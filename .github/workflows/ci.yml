@@ -1,0 +1,125 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Lint (ruff)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: python -m pip install --upgrade pip ruff
+      - name: ruff check
+        run: ruff check clipsync
+      - name: ruff format --check
+        run: ruff format --check clipsync
+
+  typecheck:
+    name: Type check (mypy)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: |
+          python -m pip install --upgrade pip
+          pip install mypy types-requests
+      - name: mypy
+        run: mypy --ignore-missing-imports --install-types --non-interactive clipsync
+
+  compile:
+    name: Compile (py_compile)
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python-version: ["3.11", "3.12"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - name: Syntax-check every module
+        run: python -m compileall -q clipsync
+
+  import-smoke:
+    name: Import smoke (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install system deps (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            python3-tk libgl1 libglib2.0-0 xclip xvfb
+      - name: Install Python deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Import every module
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            xvfb-run -a python -c "
+          import clipsync.config, clipsync.syncthing, clipsync.clipboard
+          import clipsync.pairing, clipsync.autostart, clipsync.main
+          import clipsync.ui
+          print('imports ok')
+          "
+          else
+            python -c "
+          import clipsync.config, clipsync.syncthing, clipsync.clipboard
+          import clipsync.pairing, clipsync.autostart, clipsync.main
+          import clipsync.ui
+          print('imports ok')
+          "
+          fi
+
+  syncthing-url:
+    name: Verify Syncthing release asset URL
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: HEAD the pinned release asset for linux/amd64
+        run: |
+          python - <<'PY'
+          import sys, urllib.request
+          sys.path.insert(0, '.')
+          from clipsync.syncthing import _release_asset_url
+          from clipsync.config import SYNCTHING_VERSION
+          url = _release_asset_url(SYNCTHING_VERSION)
+          print('HEAD', url)
+          req = urllib.request.Request(url, method='HEAD')
+          with urllib.request.urlopen(req, timeout=30) as r:
+              assert r.status == 200, r.status
+          print('ok')
+          PY
