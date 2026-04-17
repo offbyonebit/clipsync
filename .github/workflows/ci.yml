@@ -55,7 +55,6 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-          cache: pip
       - name: Syntax-check every module
         run: python -m compileall -q clipsync
 
