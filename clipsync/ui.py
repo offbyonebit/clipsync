@@ -11,8 +11,8 @@ from __future__ import annotations
 import logging
 import queue
 import threading
+from collections.abc import Callable
 from pathlib import Path
-from typing import Callable, Optional
 
 import customtkinter as ctk
 from PIL import Image
@@ -94,7 +94,7 @@ class UIManager:
 
         self.schedule(_do_quit)
 
-    def open_pairing(self, app: "AppContext") -> None:
+    def open_pairing(self, app: AppContext) -> None:
         def _open() -> None:
             if self._pairing_window is not None and self._pairing_window.exists():
                 self._pairing_window.focus()
@@ -107,7 +107,7 @@ class UIManager:
     def _on_pairing_closed(self) -> None:
         self._pairing_window = None
 
-    def open_settings(self, app: "AppContext") -> None:
+    def open_settings(self, app: AppContext) -> None:
         def _open() -> None:
             if self._settings_window is not None and self._settings_window.exists():
                 self._settings_window.focus()
@@ -120,7 +120,7 @@ class UIManager:
     def _on_settings_closed(self) -> None:
         self._settings_window = None
 
-    def open_devices(self, app: "AppContext") -> None:
+    def open_devices(self, app: AppContext) -> None:
         def _open() -> None:
             if self._devices_window is not None and self._devices_window.exists():
                 self._devices_window.focus()
@@ -178,7 +178,7 @@ class _BaseWindow:
         parent: ctk.CTk,
         title: str,
         size: tuple[int, int],
-        on_close: Optional[Callable[[], None]] = None,
+        on_close: Callable[[], None] | None = None,
     ) -> None:
         self._on_close = on_close
         self.window = ctk.CTkToplevel(parent)
@@ -322,7 +322,8 @@ class PairingWindow(_BaseWindow):
             self.window.after(0, self._start_pending_watch, device_id)
         except Exception as exc:
             log.exception("Pairing failed")
-            self.window.after(0, lambda: self._status_var.set(f"Failed to pair: {exc}"))
+            err = str(exc)
+            self.window.after(0, lambda: self._status_var.set(f"Failed to pair: {err}"))
 
     def _set_pending(self, device_id: str) -> None:
         self._status_var.set(f"Adding {device_id[:7]}…")
@@ -487,7 +488,9 @@ class SettingsWindow(_BaseWindow):
         container = ctk.CTkFrame(self.window, fg_color="transparent")
         container.pack(fill="both", expand=True, padx=20, pady=20)
 
-        ctk.CTkLabel(container, text="Settings", font=ctk.CTkFont(size=18, weight="bold")).pack(anchor="w", pady=(0, 12))
+        ctk.CTkLabel(container, text="Settings", font=ctk.CTkFont(size=18, weight="bold")).pack(
+            anchor="w", pady=(0, 12)
+        )
 
         self._autostart_var = ctk.BooleanVar(value=is_autostart_enabled())
         autostart_sw = ctk.CTkSwitch(
@@ -519,7 +522,9 @@ class SettingsWindow(_BaseWindow):
         )
         pause_sw.pack(anchor="w", pady=4)
 
-        ctk.CTkLabel(container, text="Sync folder path (advanced)", font=ctk.CTkFont(size=11)).pack(anchor="w", pady=(14, 2))
+        ctk.CTkLabel(container, text="Sync folder path (advanced)", font=ctk.CTkFont(size=11)).pack(
+            anchor="w", pady=(14, 2)
+        )
         folder_row = ctk.CTkFrame(container, fg_color="transparent")
         folder_row.pack(fill="x")
         self._folder_entry = ctk.CTkEntry(folder_row)
@@ -609,8 +614,12 @@ class SettingsWindow(_BaseWindow):
             self._app.on_reset()
             self._status.configure(text="All devices removed.")
 
-        ctk.CTkButton(btns, text="Cancel", fg_color="transparent", border_width=1, command=confirm.destroy).pack(side="left", expand=True, fill="x", padx=(0, 4))
-        ctk.CTkButton(btns, text="Reset", fg_color="#9b2c2c", hover_color="#7a2222", command=do_reset).pack(side="left", expand=True, fill="x", padx=(4, 0))
+        ctk.CTkButton(btns, text="Cancel", fg_color="transparent", border_width=1, command=confirm.destroy).pack(
+            side="left", expand=True, fill="x", padx=(0, 4)
+        )
+        ctk.CTkButton(btns, text="Reset", fg_color="#9b2c2c", hover_color="#7a2222", command=do_reset).pack(
+            side="left", expand=True, fill="x", padx=(4, 0)
+        )
 
 
 class LogsWindow(_BaseWindow):

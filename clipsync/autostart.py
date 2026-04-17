@@ -30,16 +30,16 @@ def _launch_command() -> list[str]:
 
 
 def _windows_set(enabled: bool) -> None:
-    import winreg  # type: ignore
+    import winreg
 
     key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
-    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_SET_VALUE) as key:
+    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_SET_VALUE) as key:  # type: ignore[attr-defined]
         if enabled:
             cmd = " ".join(f'"{a}"' for a in _launch_command())
-            winreg.SetValueEx(key, _LABEL, 0, winreg.REG_SZ, cmd)
+            winreg.SetValueEx(key, _LABEL, 0, winreg.REG_SZ, cmd)  # type: ignore[attr-defined]
         else:
             try:
-                winreg.DeleteValue(key, _LABEL)
+                winreg.DeleteValue(key, _LABEL)  # type: ignore[attr-defined]
             except FileNotFoundError:
                 pass
 
@@ -122,12 +122,12 @@ def is_autostart_enabled() -> bool:
     system = platform.system()
     try:
         if system == "Windows":
-            import winreg  # type: ignore
+            import winreg
 
             key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
-            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path) as key:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path) as key:  # type: ignore[attr-defined]
                 try:
-                    winreg.QueryValueEx(key, _LABEL)
+                    winreg.QueryValueEx(key, _LABEL)  # type: ignore[attr-defined]
                     return True
                 except FileNotFoundError:
                     return False
