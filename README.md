@@ -1,0 +1,113 @@
+# ClipSync
+
+Peer-to-peer clipboard sync for Windows, macOS, and Linux. Copy on one machine,
+paste on another — no account, no cloud, no central server. The data never
+leaves your devices.
+
+Verified working across Mac ↔ Windows, across different networks.
+
+## Why this exists
+
+Every other cross-platform clipboard tool I found falls into one of three
+buckets:
+
+1. **Same-LAN only** — needs mDNS or a discovery broadcast, so it breaks the
+   moment you're on a different network (or a corporate one that blocks
+   multicast).
+2. **Needs a signaling server** — even the "peer-to-peer" modes usually still
+   need a relay or a server you host somewhere, which means one more thing to
+   maintain and one more thing that can go down.
+3. **Reinvented the networking stack** — custom libp2p, custom NAT traversal,
+   custom encryption. Which means custom bugs.
+
+The design choice here is to **reuse Syncthing** instead of inventing anything.
+Syncthing has already solved peer discovery, NAT traversal, TLS with forward
+secrecy, and relay fallback for millions of users. By treating a single file
+(`clipboard.txt`) inside a shared Syncthing folder as the transport, you
+inherit all of that for free — including cross-WAN sync that just works,
+without Tailscale, without port forwarding, and without a VPN.
+
+Two loops sit on top:
+
+- **OUT** polls the local clipboard and writes changes to the file.
+- **IN** watches the file with filesystem events and applies remote changes to
+  the clipboard.
+
+A shared-last-value guard prevents ping-pong when both sides see the same
+write. Newlines are normalized to LF so Windows CRLF doesn't look like a real
+change and retrigger sync.
+
+## At-rest encryption
+
+Syncthing already encrypts data in transit. For defense-in-depth — in case
+someone gains read access to the sync folder on one device — you can set a
+passphrase in Settings. Payloads are then encrypted with Fernet (AES-128-CBC +
+HMAC-SHA256) using a PBKDF2-SHA256 key derivation, and prefixed with a `CSENC`
+magic header so peers can detect ciphertext and refuse to paste it raw.
+
+Every device in the group needs the same passphrase. A mismatch logs a clear
+"decrypt failed (passphrase mismatch?)" message rather than silently pasting
+ciphertext.
+
+## Install
+
+```
+pip install -r requirements.txt
+python -m clipsync
+```
+
+Python 3.11+. The correct Syncthing binary for your platform is downloaded on
+first run from the official Syncthing GitHub release.
+
+## Pairing
+
+1. Tray icon → **Add Device**.
+2. On the second machine, do the same.
+3. Scan the QR code with the webcam, or paste the device ID shown below it.
+4. Both sides auto-accept and start syncing.
+
+## Settings
+
+- Start on login (HKCU Run on Windows, LaunchAgent on macOS, XDG autostart on
+  Linux).
+- Show notifications.
+- Pause sync.
+- Sync folder path.
+- Encryption passphrase.
+- View Syncthing logs.
+- Reset / unpair all devices.
+
+Settings changes from the UI take effect immediately; hand-editing
+`settings.json` is also picked up, the file is watched for changes.
+
+## How it compares
+
+| Tool | Cross-WAN | No signaling server | E2E encrypted | Tray UI |
+|---|---|---|---|---|
+| **ClipSync** | ✅ (via Syncthing relays) | ✅ | ✅ | ✅ |
+| p2p-clipboard | partial | ✅ | ✅ | ✅ |
+| ClipCascade | ✅ | ❌ (self-host required) | ✅ | ✅ |
+| cross-clipboard | ❌ (LAN mDNS) | ✅ | ✅ | ❌ |
+| macOS Universal Clipboard | ✅ (iCloud) | ❌ | — | built-in |
+| Windows Cloud Clipboard | ✅ | ❌ (Microsoft account) | — | built-in |
+
+## Project layout
+
+| Module | Purpose |
+|---|---|
+| `config.py` | Paths, settings with on-disk watch, logging. |
+| `syncthing.py` | Binary download, config generation, REST API client, subprocess lifecycle. |
+| `clipboard.py` | OUT poll + IN watcher, loop guard, optional Fernet encryption. |
+| `pairing.py` | QR generation, webcam scan, auto-accept of pending devices. |
+| `ui.py` | CustomTkinter windows for pairing, devices, and settings. |
+| `autostart.py` | Cross-platform "run at login" toggle. |
+| `main.py` | Tray icon, orchestration, shutdown ordering. |
+
+## Status
+
+Working on Windows and macOS. Linux should work (the autostart and clipboard
+code paths are present) but hasn't been as heavily exercised.
+
+## License
+
+MIT.
