@@ -1,15 +1,18 @@
-"""CustomTkinter UI: pairing, devices, settings windows.
+"""CustomTkinter UI: pairing, devices, settings, logs windows.
 
-All UI work must happen on the Tk main thread. The `UIManager` exposes a
-thread-safe `schedule(callable)` that non-UI threads (tray, pairing
-accepter) use to request windows. The manager owns a hidden root
-`CTk` instance whose mainloop drives every Toplevel.
+Architecture: each window is opened in its own short-lived Python
+subprocess. The parent process runs the tray icon on its main thread
+(required on macOS 26 where AppKit must be initialized on the main
+thread). Child processes speak to the parent by printing JSON events
+to stdout; the parent's UIController reads and dispatches them.
 """
 
 from __future__ import annotations
 
+import json
 import logging
-import queue
+import subprocess
+import sys
 import threading
 from pathlib import Path
 from typing import Callable, Optional
@@ -23,6 +26,8 @@ from .syncthing import SyncthingClient
 
 log = logging.getLogger(__name__)
 
+_WINDOWS = ("pairing", "devices", "settings", "logs")
+
 
 def _center_window(window: ctk.CTkToplevel | ctk.CTk, width: int, height: int) -> None:
     window.update_idletasks()
@@ -33,145 +38,130 @@ def _center_window(window: ctk.CTkToplevel | ctk.CTk, width: int, height: int) -
     window.geometry(f"{width}x{height}+{x}+{y}")
 
 
-class UIManager:
-    """Owns the Tk root, marshals calls from other threads, tracks windows."""
+# ---------------------------------------------------------------------------
+# Parent-side controller
+# ---------------------------------------------------------------------------
 
-    def __init__(self) -> None:
-        ctk.set_appearance_mode("System")
-        ctk.set_default_color_theme("dark-blue")
-        self._root: ctk.CTk | None = None
-        self._queue: queue.Queue[Callable[[], None]] = queue.Queue()
-        self._pairing_window: PairingWindow | None = None
-        self._settings_window: SettingsWindow | None = None
-        self._devices_window: DevicesWindow | None = None
-        self._logs_window: LogsWindow | None = None
-        self._on_exit: Callable[[], None] | None = None
 
-    def create_root(self) -> ctk.CTk:
-        if self._root is not None:
-            return self._root
-        root = ctk.CTk()
-        root.title(config.APP_NAME)
-        root.withdraw()
-        root.protocol("WM_DELETE_WINDOW", lambda: None)
-        self._root = root
-        self._drain_queue()
-        return root
+class UIController:
+    """Spawns window subprocesses and forwards their events.
 
-    def mainloop(self, on_exit: Callable[[], None] | None = None) -> None:
-        self._on_exit = on_exit
-        root = self.create_root()
-        root.mainloop()
-        if on_exit:
-            on_exit()
+    Safe to call `open()` from any thread (pystray menu callbacks run
+    on the tray thread)."""
 
-    def _drain_queue(self) -> None:
-        assert self._root is not None
+    def __init__(self, on_event: Callable[[dict], None]) -> None:
+        self._on_event = on_event
+        self._procs: dict[str, subprocess.Popen[str]] = {}
+        self._lock = threading.Lock()
+
+    def open(self, window: str) -> None:
+        if window not in _WINDOWS:
+            log.warning("Unknown window: %s", window)
+            return
+        with self._lock:
+            existing = self._procs.get(window)
+            if existing is not None and existing.poll() is None:
+                return
+            proc = subprocess.Popen(
+                [sys.executable, "-m", "clipsync.ui", window],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL,
+                text=True,
+                bufsize=1,
+            )
+            self._procs[window] = proc
+        threading.Thread(
+            target=self._read_events,
+            args=(proc,),
+            name=f"ui-{window}-reader",
+            daemon=True,
+        ).start()
+
+    def _read_events(self, proc: subprocess.Popen[str]) -> None:
         try:
-            while True:
-                fn = self._queue.get_nowait()
+            assert proc.stdout is not None
+            for line in proc.stdout:
+                line = line.strip()
+                if not line:
+                    continue
                 try:
-                    fn()
+                    evt = json.loads(line)
+                except json.JSONDecodeError:
+                    log.debug("Non-JSON from child: %s", line)
+                    continue
+                try:
+                    self._on_event(evt)
                 except Exception:
-                    log.exception("UI task raised")
-        except queue.Empty:
-            pass
-        self._root.after(100, self._drain_queue)
+                    log.exception("UI event handler raised")
+        finally:
+            proc.wait()
 
-    def schedule(self, fn: Callable[[], None]) -> None:
-        """Safe from any thread."""
-        self._queue.put(fn)
+    def close_all(self) -> None:
+        with self._lock:
+            procs = list(self._procs.values())
+            self._procs.clear()
+        for p in procs:
+            if p.poll() is None:
+                try:
+                    p.terminate()
+                except Exception:
+                    pass
 
-    def quit(self) -> None:
-        def _do_quit() -> None:
-            for w in (self._pairing_window, self._settings_window, self._devices_window, self._logs_window):
-                if w is not None and w.exists():
-                    w.close()
-            if self._root is not None:
-                self._root.quit()
-                self._root.destroy()
-                self._root = None
 
-        self.schedule(_do_quit)
+# ---------------------------------------------------------------------------
+# Child-side event emitter
+# ---------------------------------------------------------------------------
 
-    def open_pairing(self, app: "AppContext") -> None:
-        def _open() -> None:
-            if self._pairing_window is not None and self._pairing_window.exists():
-                self._pairing_window.focus()
-                return
-            assert self._root is not None
-            self._pairing_window = PairingWindow(self._root, app, on_close=self._on_pairing_closed)
 
-        self.schedule(_open)
-
-    def _on_pairing_closed(self) -> None:
-        self._pairing_window = None
-
-    def open_settings(self, app: "AppContext") -> None:
-        def _open() -> None:
-            if self._settings_window is not None and self._settings_window.exists():
-                self._settings_window.focus()
-                return
-            assert self._root is not None
-            self._settings_window = SettingsWindow(self._root, app, on_close=self._on_settings_closed, ui=self)
-
-        self.schedule(_open)
-
-    def _on_settings_closed(self) -> None:
-        self._settings_window = None
-
-    def open_devices(self, app: "AppContext") -> None:
-        def _open() -> None:
-            if self._devices_window is not None and self._devices_window.exists():
-                self._devices_window.focus()
-                return
-            assert self._root is not None
-            self._devices_window = DevicesWindow(self._root, app, on_close=self._on_devices_closed)
-
-        self.schedule(_open)
-
-    def _on_devices_closed(self) -> None:
-        self._devices_window = None
-
-    def open_logs(self) -> None:
-        def _open() -> None:
-            if self._logs_window is not None and self._logs_window.exists():
-                self._logs_window.focus()
-                return
-            assert self._root is not None
-            self._logs_window = LogsWindow(self._root, on_close=self._on_logs_closed)
-
-        self.schedule(_open)
-
-    def _on_logs_closed(self) -> None:
-        self._logs_window = None
+def _emit(event: str, **payload: object) -> None:
+    """Print a JSON event to stdout for the parent to consume."""
+    try:
+        sys.stdout.write(json.dumps({"event": event, **payload}) + "\n")
+        sys.stdout.flush()
+    except Exception:
+        pass
 
 
 class AppContext:
-    """Everything a window needs to talk to the running app.
+    """Bag of things a window needs: settings, REST client, device id.
 
-    Passed in by main.py; the UI classes treat it as an opaque bag of
-    callbacks rather than importing the app module directly."""
+    Mutating callbacks write through settings / REST API directly and
+    also emit an event so the parent process can react (restart the
+    clipboard watcher, show a tray notification, etc.)."""
 
     def __init__(
         self,
         settings: config.Settings,
         client: SyncthingClient,
         device_id: str,
-        on_pause_changed: Callable[[bool], None],
-        on_reset: Callable[[], None],
-        on_folder_changed: Callable[[str], None],
     ) -> None:
         self.settings = settings
         self.client = client
         self.device_id = device_id
-        self.on_pause_changed = on_pause_changed
-        self.on_reset = on_reset
-        self.on_folder_changed = on_folder_changed
+
+    def on_pause_changed(self, paused: bool) -> None:
+        _emit("pause_changed", paused=paused)
+
+    def on_reset(self) -> None:
+        try:
+            for d in self.client.connected_devices():
+                self.client.remove_device(d["deviceID"])
+        except Exception:
+            log.exception("Failed to remove devices")
+        _emit("reset")
+
+    def on_folder_changed(self, new_path: str) -> None:
+        _emit("folder_changed", path=new_path)
+
+
+# ---------------------------------------------------------------------------
+# Windows
+# ---------------------------------------------------------------------------
 
 
 class _BaseWindow:
-    """Shared Toplevel behavior: fixed size, centered, accent-styled title."""
+    """Shared Toplevel behavior: fixed size, centered."""
 
     def __init__(
         self,
@@ -227,56 +217,88 @@ class PairingWindow(_BaseWindow):
         self._status_var = ctk.StringVar(value="Scan this QR on your other device, or paste its ID below.")
 
         container = ctk.CTkFrame(self.window, fg_color="transparent")
-        container.pack(fill="both", expand=True, padx=20, pady=20)
+        container.pack(fill="both", expand=True, padx=20, pady=16)
 
         title = ctk.CTkLabel(container, text="Pair a device", font=ctk.CTkFont(size=18, weight="bold"))
-        title.pack(pady=(0, 12))
+        title.pack(pady=(0, 8))
 
-        self._qr_label = ctk.CTkLabel(container, text="")
-        self._qr_label.pack()
-        self._render_qr(app.device_id)
-
-        id_label = ctk.CTkLabel(
+        # Nearby devices list — the fastest path, zero typing.
+        ctk.CTkLabel(
             container,
-            text=app.device_id,
-            font=ctk.CTkFont(size=10),
-            wraplength=360,
-            justify="center",
-        )
-        id_label.pack(pady=(6, 10))
-        id_label.bind("<Button-1>", lambda _e: self._copy_to_clipboard(app.device_id))
+            text="Nearby devices on your network",
+            font=ctk.CTkFont(size=12, weight="bold"),
+            anchor="w",
+        ).pack(fill="x")
+        self._nearby_frame = ctk.CTkScrollableFrame(container, fg_color=("gray90", "gray17"), height=100)
+        self._nearby_frame.pack(fill="x", pady=(2, 10))
+        self._nearby_seen: set[str] = set()
+        self._render_nearby([])
+        self._schedule_nearby_refresh()
 
-        copy_btn = ctk.CTkButton(
-            container,
-            text="Copy device ID",
-            fg_color=config.ACCENT_COLOR,
-            hover_color=config.ACCENT_HOVER,
-            command=lambda: self._copy_to_clipboard(app.device_id),
-        )
-        copy_btn.pack(fill="x", pady=(0, 12))
-
+        # Manual entry with paste button.
+        ctk.CTkLabel(container, text="Or paste a device ID", font=ctk.CTkFont(size=12, weight="bold"), anchor="w").pack(fill="x")
         entry_row = ctk.CTkFrame(container, fg_color="transparent")
-        entry_row.pack(fill="x", pady=(0, 8))
-        self._entry = ctk.CTkEntry(entry_row, placeholder_text="Paste remote device ID")
+        entry_row.pack(fill="x", pady=(2, 8))
+        self._entry = ctk.CTkEntry(entry_row, placeholder_text="XXXXXXX-XXXXXXX-…")
         self._entry.pack(side="left", fill="x", expand=True, padx=(0, 6))
+        paste_btn = ctk.CTkButton(
+            entry_row,
+            text="Paste",
+            width=60,
+            fg_color="transparent",
+            border_width=1,
+            border_color=config.ACCENT_COLOR,
+            text_color=config.ACCENT_COLOR,
+            hover_color=config.ACCENT_HOVER,
+            command=self._on_paste_clicked,
+        )
+        paste_btn.pack(side="left", padx=(0, 6))
         add_btn = ctk.CTkButton(
             entry_row,
             text="Add",
-            width=70,
+            width=60,
             fg_color=config.ACCENT_COLOR,
             hover_color=config.ACCENT_HOVER,
             command=self._on_add_clicked,
         )
         add_btn.pack(side="left")
 
+        # This device's QR + ID (collapsible so it doesn't dominate).
+        ctk.CTkLabel(container, text="Your device ID (for the other side)", font=ctk.CTkFont(size=12, weight="bold"), anchor="w").pack(fill="x", pady=(4, 2))
+        own_row = ctk.CTkFrame(container, fg_color=("gray90", "gray17"))
+        own_row.pack(fill="x", pady=(0, 8))
+        self._qr_label = ctk.CTkLabel(own_row, text="")
+        self._qr_label.pack(side="left", padx=8, pady=8)
+        self._render_qr(app.device_id)
+        own_right = ctk.CTkFrame(own_row, fg_color="transparent")
+        own_right.pack(side="left", fill="both", expand=True, padx=(0, 8), pady=8)
+        id_label = ctk.CTkLabel(
+            own_right,
+            text=app.device_id,
+            font=ctk.CTkFont(size=9),
+            wraplength=180,
+            justify="left",
+            anchor="w",
+        )
+        id_label.pack(fill="x")
+        copy_btn = ctk.CTkButton(
+            own_right,
+            text="Copy",
+            height=24,
+            fg_color=config.ACCENT_COLOR,
+            hover_color=config.ACCENT_HOVER,
+            command=lambda: self._copy_to_clipboard(app.device_id),
+        )
+        copy_btn.pack(fill="x", pady=(6, 0))
+
         scan_btn = ctk.CTkButton(
             container,
-            text="Scan QR with webcam",
+            text="Scan QR with webcam (slower)",
+            height=28,
             fg_color="transparent",
             border_width=1,
-            border_color=config.ACCENT_COLOR,
-            text_color=config.ACCENT_COLOR,
-            hover_color=config.ACCENT_HOVER,
+            border_color=("gray70", "gray40"),
+            text_color=("gray30", "gray80"),
             command=self._on_scan_clicked,
         )
         scan_btn.pack(fill="x")
@@ -288,12 +310,16 @@ class PairingWindow(_BaseWindow):
             justify="center",
             font=ctk.CTkFont(size=11),
         )
-        status.pack(pady=(14, 0))
+        status.pack(pady=(10, 0))
+
+        # Live preview area; hidden until the user clicks Scan.
+        self._preview_label: ctk.CTkLabel | None = None
+        self._preview_size = (320, 240)
 
     def _render_qr(self, device_id: str) -> None:
-        qr_img = pairing.generate_qr(device_id, box_size=6, border=2)
-        qr_img = qr_img.resize((220, 220), Image.NEAREST)
-        ctk_img = ctk.CTkImage(light_image=qr_img, dark_image=qr_img, size=(220, 220))
+        qr_img = pairing.generate_qr(device_id, box_size=4, border=2)
+        qr_img = qr_img.resize((110, 110), Image.NEAREST)
+        ctk_img = ctk.CTkImage(light_image=qr_img, dark_image=qr_img, size=(110, 110))
         self._qr_label.configure(image=ctk_img)
         self._qr_label.image = ctk_img  # keep reference
 
@@ -304,6 +330,80 @@ class PairingWindow(_BaseWindow):
             self._status_var.set("Device ID copied to clipboard.")
         except Exception:
             log.exception("Clipboard copy failed")
+
+    def _on_paste_clicked(self) -> None:
+        try:
+            text = self.window.clipboard_get()
+        except Exception:
+            self._status_var.set("Clipboard is empty.")
+            return
+        normalized = pairing.normalize_device_id(text)
+        self._entry.delete(0, "end")
+        if normalized:
+            self._entry.insert(0, normalized)
+            self._status_var.set("Pasted. Click Add to pair.")
+        else:
+            self._entry.insert(0, text.strip())
+            self._status_var.set("That doesn't look like a valid device ID.")
+
+    def _schedule_nearby_refresh(self) -> None:
+        if not self.exists():
+            return
+        threading.Thread(target=self._nearby_worker, daemon=True).start()
+        self.window.after(5000, self._schedule_nearby_refresh)
+
+    def _nearby_worker(self) -> None:
+        try:
+            discovered = self._app.client.get_discovered_devices()
+            known = {d["deviceID"] for d in self._app.client.connected_devices()}
+        except Exception:
+            return
+        if not self.exists():
+            return
+        items = []
+        for did in discovered.keys():
+            if did == self._app.device_id or did in known:
+                continue
+            items.append(did)
+        self.window.after(0, lambda: self._render_nearby(items))
+
+    def _render_nearby(self, device_ids: list[str]) -> None:
+        if not self.exists():
+            return
+        for child in self._nearby_frame.winfo_children():
+            child.destroy()
+        if not device_ids:
+            ctk.CTkLabel(
+                self._nearby_frame,
+                text="Searching… make sure the other device is running ClipSync on the same network.",
+                font=ctk.CTkFont(size=11),
+                wraplength=320,
+                justify="center",
+            ).pack(pady=16)
+            return
+        for did in device_ids:
+            row = ctk.CTkFrame(self._nearby_frame, fg_color=("gray85", "gray22"))
+            row.pack(fill="x", padx=4, pady=3)
+            row.grid_columnconfigure(0, weight=1)
+            ctk.CTkLabel(
+                row,
+                text=did[:24] + "…",
+                font=ctk.CTkFont(size=11),
+                anchor="w",
+            ).grid(row=0, column=0, sticky="we", padx=10, pady=6)
+            ctk.CTkButton(
+                row,
+                text="Pair",
+                width=60,
+                height=24,
+                fg_color=config.ACCENT_COLOR,
+                hover_color=config.ACCENT_HOVER,
+                command=lambda d=did: self._pair_from_nearby(d),
+            ).grid(row=0, column=1, padx=(0, 8), pady=4)
+
+    def _pair_from_nearby(self, device_id: str) -> None:
+        self._set_pending(device_id)
+        threading.Thread(target=self._pair_worker, args=(device_id,), daemon=True).start()
 
     def _on_add_clicked(self) -> None:
         raw = self._entry.get()
@@ -328,8 +428,6 @@ class PairingWindow(_BaseWindow):
         self._status_var.set(f"Adding {device_id[:7]}…")
 
     def _start_pending_watch(self, device_id: str) -> None:
-        """After we request pairing, poll connections until the device shows up."""
-
         def check() -> None:
             try:
                 devices = self._app.client.connected_devices()
@@ -349,10 +447,45 @@ class PairingWindow(_BaseWindow):
     def _on_scan_clicked(self) -> None:
         if self._scanner is not None:
             return
-        self._status_var.set("Opening camera… point it at the QR on the other device.")
+        self._status_var.set("Opening camera… point it at the other device's QR.")
+        if self._preview_label is None:
+            self._preview_label = ctk.CTkLabel(self.window, text="Starting camera…", width=self._preview_size[0], height=self._preview_size[1])
+            self._preview_label.pack(pady=(8, 10))
+            self.window.geometry("")  # let Tk grow the window to fit
         scanner = pairing.WebcamQRScanner(on_detected=self._on_qr_detected)
+        scanner.set_frame_callback(self._on_frame)
         self._scanner = scanner
         scanner.start()
+
+    def _on_frame(self, frame: object) -> None:
+        """Called on the scanner thread for every captured frame."""
+        try:
+            import cv2  # type: ignore
+        except ImportError:
+            return
+        try:
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)  # type: ignore[attr-defined]
+            h, w = rgb.shape[:2]
+            target_w, target_h = self._preview_size
+            scale = min(target_w / w, target_h / h)
+            nw, nh = int(w * scale), int(h * scale)
+            resized = cv2.resize(rgb, (nw, nh))  # type: ignore[attr-defined]
+            img = Image.fromarray(resized)
+        except Exception:
+            log.exception("Frame conversion failed")
+            return
+
+        def update() -> None:
+            if self._preview_label is None or not self.exists():
+                return
+            ctk_img = ctk.CTkImage(light_image=img, dark_image=img, size=(nw, nh))
+            self._preview_label.configure(image=ctk_img, text="")
+            self._preview_label.image = ctk_img  # keep reference
+
+        try:
+            self.window.after(0, update)
+        except Exception:
+            pass
 
     def _on_qr_detected(self, device_id: str) -> None:
         def apply() -> None:
@@ -478,11 +611,10 @@ class SettingsWindow(_BaseWindow):
         parent: ctk.CTk,
         app: AppContext,
         on_close: Callable[[], None],
-        ui: UIManager,
     ) -> None:
         super().__init__(parent, f"{config.APP_NAME} — Settings", config.SETTINGS_WINDOW_SIZE, on_close)
         self._app = app
-        self._ui = ui
+        self._logs_window: LogsWindow | None = None
 
         container = ctk.CTkFrame(self.window, fg_color="transparent")
         container.pack(fill="both", expand=True, padx=20, pady=20)
@@ -589,7 +721,14 @@ class SettingsWindow(_BaseWindow):
         self._status.configure(text="Folder updated. Restart for Syncthing changes.")
 
     def _on_view_logs(self) -> None:
-        self._ui.open_logs()
+        if self._logs_window is not None and self._logs_window.exists():
+            self._logs_window.focus()
+            return
+        parent = self.window.master
+        self._logs_window = LogsWindow(parent, on_close=self._on_logs_closed)
+
+    def _on_logs_closed(self) -> None:
+        self._logs_window = None
 
     def _on_reset(self) -> None:
         confirm = ctk.CTkToplevel(self.window)
@@ -643,3 +782,63 @@ class LogsWindow(_BaseWindow):
         self._textbox.insert("1.0", tail)
         self._textbox.configure(state="disabled")
         self._textbox.see("end")
+
+
+# ---------------------------------------------------------------------------
+# Child-process entry point
+# ---------------------------------------------------------------------------
+
+
+def _run_child(window_name: str) -> int:
+    """Entry point invoked as `python -m clipsync.ui <window>` by UIController."""
+    config.configure_logging()
+    settings = config.Settings()
+    api_key = settings.get("api_key")
+    if not api_key:
+        log.error("No api_key in settings; parent has not initialized Syncthing")
+        return 1
+    client = SyncthingClient(api_key)
+    try:
+        device_id = client.get_device_id()
+    except Exception:
+        log.exception("Could not fetch device id from Syncthing")
+        device_id = ""
+
+    app = AppContext(settings=settings, client=client, device_id=device_id)
+
+    ctk.set_appearance_mode("System")
+    ctk.set_default_color_theme("dark-blue")
+    root = ctk.CTk()
+    root.withdraw()
+
+    def _quit() -> None:
+        try:
+            root.quit()
+        except Exception:
+            pass
+
+    if window_name == "pairing":
+        PairingWindow(root, app, on_close=_quit)
+    elif window_name == "devices":
+        DevicesWindow(root, app, on_close=_quit)
+    elif window_name == "settings":
+        SettingsWindow(root, app, on_close=_quit)
+    elif window_name == "logs":
+        LogsWindow(root, on_close=_quit)
+    else:
+        log.error("Unknown window: %s", window_name)
+        return 1
+
+    try:
+        root.mainloop()
+    finally:
+        try:
+            root.destroy()
+        except Exception:
+            pass
+    return 0
+
+
+if __name__ == "__main__":
+    name = sys.argv[1] if len(sys.argv) > 1 else ""
+    sys.exit(_run_child(name))
