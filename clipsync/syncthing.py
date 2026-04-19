@@ -152,13 +152,15 @@ def _generate_home(binary: Path, home: Path) -> None:
 
 
 def _read_device_id(binary: Path, home: Path) -> str:
-    """Extract our device ID via `syncthing --device-id`."""
-    out = _run_capture([str(binary), f"--home={home}", "--device-id"], timeout=15)
-    for line in out.splitlines():
-        line = line.strip()
-        if line and "-" in line and len(line) >= 50:
-            return line
-    raise SyncthingError(f"Could not parse device ID from output: {out!r}")
+    """Extract our device ID from the generated config.xml."""
+    config_path = home / "config.xml"
+    tree = ET.parse(config_path)
+    root = tree.getroot()
+    for device in root.findall("device"):
+        did = device.get("id", "")
+        if did and "-" in did and len(did) >= 50:
+            return did
+    raise SyncthingError("Could not parse device ID from config.xml")
 
 
 def _xml_set(element: ET.Element, tag: str, text: str) -> ET.Element:
