@@ -29,7 +29,11 @@ jobs:
 
   typecheck:
     name: Type check (mypy)
-    runs-on: ubuntu-latest
+    # Runs on Windows so stdlib modules like winreg (used by
+    # clipsync/autostart.py for the Windows login-registration path)
+    # resolve natively. Ubuntu doesn't ship winreg and mypy there flags
+    # every attribute access on it as an error.
+    runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
