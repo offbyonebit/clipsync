@@ -23,7 +23,10 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 ASSETS_DIR = PROJECT_ROOT / "clipsync" / "assets"
-ENTRY_POINT = PROJECT_ROOT / "clipsync" / "__main__.py"
+# Use the absolute-import wrapper instead of clipsync/__main__.py so the
+# bundle does not choke on `from .main import main`. PyInstaller runs its
+# entry script as the top-level __main__, which has no parent package.
+ENTRY_POINT = PROJECT_ROOT / "clipsync_launcher.py"
 
 
 def _data_arg() -> str:
