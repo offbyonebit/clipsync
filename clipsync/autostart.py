@@ -30,7 +30,7 @@ def _launch_command() -> list[str]:
 
 
 def _windows_set(enabled: bool) -> None:
-    import winreg  # type: ignore
+    import winreg
 
     key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
     with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_SET_VALUE) as key:
@@ -122,7 +122,7 @@ def is_autostart_enabled() -> bool:
     system = platform.system()
     try:
         if system == "Windows":
-            import winreg  # type: ignore
+            import winreg
 
             key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
             with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path) as key:

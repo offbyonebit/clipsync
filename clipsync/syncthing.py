@@ -99,10 +99,12 @@ def _extract_binary(data: bytes, ext: str, dest_dir: Path) -> Path:
                 shutil.copyfileobj(src, dst)
     else:
         with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as tf:
-            members = [m for m in tf.getmembers() if m.name.endswith(f"/{target_name}") or m.name.endswith(target_name)]
-            if not members:
+            tar_members = [
+                m for m in tf.getmembers() if m.name.endswith(f"/{target_name}") or m.name.endswith(target_name)
+            ]
+            if not tar_members:
                 raise SyncthingError("Syncthing binary not found in archive")
-            extracted = tf.extractfile(members[0])
+            extracted = tf.extractfile(tar_members[0])
             if extracted is None:
                 raise SyncthingError("Failed to extract syncthing binary")
             with target.open("wb") as dst:

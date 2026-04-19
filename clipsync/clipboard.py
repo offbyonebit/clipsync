@@ -70,7 +70,7 @@ def _decrypt(data: bytes, passphrase: str) -> str | None:
     if not data.startswith(_ENC_MAGIC):
         return None
     try:
-        plain = Fernet(_derive_key(passphrase)).decrypt(data[len(_ENC_MAGIC):])
+        plain = Fernet(_derive_key(passphrase)).decrypt(data[len(_ENC_MAGIC) :])
     except (InvalidToken, ValueError):
         return None
     try:
