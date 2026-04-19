@@ -30,7 +30,12 @@ POLL = 0.05  # tight poll for fast tests
 
 
 def _install_fake_clipboard(sync: ClipboardSync, state: dict) -> None:
-    """Replace pyperclip access with dict-backed state, unique per instance."""
+    """Replace pyperclip access with dict-backed state, unique per instance.
+
+    Also stubs out image clipboard access so these text-only tests are not
+    perturbed by whatever the host's real system clipboard happens to hold
+    (a real PNG on the Mac's clipboard would otherwise take priority in
+    _out_tick and make these assertions flake)."""
 
     def read() -> str | None:
         return state.get("value")
@@ -41,6 +46,8 @@ def _install_fake_clipboard(sync: ClipboardSync, state: dict) -> None:
 
     sync._read_clipboard = read  # type: ignore[method-assign]
     sync._write_clipboard = write  # type: ignore[method-assign]
+    sync._read_clipboard_image = lambda: None  # type: ignore[method-assign]
+    sync._write_clipboard_image = lambda _b: True  # type: ignore[method-assign]
 
 
 def _wait_for(predicate, timeout: float = 5.0, interval: float = 0.05) -> bool:
@@ -142,8 +149,7 @@ def test_encrypted_mismatched_passphrase_does_not_corrupt(two_sided) -> None:
     # Wait past multiple poll cycles; decrypt should fail silently on win.
     time.sleep(POLL * 20)
     assert win_clip["value"] == original_win_value, (
-        "Windows clipboard was overwritten despite decrypt failure; "
-        f"got {win_clip['value']!r}"
+        f"Windows clipboard was overwritten despite decrypt failure; got {win_clip['value']!r}"
     )
 
 

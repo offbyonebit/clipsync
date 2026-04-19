@@ -62,6 +62,11 @@ class OSClipboard:
 def _install(sync: ClipboardSync, clip: OSClipboard) -> None:
     sync._read_clipboard = clip.read  # type: ignore[method-assign]
     sync._write_clipboard = clip.write  # type: ignore[method-assign]
+    # Stub image access so the host's real clipboard cannot leak into
+    # these text-only tests (an image on the Mac clipboard would take
+    # priority in _out_tick and hide the text propagation under test).
+    sync._read_clipboard_image = lambda: None  # type: ignore[method-assign]
+    sync._write_clipboard_image = lambda _b: True  # type: ignore[method-assign]
 
 
 def _wait_for(predicate, timeout: float = 5.0, interval: float = 0.05) -> bool:
@@ -120,9 +125,7 @@ OS_PAIRS = [
 def test_plain_text_syncs_across(make_pair, src, dst) -> None:
     a, b, clip_a, clip_b = make_pair(src, dst)
     clip_a.set("hello world")
-    assert _wait_for(lambda: "hello world" in clip_b.read()), (
-        f"{src}->{dst} did not propagate; got {clip_b.read()!r}"
-    )
+    assert _wait_for(lambda: "hello world" in clip_b.read()), f"{src}->{dst} did not propagate; got {clip_b.read()!r}"
 
 
 @pytest.mark.parametrize("src,dst", [(a, b) for pair in OS_PAIRS for a, b in (pair, pair[::-1])])
@@ -147,9 +150,7 @@ def test_multiline_does_not_oscillate(make_pair, src, dst) -> None:
 
     a_text = clip_a.read().replace("\r\n", "\n")
     b_text = clip_b.read().replace("\r\n", "\n")
-    assert a_text == b_text == "line one\nline two\nline three", (
-        f"Instability detected: a={a_text!r} b={b_text!r}"
-    )
+    assert a_text == b_text == "line one\nline two\nline three", f"Instability detected: a={a_text!r} b={b_text!r}"
 
 
 def test_three_way_relay_simulation(make_pair) -> None:

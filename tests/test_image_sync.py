@@ -87,17 +87,13 @@ def two_sided(tmp_path, monkeypatch):
 def test_image_syncs_a_to_b(two_sided) -> None:
     _, _, _, img_a, _, img_b = two_sided
     img_a["image"] = FAKE_PNG_RED
-    assert _wait_for(lambda: img_b["image"] == FAKE_PNG_RED), (
-        f"Image did not sync to B; got {img_b['image']!r}"
-    )
+    assert _wait_for(lambda: img_b["image"] == FAKE_PNG_RED), f"Image did not sync to B; got {img_b['image']!r}"
 
 
 def test_image_syncs_b_to_a(two_sided) -> None:
     _, _, _, img_a, _, img_b = two_sided
     img_b["image"] = FAKE_PNG_BLUE
-    assert _wait_for(lambda: img_a["image"] == FAKE_PNG_BLUE), (
-        f"Image did not sync to A; got {img_a['image']!r}"
-    )
+    assert _wait_for(lambda: img_a["image"] == FAKE_PNG_BLUE), f"Image did not sync to A; got {img_a['image']!r}"
 
 
 def test_image_does_not_oscillate(two_sided) -> None:
@@ -124,9 +120,7 @@ def test_text_still_syncs_when_no_image(two_sided) -> None:
     """Regression: text sync must work when image clipboard always returns None."""
     _, _, txt_a, _, txt_b, _ = two_sided
     txt_a["value"] = "hello from a"
-    assert _wait_for(lambda: txt_b["value"] == "hello from a"), (
-        f"Text did not sync; got {txt_b['value']!r}"
-    )
+    assert _wait_for(lambda: txt_b["value"] == "hello from a"), f"Text did not sync; got {txt_b['value']!r}"
 
 
 def test_image_sync_with_encryption(two_sided) -> None:
@@ -136,9 +130,7 @@ def test_image_sync_with_encryption(two_sided) -> None:
     time.sleep(POLL * 3)
 
     img_a["image"] = FAKE_PNG_RED
-    assert _wait_for(lambda: img_b["image"] == FAKE_PNG_RED), (
-        f"Encrypted image did not sync; got {img_b['image']!r}"
-    )
+    assert _wait_for(lambda: img_b["image"] == FAKE_PNG_RED), f"Encrypted image did not sync; got {img_b['image']!r}"
 
 
 def test_encrypted_image_mismatched_passphrase(two_sided) -> None:
@@ -150,6 +142,4 @@ def test_encrypted_image_mismatched_passphrase(two_sided) -> None:
 
     img_a["image"] = FAKE_PNG_RED
     time.sleep(POLL * 20)
-    assert img_b["image"] is None, (
-        f"B applied image despite passphrase mismatch; got {img_b['image']!r}"
-    )
+    assert img_b["image"] is None, f"B applied image despite passphrase mismatch; got {img_b['image']!r}"
