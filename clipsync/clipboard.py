@@ -40,6 +40,8 @@ class ClipboardSync:
         self._observer: Observer | None = None
         self._last_synced: str | None = None
         self._lock = threading.Lock()
+        self._last_read_error: str | None = None
+        self._last_write_error: str | None = None
 
     @property
     def clipboard_file(self) -> Path:
@@ -84,8 +86,14 @@ class ClipboardSync:
         try:
             value = pyperclip.paste()
         except Exception as exc:
-            log.debug("Clipboard read failed: %s", exc)
+            msg = f"{type(exc).__name__}: {exc}"
+            if msg != self._last_read_error:
+                log.warning("Clipboard read failed: %s", msg)
+                self._last_read_error = msg
             return None
+        if self._last_read_error is not None:
+            log.info("Clipboard read recovered")
+            self._last_read_error = None
         if not isinstance(value, str):
             return None
         return value
@@ -93,10 +101,16 @@ class ClipboardSync:
     def _write_clipboard(self, value: str) -> bool:
         try:
             pyperclip.copy(value)
-            return True
         except Exception as exc:
-            log.debug("Clipboard write failed: %s", exc)
+            msg = f"{type(exc).__name__}: {exc}"
+            if msg != self._last_write_error:
+                log.warning("Clipboard write failed: %s", msg)
+                self._last_write_error = msg
             return False
+        if self._last_write_error is not None:
+            log.info("Clipboard write recovered")
+            self._last_write_error = None
+        return True
 
     def _out_loop(self) -> None:
         while not self._stop.is_set():
