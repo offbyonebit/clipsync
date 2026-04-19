@@ -153,33 +153,77 @@ def _generate_home(binary: Path, home: Path) -> None:
         raise SyncthingError(f"syncthing generate did not produce config.xml: {output}")
 
 
-def _read_device_id(binary: Path, home: Path) -> str:
-    """Extract our own device ID from config.xml.
+_LUHN_BASE32 = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"
 
-    After pairing, config.xml holds multiple <device> entries (self
-    plus each paired remote), in arbitrary order. The self device is
-    the one whose id is shared by every folder's own <device> list
-    (Syncthing requires the owner to be listed on each folder).
+
+def _luhn32(s: str) -> str:
+    """Compute Syncthing's Luhn mod-32 check character over a base32 string."""
+    factor = 1
+    total = 0
+    n = 32
+    for ch in s:
+        codepoint = _LUHN_BASE32.index(ch)
+        addend = factor * codepoint
+        factor = 3 - factor
+        addend = (addend // n) + (addend % n)
+        total += addend
+    check = (n - (total % n)) % n
+    return _LUHN_BASE32[check]
+
+
+def _device_id_from_cert(cert_pem_path: Path) -> str:
+    """Compute the Syncthing device ID from a PEM-encoded certificate.
+
+    The device ID is the SHA-256 of the DER-encoded cert, base32 encoded
+    (no padding), split into four 13-char chunks each followed by a Luhn
+    mod-32 check character, then chunked with hyphens every 7 chars.
+    This matches Syncthing's own DeviceID.String() exactly, so it always
+    returns the self device (unlike config.xml which after pairing holds
+    multiple <device> entries with no reliable self marker).
     """
+    import base64
+    import hashlib
+
+    from cryptography import x509
+    from cryptography.hazmat.primitives.serialization import Encoding
+
+    cert = x509.load_pem_x509_certificate(cert_pem_path.read_bytes())
+    der = cert.public_bytes(Encoding.DER)
+    digest = hashlib.sha256(der).digest()
+    b32 = base64.b32encode(digest).decode("ascii").rstrip("=")
+    # 256 bits -> 52 base32 chars. Split into 4 x 13, append Luhn check on each.
+    if len(b32) != 52:
+        raise SyncthingError(f"Unexpected base32 length {len(b32)} for device id")
+    chunks = [b32[i : i + 13] for i in range(0, 52, 13)]
+    with_checks = "".join(c + _luhn32(c) for c in chunks)  # 56 chars
+    return "-".join(with_checks[i : i + 7] for i in range(0, 56, 7))
+
+
+def _read_device_id(binary: Path, home: Path) -> str:
+    """Return our own device ID, derived from cert.pem like Syncthing does.
+
+    Syncthing's device ID is the SHA-256 of its certificate, Luhn-
+    checksummed and hyphen-chunked. Deriving from the cert is the only
+    reliable way: config.xml after pairing holds multiple <device>
+    entries with no distinguishable self marker, and --device-id isn't
+    supported across all Syncthing versions.
+    """
+    cert_path = home / "cert.pem"
+    if cert_path.exists():
+        try:
+            return _device_id_from_cert(cert_path)
+        except Exception:
+            log.exception("Failed to derive device ID from cert.pem, falling back to config.xml")
+
+    # Fallback for anyone without cert.pem (shouldn't happen post-generate).
     config_path = home / "config.xml"
     tree = ET.parse(config_path)
     root = tree.getroot()
-    top_level_ids = [d.get("id", "") for d in root.findall("device") if d.get("id")]
-
-    folder_device_ids: set[str] | None = None
-    for folder in root.findall("folder"):
-        ids_in_folder = {d.get("id", "") for d in folder.findall("device") if d.get("id")}
-        folder_device_ids = ids_in_folder if folder_device_ids is None else (folder_device_ids & ids_in_folder)
-    if folder_device_ids is None:
-        folder_device_ids = set()
-
-    for did in top_level_ids:
-        if did in folder_device_ids and "-" in did and len(did) >= 50:
+    for device in root.findall("device"):
+        did = device.get("id", "")
+        if did and "-" in did and len(did) >= 50:
             return did
-    for did in top_level_ids:
-        if "-" in did and len(did) >= 50:
-            return did
-    raise SyncthingError("Could not parse device ID from config.xml")
+    raise SyncthingError("Could not determine device ID")
 
 
 def _xml_set(element: ET.Element, tag: str, text: str) -> ET.Element:
