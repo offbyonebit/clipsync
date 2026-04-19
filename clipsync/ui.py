@@ -62,8 +62,16 @@ class UIController:
             existing = self._procs.get(window)
             if existing is not None and existing.poll() is None:
                 return
+            # Frozen bundle: sys.executable is the ClipSync binary, not a
+            # Python interpreter, so -m flags are meaningless. The launcher
+            # dispatches on argv[1] == "ui" instead. Source runs still use
+            # the normal `python -m clipsync.ui <name>` path.
+            if getattr(sys, "frozen", False):
+                cmd = [sys.executable, "ui", window]
+            else:
+                cmd = [sys.executable, "-m", "clipsync.ui", window]
             proc = subprocess.Popen(
-                [sys.executable, "-m", "clipsync.ui", window],
+                cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
                 stdin=subprocess.DEVNULL,
