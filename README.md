@@ -59,6 +59,36 @@ python -m clipsync
 Python 3.11+. The correct Syncthing binary for your platform is downloaded on
 first run from the official Syncthing GitHub release.
 
+### Linux setup notes
+
+`pystray` picks its tray backend at import time: PyGObject + AppIndicator if
+available, XEmbed otherwise. KDE Plasma and several other modern desktops no
+longer render XEmbed icons — they only speak `StatusNotifierItem`, which
+AppIndicator provides. If the tray icon silently never appears, install the
+system packages and make them visible to your venv.
+
+**Debian / Ubuntu / Mint**
+```
+sudo apt install python3-gi gir1.2-ayatanaappindicator3-0.1 xclip
+```
+
+**Fedora**
+```
+sudo dnf install python3-gobject libayatana-appindicator-gtk3 xclip
+```
+
+**Arch**
+```
+sudo pacman -S python-gobject libayatana-appindicator xclip
+```
+
+If you use a virtualenv, set `include-system-site-packages = true` in its
+`pyvenv.cfg` so the system-installed PyGObject is importable. `xclip` is the
+X11 backend `pyperclip` uses for clipboard access; on Wayland install
+`wl-clipboard` instead. GNOME users typically also need the
+[AppIndicator extension](https://extensions.gnome.org/extension/615/appindicator-support/)
+for the icon to actually show up.
+
 ## Pairing
 
 1. Tray icon → **Add Device**.
