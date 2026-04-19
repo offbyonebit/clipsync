@@ -36,6 +36,49 @@ def _normalize_newlines(s: str) -> str:
     return s.replace("\r\n", "\n").replace("\r", "\n")
 
 
+# Encrypted payloads start with this magic header so a receiver can
+# detect them and either decrypt or reject without corrupting its own
+# clipboard with ciphertext bytes.
+_ENC_MAGIC = b"CSENC\x00"
+
+
+def _derive_key(passphrase: str) -> bytes:
+    import base64
+
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+
+    kdf = PBKDF2HMAC(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=b"clipsync-v1-salt",
+        iterations=120_000,
+    )
+    return base64.urlsafe_b64encode(kdf.derive(passphrase.encode("utf-8")))
+
+
+def _encrypt(text: str, passphrase: str) -> bytes:
+    from cryptography.fernet import Fernet
+
+    token = Fernet(_derive_key(passphrase)).encrypt(text.encode("utf-8"))
+    return _ENC_MAGIC + token
+
+
+def _decrypt(data: bytes, passphrase: str) -> str | None:
+    from cryptography.fernet import Fernet, InvalidToken
+
+    if not data.startswith(_ENC_MAGIC):
+        return None
+    try:
+        plain = Fernet(_derive_key(passphrase)).decrypt(data[len(_ENC_MAGIC):])
+    except (InvalidToken, ValueError):
+        return None
+    try:
+        return plain.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+
+
 class ClipboardSync:
     """Bidirectional clipboard/file sync with a shared last-value guard."""
 
@@ -48,6 +91,7 @@ class ClipboardSync:
         self._lock = threading.Lock()
         self._last_read_error: str | None = None
         self._last_write_error: str | None = None
+        self._last_decrypt_error: str | None = None
 
     @property
     def clipboard_file(self) -> Path:
@@ -75,15 +119,67 @@ class ClipboardSync:
             self._poll_thread.join(timeout=3)
         log.info("Clipboard sync stopped")
 
-    def _seed_from_file(self) -> None:
-        """Prime _last_synced from whatever is on disk so we don't re-emit it."""
+    def _passphrase(self) -> str:
+        val = self._settings.get("encryption_passphrase") or ""
+        return val if isinstance(val, str) else ""
+
+    def _read_file(self) -> str | None:
+        """Return the plaintext content of the shared file, transparently
+        decrypting if it's a CSENC payload. None means the file is missing,
+        unreadable, or encrypted with a passphrase we don't have."""
         path = self.clipboard_file
         try:
-            if path.exists():
-                with self._lock:
-                    self._last_synced = _normalize_newlines(path.read_text(encoding="utf-8"))
+            if not path.exists():
+                return None
+            data = path.read_bytes()
         except OSError as exc:
-            log.warning("Could not read existing clipboard file: %s", exc)
+            log.debug("File read failed: %s", exc)
+            return None
+        if data.startswith(_ENC_MAGIC):
+            passphrase = self._passphrase()
+            if not passphrase:
+                err = "encrypted payload but no passphrase configured"
+                if err != self._last_decrypt_error:
+                    log.warning("Cannot read clipboard: %s", err)
+                    self._last_decrypt_error = err
+                return None
+            decrypted = _decrypt(data, passphrase)
+            if decrypted is None:
+                err = "decrypt failed (passphrase mismatch?)"
+                if err != self._last_decrypt_error:
+                    log.warning("Cannot read clipboard: %s", err)
+                    self._last_decrypt_error = err
+                return None
+            if self._last_decrypt_error is not None:
+                log.info("Decrypt recovered")
+                self._last_decrypt_error = None
+            return _normalize_newlines(decrypted)
+        try:
+            return _normalize_newlines(data.decode("utf-8"))
+        except UnicodeDecodeError:
+            log.warning("Clipboard file is not valid UTF-8 and not encrypted; ignoring")
+            return None
+
+    def _write_file(self, text: str) -> None:
+        """Atomic write of the shared file, encrypting if a passphrase is set."""
+        path = self.clipboard_file
+        path.parent.mkdir(parents=True, exist_ok=True)
+        passphrase = self._passphrase()
+        payload = _encrypt(text, passphrase) if passphrase else text.encode("utf-8")
+        tmp = path.with_suffix(".txt.tmp")
+        tmp.write_bytes(payload)
+        tmp.replace(path)
+
+    def _seed_from_file(self) -> None:
+        """Prime _last_synced from whatever is on disk so we don't re-emit it."""
+        try:
+            content = self._read_file()
+        except Exception:
+            log.warning("Could not read existing clipboard file")
+            return
+        if content is not None:
+            with self._lock:
+                self._last_synced = content
 
     def _is_paused(self) -> bool:
         return bool(self._settings.get("sync_paused"))
@@ -136,12 +232,8 @@ class ClipboardSync:
             if current == self._last_synced:
                 return
             self._last_synced = current
-        path = self.clipboard_file
         try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = path.with_suffix(".txt.tmp")
-            tmp.write_text(current, encoding="utf-8")
-            tmp.replace(path)
+            self._write_file(current)
             log.info("OUT: %d chars written", len(current))
         except OSError:
             log.exception("Failed to write clipboard file")
@@ -158,13 +250,8 @@ class ClipboardSync:
     def _on_file_changed(self) -> None:
         if self._is_paused():
             return
-        path = self.clipboard_file
-        try:
-            if not path.exists():
-                return
-            content = _normalize_newlines(path.read_text(encoding="utf-8"))
-        except OSError as exc:
-            log.debug("File read failed: %s", exc)
+        content = self._read_file()
+        if content is None:
             return
         with self._lock:
             if content == self._last_synced:

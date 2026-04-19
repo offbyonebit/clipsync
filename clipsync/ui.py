@@ -583,6 +583,19 @@ class DevicesWindow(_BaseWindow):
         status_lbl = ctk.CTkLabel(row, text=status_text, text_color=status_color, font=ctk.CTkFont(size=11))
         status_lbl.grid(row=0, column=1, rowspan=2, padx=10)
 
+        rename_btn = ctk.CTkButton(
+            row,
+            text="Rename",
+            width=70,
+            fg_color="transparent",
+            border_width=1,
+            text_color=config.ACCENT_COLOR,
+            border_color=config.ACCENT_COLOR,
+            hover_color=config.ACCENT_HOVER,
+            command=lambda did=device["deviceID"], nm=name_text: self._rename_device(did, nm),
+        )
+        rename_btn.grid(row=0, column=2, rowspan=2, padx=(0, 6))
+
         remove_btn = ctk.CTkButton(
             row,
             text="Remove",
@@ -593,7 +606,7 @@ class DevicesWindow(_BaseWindow):
             hover_color=("gray75", "gray30"),
             command=lambda did=device["deviceID"]: self._remove_device(did),
         )
-        remove_btn.grid(row=0, column=2, rowspan=2, padx=(0, 10))
+        remove_btn.grid(row=0, column=3, rowspan=2, padx=(0, 10))
 
     def _remove_device(self, device_id: str) -> None:
         try:
@@ -601,6 +614,44 @@ class DevicesWindow(_BaseWindow):
         except Exception:
             log.exception("Failed to remove device")
         self._refresh()
+
+    def _rename_device(self, device_id: str, current_name: str) -> None:
+        dialog = ctk.CTkToplevel(self.window)
+        dialog.title("Rename device")
+        dialog.resizable(False, False)
+        _center_window(dialog, 320, 160)
+        dialog.transient(self.window)
+        dialog.grab_set()
+
+        ctk.CTkLabel(
+            dialog,
+            text=f"New name for {device_id[:7]}:",
+            font=ctk.CTkFont(size=12),
+        ).pack(padx=20, pady=(18, 6))
+
+        entry = ctk.CTkEntry(dialog)
+        entry.insert(0, current_name)
+        entry.pack(fill="x", padx=20)
+        entry.select_range(0, "end")
+        entry.focus_set()
+
+        btns = ctk.CTkFrame(dialog, fg_color="transparent")
+        btns.pack(fill="x", padx=20, pady=(12, 16))
+
+        def do_save() -> None:
+            new_name = entry.get().strip()
+            if not new_name:
+                return
+            try:
+                self._app.client.rename_device(device_id, new_name)
+            except Exception:
+                log.exception("Rename failed")
+            dialog.destroy()
+            self._refresh()
+
+        ctk.CTkButton(btns, text="Cancel", fg_color="transparent", border_width=1, command=dialog.destroy).pack(side="left", expand=True, fill="x", padx=(0, 4))
+        ctk.CTkButton(btns, text="Save", fg_color=config.ACCENT_COLOR, hover_color=config.ACCENT_HOVER, command=do_save).pack(side="left", expand=True, fill="x", padx=(4, 0))
+        entry.bind("<Return>", lambda _e: do_save())
 
 
 class SettingsWindow(_BaseWindow):
@@ -650,6 +701,28 @@ class SettingsWindow(_BaseWindow):
             progress_color=config.ACCENT_COLOR,
         )
         pause_sw.pack(anchor="w", pady=4)
+
+        ctk.CTkLabel(container, text="Encryption passphrase (optional)", font=ctk.CTkFont(size=11)).pack(anchor="w", pady=(14, 2))
+        ctk.CTkLabel(
+            container,
+            text="Same passphrase on every device. Empty = no encryption.",
+            font=ctk.CTkFont(size=10),
+            text_color=("gray40", "gray60"),
+        ).pack(anchor="w")
+        passphrase_row = ctk.CTkFrame(container, fg_color="transparent")
+        passphrase_row.pack(fill="x", pady=(2, 0))
+        self._passphrase_entry = ctk.CTkEntry(passphrase_row, show="•")
+        self._passphrase_entry.insert(0, str(app.settings.get("encryption_passphrase") or ""))
+        self._passphrase_entry.pack(side="left", fill="x", expand=True, padx=(0, 6))
+        passphrase_btn = ctk.CTkButton(
+            passphrase_row,
+            text="Save",
+            width=70,
+            fg_color=config.ACCENT_COLOR,
+            hover_color=config.ACCENT_HOVER,
+            command=self._on_save_passphrase,
+        )
+        passphrase_btn.pack(side="left")
 
         ctk.CTkLabel(container, text="Sync folder path (advanced)", font=ctk.CTkFont(size=11)).pack(anchor="w", pady=(14, 2))
         folder_row = ctk.CTkFrame(container, fg_color="transparent")
@@ -705,6 +778,14 @@ class SettingsWindow(_BaseWindow):
         self._app.settings.set("sync_paused", paused)
         self._app.on_pause_changed(paused)
         self._status.configure(text=f"Sync {'paused' if paused else 'resumed'}.")
+
+    def _on_save_passphrase(self) -> None:
+        new_value = self._passphrase_entry.get()
+        self._app.settings.set("encryption_passphrase", new_value)
+        if new_value:
+            self._status.configure(text="Encryption enabled. Set the same passphrase on every device.")
+        else:
+            self._status.configure(text="Encryption disabled.")
 
     def _on_save_folder(self) -> None:
         new_path = self._folder_entry.get().strip()

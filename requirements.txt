@@ -7,3 +7,4 @@ watchdog>=4.0.0
 requests>=2.31.0
 opencv-python>=4.9.0.80
 pyinstaller>=6.3.0
+cryptography>=41.0.0
