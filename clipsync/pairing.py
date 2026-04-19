@@ -13,7 +13,7 @@ import logging
 import re
 import threading
 import time
-from typing import Callable
+from collections.abc import Callable
 
 import qrcode
 from PIL import Image
@@ -78,7 +78,7 @@ class WebcamQRScanner:
 
     def _run(self) -> None:
         try:
-            import cv2  # type: ignore
+            import cv2
         except ImportError:
             log.error("opencv-python not installed, cannot scan QR codes")
             return

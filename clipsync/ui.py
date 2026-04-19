@@ -14,8 +14,8 @@ import logging
 import subprocess
 import sys
 import threading
+from collections.abc import Callable
 from pathlib import Path
-from typing import Callable, Optional
 
 import customtkinter as ctk
 from PIL import Image
@@ -171,7 +171,7 @@ class _BaseWindow:
         parent: ctk.CTk,
         title: str,
         size: tuple[int, int],
-        on_close: Optional[Callable[[], None]] = None,
+        on_close: Callable[[], None] | None = None,
     ) -> None:
         self._on_close = on_close
         self.window = ctk.CTkToplevel(parent)
@@ -239,7 +239,9 @@ class PairingWindow(_BaseWindow):
         self._schedule_nearby_refresh()
 
         # Manual entry with paste button.
-        ctk.CTkLabel(container, text="Or paste a device ID", font=ctk.CTkFont(size=12, weight="bold"), anchor="w").pack(fill="x")
+        ctk.CTkLabel(container, text="Or paste a device ID", font=ctk.CTkFont(size=12, weight="bold"), anchor="w").pack(
+            fill="x"
+        )
         entry_row = ctk.CTkFrame(container, fg_color="transparent")
         entry_row.pack(fill="x", pady=(2, 8))
         self._entry = ctk.CTkEntry(entry_row, placeholder_text="XXXXXXX-XXXXXXX-…")
@@ -267,7 +269,9 @@ class PairingWindow(_BaseWindow):
         add_btn.pack(side="left")
 
         # This device's QR + ID (collapsible so it doesn't dominate).
-        ctk.CTkLabel(container, text="Your device ID (for the other side)", font=ctk.CTkFont(size=12, weight="bold"), anchor="w").pack(fill="x", pady=(4, 2))
+        ctk.CTkLabel(
+            container, text="Your device ID (for the other side)", font=ctk.CTkFont(size=12, weight="bold"), anchor="w"
+        ).pack(fill="x", pady=(4, 2))
         own_row = ctk.CTkFrame(container, fg_color=("gray90", "gray17"))
         own_row.pack(fill="x", pady=(0, 8))
         self._qr_label = ctk.CTkLabel(own_row, text="")
@@ -364,7 +368,7 @@ class PairingWindow(_BaseWindow):
         if not self.exists():
             return
         items = []
-        for did in discovered.keys():
+        for did in discovered:
             if did == self._app.device_id or did in known:
                 continue
             items.append(did)
@@ -425,7 +429,8 @@ class PairingWindow(_BaseWindow):
             self.window.after(0, self._start_pending_watch, device_id)
         except Exception as exc:
             log.exception("Pairing failed")
-            self.window.after(0, lambda: self._status_var.set(f"Failed to pair: {exc}"))
+            message = f"Failed to pair: {exc}"
+            self.window.after(0, lambda: self._status_var.set(message))
 
     def _set_pending(self, device_id: str) -> None:
         self._status_var.set(f"Adding {device_id[:7]}…")
@@ -452,7 +457,9 @@ class PairingWindow(_BaseWindow):
             return
         self._status_var.set("Opening camera… point it at the other device's QR.")
         if self._preview_label is None:
-            self._preview_label = ctk.CTkLabel(self.window, text="Starting camera…", width=self._preview_size[0], height=self._preview_size[1])
+            self._preview_label = ctk.CTkLabel(
+                self.window, text="Starting camera…", width=self._preview_size[0], height=self._preview_size[1]
+            )
             self._preview_label.pack(pady=(8, 10))
             self.window.geometry("")  # let Tk grow the window to fit
         scanner = pairing.WebcamQRScanner(on_detected=self._on_qr_detected)
@@ -463,16 +470,16 @@ class PairingWindow(_BaseWindow):
     def _on_frame(self, frame: object) -> None:
         """Called on the scanner thread for every captured frame."""
         try:
-            import cv2  # type: ignore
+            import cv2
         except ImportError:
             return
         try:
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)  # type: ignore[attr-defined]
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             h, w = rgb.shape[:2]
             target_w, target_h = self._preview_size
             scale = min(target_w / w, target_h / h)
             nw, nh = int(w * scale), int(h * scale)
-            resized = cv2.resize(rgb, (nw, nh))  # type: ignore[attr-defined]
+            resized = cv2.resize(rgb, (nw, nh))
             img = Image.fromarray(resized)
         except Exception:
             log.exception("Frame conversion failed")
@@ -652,8 +659,12 @@ class DevicesWindow(_BaseWindow):
             dialog.destroy()
             self._refresh()
 
-        ctk.CTkButton(btns, text="Cancel", fg_color="transparent", border_width=1, command=dialog.destroy).pack(side="left", expand=True, fill="x", padx=(0, 4))
-        ctk.CTkButton(btns, text="Save", fg_color=config.ACCENT_COLOR, hover_color=config.ACCENT_HOVER, command=do_save).pack(side="left", expand=True, fill="x", padx=(4, 0))
+        ctk.CTkButton(btns, text="Cancel", fg_color="transparent", border_width=1, command=dialog.destroy).pack(
+            side="left", expand=True, fill="x", padx=(0, 4)
+        )
+        ctk.CTkButton(
+            btns, text="Save", fg_color=config.ACCENT_COLOR, hover_color=config.ACCENT_HOVER, command=do_save
+        ).pack(side="left", expand=True, fill="x", padx=(4, 0))
         entry.bind("<Return>", lambda _e: do_save())
 
 
@@ -673,7 +684,9 @@ class SettingsWindow(_BaseWindow):
         container = ctk.CTkFrame(self.window, fg_color="transparent")
         container.pack(fill="both", expand=True, padx=20, pady=20)
 
-        ctk.CTkLabel(container, text="Settings", font=ctk.CTkFont(size=18, weight="bold")).pack(anchor="w", pady=(0, 12))
+        ctk.CTkLabel(container, text="Settings", font=ctk.CTkFont(size=18, weight="bold")).pack(
+            anchor="w", pady=(0, 12)
+        )
 
         self._autostart_var = ctk.BooleanVar(value=is_autostart_enabled())
         autostart_sw = ctk.CTkSwitch(
@@ -705,7 +718,9 @@ class SettingsWindow(_BaseWindow):
         )
         pause_sw.pack(anchor="w", pady=4)
 
-        ctk.CTkLabel(container, text="Encryption passphrase (optional)", font=ctk.CTkFont(size=11)).pack(anchor="w", pady=(14, 2))
+        ctk.CTkLabel(container, text="Encryption passphrase (optional)", font=ctk.CTkFont(size=11)).pack(
+            anchor="w", pady=(14, 2)
+        )
         ctk.CTkLabel(
             container,
             text="Same passphrase on every device. Empty = no encryption.",
@@ -727,7 +742,9 @@ class SettingsWindow(_BaseWindow):
         )
         passphrase_btn.pack(side="left")
 
-        ctk.CTkLabel(container, text="Sync folder path (advanced)", font=ctk.CTkFont(size=11)).pack(anchor="w", pady=(14, 2))
+        ctk.CTkLabel(container, text="Sync folder path (advanced)", font=ctk.CTkFont(size=11)).pack(
+            anchor="w", pady=(14, 2)
+        )
         folder_row = ctk.CTkFrame(container, fg_color="transparent")
         folder_row.pack(fill="x")
         self._folder_entry = ctk.CTkEntry(folder_row)
@@ -833,8 +850,12 @@ class SettingsWindow(_BaseWindow):
             self._app.on_reset()
             self._status.configure(text="All devices removed.")
 
-        ctk.CTkButton(btns, text="Cancel", fg_color="transparent", border_width=1, command=confirm.destroy).pack(side="left", expand=True, fill="x", padx=(0, 4))
-        ctk.CTkButton(btns, text="Reset", fg_color="#9b2c2c", hover_color="#7a2222", command=do_reset).pack(side="left", expand=True, fill="x", padx=(4, 0))
+        ctk.CTkButton(btns, text="Cancel", fg_color="transparent", border_width=1, command=confirm.destroy).pack(
+            side="left", expand=True, fill="x", padx=(0, 4)
+        )
+        ctk.CTkButton(btns, text="Reset", fg_color="#9b2c2c", hover_color="#7a2222", command=do_reset).pack(
+            side="left", expand=True, fill="x", padx=(4, 0)
+        )
 
 
 class LogsWindow(_BaseWindow):
