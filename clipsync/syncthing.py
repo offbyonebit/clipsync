@@ -152,13 +152,30 @@ def _generate_home(binary: Path, home: Path) -> None:
 
 
 def _read_device_id(binary: Path, home: Path) -> str:
-    """Extract our device ID from the generated config.xml."""
+    """Extract our own device ID from config.xml.
+
+    After pairing, config.xml holds multiple <device> entries (self
+    plus each paired remote), in arbitrary order. The self device is
+    the one whose id is shared by every folder's own <device> list
+    (Syncthing requires the owner to be listed on each folder).
+    """
     config_path = home / "config.xml"
     tree = ET.parse(config_path)
     root = tree.getroot()
-    for device in root.findall("device"):
-        did = device.get("id", "")
-        if did and "-" in did and len(did) >= 50:
+    top_level_ids = [d.get("id", "") for d in root.findall("device") if d.get("id")]
+
+    folder_device_ids: set[str] | None = None
+    for folder in root.findall("folder"):
+        ids_in_folder = {d.get("id", "") for d in folder.findall("device") if d.get("id")}
+        folder_device_ids = ids_in_folder if folder_device_ids is None else (folder_device_ids & ids_in_folder)
+    if folder_device_ids is None:
+        folder_device_ids = set()
+
+    for did in top_level_ids:
+        if did in folder_device_ids and "-" in did and len(did) >= 50:
+            return did
+    for did in top_level_ids:
+        if "-" in did and len(did) >= 50:
             return did
     raise SyncthingError("Could not parse device ID from config.xml")
 
@@ -339,6 +356,15 @@ class SyncthingClient:
         folder_devices.append({"deviceID": device_id, "introducedBy": ""})
         target["devices"] = folder_devices
         self._put(f"/rest/config/folders/{folder_id}", target)
+
+    def rename_device(self, device_id: str, new_name: str) -> None:
+        """Update the display name of a configured device."""
+        devices = self.get_devices()
+        target = next((d for d in devices if d.get("deviceID") == device_id), None)
+        if target is None:
+            raise SyncthingError(f"Device {device_id!r} not in config")
+        target["name"] = new_name
+        self._put(f"/rest/config/devices/{device_id}", target)
 
     def remove_device(self, device_id: str) -> None:
         try:
