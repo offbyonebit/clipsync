@@ -92,6 +92,7 @@ class Settings:
         self._path = path
         self._lock = threading.RLock()
         self._data: dict[str, Any] = dict(DEFAULT_SETTINGS)
+        self._mtime_ns: int = 0
         self._load()
 
     def _load(self) -> None:
@@ -119,9 +120,25 @@ class Settings:
         with tmp.open("w", encoding="utf-8") as fh:
             json.dump(self._data, fh, indent=2)
         os.replace(tmp, self._path)
+        try:
+            self._mtime_ns = self._path.stat().st_mtime_ns
+        except OSError:
+            pass
+
+    def _refresh_if_changed(self) -> None:
+        """Reload from disk if another process (e.g. a UI subprocess) has
+        written a newer settings.json. Cheap stat call; no-op if unchanged."""
+        try:
+            current_mtime = self._path.stat().st_mtime_ns
+        except OSError:
+            return
+        if current_mtime == self._mtime_ns:
+            return
+        self.reload()
 
     def get(self, key: str, default: Any = None) -> Any:
         with self._lock:
+            self._refresh_if_changed()
             return self._data.get(key, default)
 
     def set(self, key: str, value: Any) -> None:
@@ -139,14 +156,15 @@ class Settings:
             return dict(self._data)
 
     def reload(self) -> None:
-        """Re-read from disk. Used by the main process after a UI
-        subprocess has persisted changes to settings.json."""
+        """Re-read from disk. Normally called automatically by get(),
+        but still available for explicit refresh (e.g. after a UI event)."""
         with self._lock:
             if not self._path.exists():
                 return
             try:
                 with self._path.open("r", encoding="utf-8") as fh:
                     loaded = json.load(fh)
+                self._mtime_ns = self._path.stat().st_mtime_ns
             except (OSError, json.JSONDecodeError) as exc:
                 logging.warning("Failed to reload settings: %s", exc)
                 return
