@@ -30,6 +30,12 @@ from . import config
 log = logging.getLogger(__name__)
 
 
+def _normalize_newlines(s: str) -> str:
+    """Collapse CRLF/CR to LF so Windows's clipboard normalization does not
+    look like a real change to the OUT loop after a remote update."""
+    return s.replace("\r\n", "\n").replace("\r", "\n")
+
+
 class ClipboardSync:
     """Bidirectional clipboard/file sync with a shared last-value guard."""
 
@@ -75,7 +81,7 @@ class ClipboardSync:
         try:
             if path.exists():
                 with self._lock:
-                    self._last_synced = path.read_text(encoding="utf-8")
+                    self._last_synced = _normalize_newlines(path.read_text(encoding="utf-8"))
         except OSError as exc:
             log.warning("Could not read existing clipboard file: %s", exc)
 
@@ -96,7 +102,7 @@ class ClipboardSync:
             self._last_read_error = None
         if not isinstance(value, str):
             return None
-        return value
+        return _normalize_newlines(value)
 
     def _write_clipboard(self, value: str) -> bool:
         try:
@@ -156,7 +162,7 @@ class ClipboardSync:
         try:
             if not path.exists():
                 return
-            content = path.read_text(encoding="utf-8")
+            content = _normalize_newlines(path.read_text(encoding="utf-8"))
         except OSError as exc:
             log.debug("File read failed: %s", exc)
             return
