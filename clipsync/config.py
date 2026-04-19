@@ -35,7 +35,7 @@ CLIPBOARD_POLL_INTERVAL = 0.5
 PAIRING_POLL_INTERVAL = 5.0
 
 PAIRING_WINDOW_SIZE = (420, 620)
-SETTINGS_WINDOW_SIZE = (400, 450)
+SETTINGS_WINDOW_SIZE = (420, 560)
 
 
 def _app_data_dir() -> Path:
@@ -76,6 +76,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "start_on_login": False,
     "sync_folder": str(SYNC_FOLDER),
     "first_run_completed": False,
+    "encryption_passphrase": "",
 }
 
 
