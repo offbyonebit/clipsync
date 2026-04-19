@@ -82,10 +82,25 @@ class WebcamQRScanner:
         except ImportError:
             log.error("opencv-python not installed, cannot scan QR codes")
             return
-        cap = cv2.VideoCapture(0)
+        import platform
+
+        system = platform.system()
+        if system == "Windows":
+            backend = cv2.CAP_DSHOW
+        elif system == "Darwin":
+            backend = cv2.CAP_AVFOUNDATION
+        else:
+            backend = cv2.CAP_V4L2
+        cap = cv2.VideoCapture(0, backend)
+        if not cap.isOpened():
+            log.warning("Fast backend failed, retrying with default")
+            cap = cv2.VideoCapture(0)
         if not cap.isOpened():
             log.error("Could not open webcam")
             return
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         detector = cv2.QRCodeDetector()
         try:
             while not self._stop.is_set():

@@ -299,6 +299,16 @@ class SyncthingClient:
             return {}
         return data or {}
 
+    def get_discovered_devices(self) -> dict[str, list[str]]:
+        """Devices seen via local broadcast + global discovery, keyed by ID."""
+        try:
+            data = self._get("/rest/system/discovery")
+        except requests.RequestException:
+            return {}
+        if not isinstance(data, dict):
+            return {}
+        return {k: list(v.get("addresses") or []) if isinstance(v, dict) else list(v or []) for k, v in data.items()}
+
     def get_connections(self) -> dict[str, Any]:
         return self._get("/rest/system/connections") or {}
 

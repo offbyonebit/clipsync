@@ -1,15 +1,17 @@
-"""Entry point: wires Syncthing, clipboard, UI, and the tray icon together.
+"""Entry point: wires Syncthing, clipboard, and the tray icon together.
 
 Lifecycle on start:
   1. Configure logging and settings
   2. Launch Syncthing and wait until its REST API is ready
   3. Start the auto-accepter and clipboard sync threads
-  4. Show the tray icon
-  5. Enter the Tk main loop (needed for CustomTkinter windows)
+  4. Run the tray icon on the main thread (required on macOS; fine
+     everywhere else). UI windows are spawned as separate Python
+     subprocesses by the UIController.
 
 Lifecycle on quit:
-  Stop in reverse order. Syncthing's subprocess is always the last thing
-  we bring down so pending file changes flush cleanly.
+  Tray.run() returns when `icon.stop()` is called. We then tear down
+  in reverse order. Syncthing's subprocess is always the last thing we
+  bring down so pending file changes flush cleanly.
 """
 
 from __future__ import annotations
@@ -27,7 +29,7 @@ from . import config
 from .clipboard import ClipboardSync
 from .pairing import PendingDeviceAccepter
 from .syncthing import SyncthingError, SyncthingService
-from .ui import AppContext, UIManager
+from .ui import UIController
 
 log = logging.getLogger(__name__)
 
@@ -56,21 +58,16 @@ def _load_or_create_icon(size: int = 64) -> Image.Image:
 
 
 class ClipSyncApp:
-    """Top-level orchestration object.
-
-    Owns the Syncthing subprocess, the clipboard engine, the pending-device
-    auto-accepter, the tray icon, and the UI manager. A single Event is
-    used to coordinate shutdown across all threads."""
+    """Top-level orchestration object."""
 
     def __init__(self) -> None:
         self.settings = config.Settings()
         self.syncthing = SyncthingService(self.settings)
         self.clipboard: ClipboardSync | None = None
         self.accepter: PendingDeviceAccepter | None = None
-        self.ui = UIManager()
+        self.ui = UIController(on_event=self._handle_ui_event)
         self.tray: pystray.Icon | None = None
         self._quitting = threading.Event()
-        self._app_context: AppContext | None = None
 
     def start(self) -> None:
         config.configure_logging()
@@ -89,24 +86,15 @@ class ClipSyncApp:
         )
         self.accepter.start()
 
-        self._app_context = AppContext(
-            settings=self.settings,
-            client=self.syncthing.client,
-            device_id=self.syncthing.device_id,
-            on_pause_changed=self._on_pause_changed,
-            on_reset=self._on_reset,
-            on_folder_changed=self._on_folder_changed,
-        )
-
-        self.ui.create_root()
-        self._start_tray()
-
         if not self.settings.get("first_run_completed"):
             self.settings.set("first_run_completed", True)
-            self._notify(f"{config.APP_NAME} is running", "Click the tray icon to add a device.")
+            # Tray notification needs the icon to be running, so defer.
+            self._pending_first_run_notice = True
+        else:
+            self._pending_first_run_notice = False
 
-        log.info("Initialization complete, entering main loop")
-        self.ui.mainloop(on_exit=self._shutdown)
+        log.info("Initialization complete, starting tray")
+        self._run_tray()
 
     def _start_syncthing_with_retry(self) -> None:
         attempt = 0
@@ -117,7 +105,6 @@ class ClipSyncApp:
             except SyncthingError as exc:
                 attempt += 1
                 log.error("Syncthing failed to start (attempt %d): %s", attempt, exc)
-                self._notify("ClipSync error", f"Syncthing failed to start: {exc}. Retrying…")
                 if self._quitting.wait(10):
                     break
             except Exception:
@@ -127,18 +114,18 @@ class ClipSyncApp:
         if not self._quitting.is_set():
             raise SystemExit("Could not start Syncthing; giving up")
 
-    def _start_tray(self) -> None:
+    def _run_tray(self) -> None:
         image = _load_or_create_icon()
         menu = pystray.Menu(
-            pystray.MenuItem("Add Device", self._menu_add_device),
-            pystray.MenuItem("Connected Devices", self._menu_devices),
+            pystray.MenuItem("Add Device", lambda _i, _it: self.ui.open("pairing")),
+            pystray.MenuItem("Connected Devices", lambda _i, _it: self.ui.open("devices")),
             pystray.MenuItem(
                 "Pause Sync",
                 self._menu_toggle_pause,
                 checked=lambda _item: bool(self.settings.get("sync_paused")),
             ),
             pystray.Menu.SEPARATOR,
-            pystray.MenuItem("Settings", self._menu_settings),
+            pystray.MenuItem("Settings", lambda _i, _it: self.ui.open("settings")),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Quit", self._menu_quit),
         )
@@ -148,7 +135,16 @@ class ClipSyncApp:
             title=config.APP_NAME,
             menu=menu,
         )
-        threading.Thread(target=self.tray.run, name="clipsync-tray", daemon=True).start()
+        try:
+            self.tray.run(setup=self._on_tray_ready)
+        finally:
+            self._shutdown()
+
+    def _on_tray_ready(self, icon: pystray.Icon) -> None:
+        icon.visible = True
+        if self._pending_first_run_notice:
+            self._pending_first_run_notice = False
+            self._notify(f"{config.APP_NAME} is running", "Click the tray icon to add a device.")
 
     def _notify(self, title: str, message: str) -> None:
         if not self.settings.get("show_notifications", True) and title != f"{config.APP_NAME} is running":
@@ -163,18 +159,6 @@ class ClipSyncApp:
             log.debug("Tray notification not supported on this platform")
             log.info("%s: %s", title, message)
 
-    def _menu_add_device(self, _icon: pystray.Icon, _item: pystray.MenuItem) -> None:
-        if self._app_context is not None:
-            self.ui.open_pairing(self._app_context)
-
-    def _menu_devices(self, _icon: pystray.Icon, _item: pystray.MenuItem) -> None:
-        if self._app_context is not None:
-            self.ui.open_devices(self._app_context)
-
-    def _menu_settings(self, _icon: pystray.Icon, _item: pystray.MenuItem) -> None:
-        if self._app_context is not None:
-            self.ui.open_settings(self._app_context)
-
     def _menu_toggle_pause(self, _icon: pystray.Icon, _item: pystray.MenuItem) -> None:
         paused = not bool(self.settings.get("sync_paused"))
         self.settings.set("sync_paused", paused)
@@ -182,9 +166,27 @@ class ClipSyncApp:
         if self.tray is not None:
             self.tray.update_menu()
 
-    def _menu_quit(self, _icon: pystray.Icon, _item: pystray.MenuItem) -> None:
+    def _menu_quit(self, icon: pystray.Icon, _item: pystray.MenuItem) -> None:
         log.info("Quit requested from tray")
-        self.ui.quit()
+        icon.stop()
+
+    # UI event dispatch ------------------------------------------------------
+
+    def _handle_ui_event(self, evt: dict) -> None:
+        """Called from a background reader thread for each JSON event from a child window."""
+        kind = evt.get("event")
+        if kind == "pause_changed":
+            self._on_pause_changed(bool(evt.get("paused")))
+            if self.tray is not None:
+                self.tray.update_menu()
+        elif kind == "folder_changed":
+            path = evt.get("path")
+            if isinstance(path, str):
+                self._on_folder_changed(path)
+        elif kind == "reset":
+            log.info("Devices reset from UI")
+        else:
+            log.debug("Unhandled UI event: %s", evt)
 
     def _on_pause_changed(self, paused: bool) -> None:
         if self.syncthing.client is not None:
@@ -200,37 +202,24 @@ class ClipSyncApp:
     def _on_device_accepted(self, device_id: str) -> None:
         self._notify("Device connected", f"Now syncing clipboard with {device_id[:7]}")
 
-    def _on_reset(self) -> None:
-        if self.syncthing.client is None:
-            return
-        try:
-            for d in self.syncthing.client.connected_devices():
-                self.syncthing.client.remove_device(d["deviceID"])
-            log.info("All paired devices removed")
-        except Exception:
-            log.exception("Failed to reset devices")
-
     def _on_folder_changed(self, new_path: str) -> None:
-        """Update the clipboard engine to watch the new folder.
-
-        Syncthing's own folder path change needs a restart to take effect;
-        the UI surface already warns the user."""
         Path(new_path).mkdir(parents=True, exist_ok=True)
         if self.clipboard is not None:
             self.clipboard.stop()
             self.clipboard = ClipboardSync(self.settings)
             self.clipboard.start()
 
+    # Shutdown ---------------------------------------------------------------
+
     def _shutdown(self) -> None:
         if self._quitting.is_set():
             return
         self._quitting.set()
         log.info("Shutting down")
-        if self.tray is not None:
-            try:
-                self.tray.stop()
-            except Exception:
-                log.exception("Error stopping tray")
+        try:
+            self.ui.close_all()
+        except Exception:
+            log.exception("Error closing UI subprocesses")
         if self.accepter is not None:
             self.accepter.stop()
         if self.clipboard is not None:
@@ -251,7 +240,14 @@ def _read_version() -> str:
 def _install_signal_handlers(app: ClipSyncApp) -> None:
     def handler(_signum, _frame) -> None:
         log.info("Received termination signal, shutting down")
-        app.ui.quit()
+        if app.tray is not None:
+            try:
+                app.tray.stop()
+                return
+            except Exception:
+                pass
+        app._shutdown()
+        sys.exit(0)
 
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
@@ -266,7 +262,7 @@ def main() -> int:
     try:
         app.start()
     except KeyboardInterrupt:
-        app.ui.quit()
+        app._shutdown()
     except Exception:
         log.exception("Fatal error in main")
         return 1
