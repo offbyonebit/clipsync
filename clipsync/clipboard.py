@@ -486,8 +486,7 @@ class _ClipboardFileHandler(FileSystemEventHandler):
         try:
             resolved = Path(path).resolve()
             return (
-                resolved == self._sync.clipboard_file.resolve()
-                or resolved == self._sync.clipboard_image_file.resolve()
+                resolved == self._sync.clipboard_file.resolve() or resolved == self._sync.clipboard_image_file.resolve()
             )
         except OSError:
             return False

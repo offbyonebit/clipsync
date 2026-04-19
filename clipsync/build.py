@@ -61,7 +61,16 @@ def _platform_args() -> list[str]:
     if system == "Windows":
         return ["--noconsole"]
     if system == "Darwin":
-        return ["--windowed"]
+        # AppKit / Foundation are imported lazily inside image-write
+        # functions, which PyInstaller's static analysis sometimes
+        # misses. Declare them explicitly so the bundle includes pyobjc.
+        return [
+            "--windowed",
+            "--hidden-import",
+            "AppKit",
+            "--hidden-import",
+            "Foundation",
+        ]
     return []  # Linux: keep console; users typically launch via tray anyway
 
 

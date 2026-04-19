@@ -8,3 +8,5 @@ requests>=2.31.0
 opencv-python>=4.9.0.80
 pyinstaller>=6.3.0
 cryptography>=41.0.0
+pyobjc-core>=10.0; sys_platform == "darwin"
+pyobjc-framework-Cocoa>=10.0; sys_platform == "darwin"
