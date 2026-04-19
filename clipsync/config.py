@@ -138,6 +138,22 @@ class Settings:
         with self._lock:
             return dict(self._data)
 
+    def reload(self) -> None:
+        """Re-read from disk. Used by the main process after a UI
+        subprocess has persisted changes to settings.json."""
+        with self._lock:
+            if not self._path.exists():
+                return
+            try:
+                with self._path.open("r", encoding="utf-8") as fh:
+                    loaded = json.load(fh)
+            except (OSError, json.JSONDecodeError) as exc:
+                logging.warning("Failed to reload settings: %s", exc)
+                return
+            merged = dict(DEFAULT_SETTINGS)
+            merged.update({k: v for k, v in loaded.items() if k in DEFAULT_SETTINGS})
+            self._data = merged
+
 
 def ensure_directories() -> None:
     """Create all app directories. Safe to call repeatedly."""

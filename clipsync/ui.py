@@ -154,6 +154,9 @@ class AppContext:
     def on_folder_changed(self, new_path: str) -> None:
         _emit("folder_changed", path=new_path)
 
+    def on_settings_changed(self) -> None:
+        _emit("settings_changed")
+
 
 # ---------------------------------------------------------------------------
 # Windows
@@ -782,6 +785,7 @@ class SettingsWindow(_BaseWindow):
     def _on_save_passphrase(self) -> None:
         new_value = self._passphrase_entry.get()
         self._app.settings.set("encryption_passphrase", new_value)
+        self._app.on_settings_changed()
         if new_value:
             self._status.configure(text="Encryption enabled. Set the same passphrase on every device.")
         else:
