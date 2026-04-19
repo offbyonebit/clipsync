@@ -174,6 +174,9 @@ class ClipSyncApp:
 
     def _handle_ui_event(self, evt: dict) -> None:
         """Called from a background reader thread for each JSON event from a child window."""
+        # Any UI event means a child subprocess may have persisted settings
+        # changes to disk. Reload so in-memory values stay in sync.
+        self.settings.reload()
         kind = evt.get("event")
         if kind == "pause_changed":
             self._on_pause_changed(bool(evt.get("paused")))
