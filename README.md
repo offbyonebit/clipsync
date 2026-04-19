@@ -110,4 +110,6 @@ code paths are present) but hasn't been as heavily exercised.
 
 ## License
 
-MIT.
+MIT — see [LICENSE](LICENSE). You can fork, modify, and redistribute
+(including commercially), but the copyright notice must travel with the
+code.
