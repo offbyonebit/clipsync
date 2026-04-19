@@ -9,14 +9,21 @@ Two loops:
        and set the local clipboard.
 
 The shared tracker (_last_synced) is the loop guard: a change is only
-propagated in one direction if the text differs from the last value we
+propagated in one direction if the content differs from the last value we
 already synced, which prevents a write from causing a read from causing a
 write ad infinitum.
+
+Image support uses a separate file (clipboard.png) alongside the existing
+clipboard.txt. Text and images are handled independently; whichever file
+changes triggers the appropriate IN handler.
 """
 
 from __future__ import annotations
 
+import io
 import logging
+import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -57,26 +64,106 @@ def _derive_key(passphrase: str) -> bytes:
     return base64.urlsafe_b64encode(kdf.derive(passphrase.encode("utf-8")))
 
 
-def _encrypt(text: str, passphrase: str) -> bytes:
+def _encrypt(payload: bytes, passphrase: str) -> bytes:
+    """Encrypt arbitrary bytes with Fernet and prepend the CSENC magic header."""
     from cryptography.fernet import Fernet
 
-    token = Fernet(_derive_key(passphrase)).encrypt(text.encode("utf-8"))
+    token = Fernet(_derive_key(passphrase)).encrypt(payload)
     return _ENC_MAGIC + token
 
 
-def _decrypt(data: bytes, passphrase: str) -> str | None:
+def _decrypt(data: bytes, passphrase: str) -> bytes | None:
+    """Decrypt a CSENC-prefixed payload. Returns raw bytes, or None on failure."""
     from cryptography.fernet import Fernet, InvalidToken
 
     if not data.startswith(_ENC_MAGIC):
         return None
     try:
-        plain = Fernet(_derive_key(passphrase)).decrypt(data[len(_ENC_MAGIC) :])
+        return Fernet(_derive_key(passphrase)).decrypt(data[len(_ENC_MAGIC) :])
     except (InvalidToken, ValueError):
         return None
-    try:
-        return plain.decode("utf-8")
-    except UnicodeDecodeError:
-        return None
+
+
+def _read_image_from_system_clipboard() -> bytes | None:
+    """Return PNG bytes from the system clipboard, or None if no image is present."""
+    if sys.platform in ("win32", "darwin"):
+        try:
+            from PIL import Image, ImageGrab
+
+            img = ImageGrab.grabclipboard()
+            if not isinstance(img, Image.Image):
+                return None
+            buf = io.BytesIO()
+            img.save(buf, format="PNG")
+            return buf.getvalue()
+        except Exception:
+            return None
+    # Linux: try xclip then wl-paste
+    for cmd in (
+        ["xclip", "-selection", "clipboard", "-t", "image/png", "-o"],
+        ["wl-paste", "--type", "image/png"],
+    ):
+        try:
+            result = subprocess.run(cmd, capture_output=True, timeout=3)
+            if result.returncode == 0 and result.stdout:
+                return result.stdout
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+            continue
+    return None
+
+
+def _write_image_to_system_clipboard(png_bytes: bytes) -> bool:
+    """Write PNG bytes to the system clipboard. Returns True on success."""
+    if sys.platform == "darwin":
+        try:
+            from AppKit import NSImage, NSPasteboard  # type: ignore[import]
+            from Foundation import NSData  # type: ignore[import]
+
+            ns_data = NSData.dataWithBytes_length_(png_bytes, len(png_bytes))
+            ns_image = NSImage.alloc().initWithData_(ns_data)
+            pb = NSPasteboard.generalPasteboard()
+            pb.clearContents()
+            pb.writeObjects_([ns_image])
+            return True
+        except Exception:
+            return False
+    if sys.platform == "win32":
+        try:
+            import ctypes
+
+            from PIL import Image
+
+            img = Image.open(io.BytesIO(png_bytes)).convert("RGB")
+            bmp_buf = io.BytesIO()
+            img.save(bmp_buf, format="BMP")
+            dib = bmp_buf.getvalue()[14:]  # strip 14-byte BMP file header
+            GMEM_MOVEABLE, CF_DIB = 0x0002, 8
+            h = ctypes.windll.kernel32.GlobalAlloc(GMEM_MOVEABLE, len(dib))
+            if not h:
+                return False
+            p = ctypes.windll.kernel32.GlobalLock(h)
+            ctypes.memmove(p, dib, len(dib))
+            ctypes.windll.kernel32.GlobalUnlock(h)
+            if not ctypes.windll.user32.OpenClipboard(None):
+                return False
+            ctypes.windll.user32.EmptyClipboard()
+            ctypes.windll.user32.SetClipboardData(CF_DIB, h)
+            ctypes.windll.user32.CloseClipboard()
+            return True
+        except Exception:
+            return False
+    # Linux: try xclip then wl-copy
+    for cmd in (
+        ["xclip", "-selection", "clipboard", "-t", "image/png"],
+        ["wl-copy", "--type", "image/png"],
+    ):
+        try:
+            result = subprocess.run(cmd, input=png_bytes, capture_output=True, timeout=3)
+            if result.returncode == 0:
+                return True
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+            continue
+    return False
 
 
 class ClipboardSync:
@@ -87,7 +174,7 @@ class ClipboardSync:
         self._stop = threading.Event()
         self._poll_thread: threading.Thread | None = None
         self._observer: Observer | None = None
-        self._last_synced: str | None = None
+        self._last_synced: str | bytes | None = None
         self._lock = threading.Lock()
         self._last_read_error: str | None = None
         self._last_write_error: str | None = None
@@ -97,6 +184,11 @@ class ClipboardSync:
     def clipboard_file(self) -> Path:
         folder = Path(self._settings.get("sync_folder") or config.SYNC_FOLDER)
         return folder / config.CLIPBOARD_FILENAME
+
+    @property
+    def clipboard_image_file(self) -> Path:
+        folder = Path(self._settings.get("sync_folder") or config.SYNC_FOLDER)
+        return folder / config.CLIPBOARD_IMAGE_FILENAME
 
     def start(self) -> None:
         self._stop.clear()
@@ -153,7 +245,11 @@ class ClipboardSync:
             if self._last_decrypt_error is not None:
                 log.info("Decrypt recovered")
                 self._last_decrypt_error = None
-            return _normalize_newlines(decrypted)
+            try:
+                return _normalize_newlines(decrypted.decode("utf-8"))
+            except UnicodeDecodeError:
+                log.warning("Decrypted clipboard data is not valid UTF-8; ignoring")
+                return None
         try:
             return _normalize_newlines(data.decode("utf-8"))
         except UnicodeDecodeError:
@@ -165,21 +261,77 @@ class ClipboardSync:
         path = self.clipboard_file
         path.parent.mkdir(parents=True, exist_ok=True)
         passphrase = self._passphrase()
-        payload = _encrypt(text, passphrase) if passphrase else text.encode("utf-8")
-        tmp = path.with_suffix(".txt.tmp")
+        encoded = text.encode("utf-8")
+        payload = _encrypt(encoded, passphrase) if passphrase else encoded
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_bytes(payload)
+        tmp.replace(path)
+
+    def _read_image_file(self) -> bytes | None:
+        """Return PNG bytes from the shared image file, decrypting if needed."""
+        path = self.clipboard_image_file
+        try:
+            if not path.exists():
+                return None
+            data = path.read_bytes()
+        except OSError as exc:
+            log.debug("Image file read failed: %s", exc)
+            return None
+        if data.startswith(_ENC_MAGIC):
+            passphrase = self._passphrase()
+            if not passphrase:
+                err = "encrypted payload but no passphrase configured"
+                if err != self._last_decrypt_error:
+                    log.warning("Cannot read clipboard image: %s", err)
+                    self._last_decrypt_error = err
+                return None
+            decrypted = _decrypt(data, passphrase)
+            if decrypted is None:
+                err = "decrypt failed (passphrase mismatch?)"
+                if err != self._last_decrypt_error:
+                    log.warning("Cannot read clipboard image: %s", err)
+                    self._last_decrypt_error = err
+                return None
+            if self._last_decrypt_error is not None:
+                log.info("Decrypt recovered")
+                self._last_decrypt_error = None
+            return decrypted
+        return data
+
+    def _write_image_file(self, png_bytes: bytes) -> None:
+        """Atomic write of the shared image file, encrypting if a passphrase is set."""
+        path = self.clipboard_image_file
+        path.parent.mkdir(parents=True, exist_ok=True)
+        passphrase = self._passphrase()
+        payload = _encrypt(png_bytes, passphrase) if passphrase else png_bytes
+        tmp = path.with_name(path.name + ".tmp")
         tmp.write_bytes(payload)
         tmp.replace(path)
 
     def _seed_from_file(self) -> None:
-        """Prime _last_synced from whatever is on disk so we don't re-emit it."""
+        """Prime _last_synced from disk so we don't re-emit stale content on startup.
+        Uses the more-recently-modified file when both exist."""
         try:
+            text_path = self.clipboard_file
+            img_path = self.clipboard_image_file
+            try:
+                text_mtime = text_path.stat().st_mtime if text_path.exists() else 0.0
+                img_mtime = img_path.stat().st_mtime if img_path.exists() else 0.0
+            except OSError:
+                text_mtime = img_mtime = 0.0
+
+            if img_mtime > text_mtime:
+                image = self._read_image_file()
+                if image is not None:
+                    with self._lock:
+                        self._last_synced = image
+                    return
             content = self._read_file()
+            if content is not None:
+                with self._lock:
+                    self._last_synced = content
         except Exception:
             log.warning("Could not read existing clipboard file")
-            return
-        if content is not None:
-            with self._lock:
-                self._last_synced = content
 
     def _is_paused(self) -> bool:
         return bool(self._settings.get("sync_paused"))
@@ -214,6 +366,20 @@ class ClipboardSync:
             self._last_write_error = None
         return True
 
+    def _read_clipboard_image(self) -> bytes | None:
+        try:
+            return _read_image_from_system_clipboard()
+        except Exception as exc:
+            log.debug("Image clipboard read failed: %s", exc)
+            return None
+
+    def _write_clipboard_image(self, png_bytes: bytes) -> bool:
+        try:
+            return _write_image_to_system_clipboard(png_bytes)
+        except Exception as exc:
+            log.debug("Image clipboard write failed: %s", exc)
+            return False
+
     def _out_loop(self) -> None:
         while not self._stop.is_set():
             try:
@@ -225,6 +391,20 @@ class ClipboardSync:
                 break
 
     def _out_tick(self) -> None:
+        # Images take priority: if the clipboard has an image, sync it.
+        image = self._read_clipboard_image()
+        if image is not None:
+            with self._lock:
+                if image == self._last_synced:
+                    return
+                self._last_synced = image
+            try:
+                self._write_image_file(image)
+                log.info("OUT: %d bytes image written", len(image))
+            except OSError:
+                log.exception("Failed to write image file")
+            return
+
         current = self._read_clipboard()
         if current is None or current == "":
             return
@@ -247,9 +427,19 @@ class ClipboardSync:
         observer.start()
         self._observer = observer
 
-    def _on_file_changed(self) -> None:
+    def _on_file_changed(self, path: str) -> None:
         if self._is_paused():
             return
+        try:
+            changed = Path(path).resolve()
+        except OSError:
+            return
+        if changed == self.clipboard_image_file.resolve():
+            self._on_image_file_changed()
+        else:
+            self._on_text_file_changed()
+
+    def _on_text_file_changed(self) -> None:
         content = self._read_file()
         if content is None:
             return
@@ -266,9 +456,26 @@ class ClipboardSync:
                 self._last_synced = content
             log.info("IN: %d chars applied to clipboard", len(content))
 
+    def _on_image_file_changed(self) -> None:
+        image = self._read_image_file()
+        if image is None:
+            return
+        with self._lock:
+            if image == self._last_synced:
+                return
+        current = self._read_clipboard_image()
+        if current == image:
+            with self._lock:
+                self._last_synced = image
+            return
+        if self._write_clipboard_image(image):
+            with self._lock:
+                self._last_synced = image
+            log.info("IN: %d bytes image applied to clipboard", len(image))
+
 
 class _ClipboardFileHandler(FileSystemEventHandler):
-    """Dispatch watchdog events for the clipboard file to ClipboardSync."""
+    """Dispatch watchdog events for the clipboard files to ClipboardSync."""
 
     def __init__(self, sync: ClipboardSync) -> None:
         super().__init__()
@@ -277,7 +484,11 @@ class _ClipboardFileHandler(FileSystemEventHandler):
 
     def _matches(self, path: str) -> bool:
         try:
-            return Path(path).resolve() == self._sync.clipboard_file.resolve()
+            resolved = Path(path).resolve()
+            return (
+                resolved == self._sync.clipboard_file.resolve()
+                or resolved == self._sync.clipboard_image_file.resolve()
+            )
         except OSError:
             return False
 
@@ -288,7 +499,7 @@ class _ClipboardFileHandler(FileSystemEventHandler):
         if now < self._debounce_until:
             return
         self._debounce_until = now + 0.1
-        self._sync._on_file_changed()
+        self._sync._on_file_changed(path)
 
     def on_modified(self, event: FileSystemEvent) -> None:
         if event.is_directory:
