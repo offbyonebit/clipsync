@@ -26,7 +26,7 @@ from .syncthing import SyncthingClient
 
 log = logging.getLogger(__name__)
 
-_WINDOWS = ("pairing", "devices", "settings", "logs")
+_WINDOWS = ("pairing", "devices", "settings", "logs", "incoming")
 
 
 def _center_window(window: ctk.CTkToplevel | ctk.CTk, width: int, height: int) -> None:
@@ -164,6 +164,12 @@ class AppContext:
 
     def on_settings_changed(self) -> None:
         _emit("settings_changed")
+
+    def on_accept_device(self, device_id: str) -> None:
+        _emit("accept_device", device_id=device_id)
+
+    def on_reject_device(self, device_id: str) -> None:
+        _emit("reject_device", device_id=device_id)
 
 
 # ---------------------------------------------------------------------------
@@ -726,6 +732,16 @@ class SettingsWindow(_BaseWindow):
         )
         pause_sw.pack(anchor="w", pady=4)
 
+        self._auto_accept_var = ctk.BooleanVar(value=bool(app.settings.get("auto_accept_incoming")))
+        auto_accept_sw = ctk.CTkSwitch(
+            container,
+            text="Auto-accept incoming requests (no prompt)",
+            variable=self._auto_accept_var,
+            command=self._on_auto_accept_toggle,
+            progress_color=config.ACCENT_COLOR,
+        )
+        auto_accept_sw.pack(anchor="w", pady=4)
+
         ctk.CTkLabel(container, text="Encryption passphrase (optional)", font=ctk.CTkFont(size=11)).pack(
             anchor="w", pady=(14, 2)
         )
@@ -806,6 +822,18 @@ class SettingsWindow(_BaseWindow):
         self._app.settings.set("sync_paused", paused)
         self._app.on_pause_changed(paused)
         self._status.configure(text=f"Sync {'paused' if paused else 'resumed'}.")
+
+    def _on_auto_accept_toggle(self) -> None:
+        enabled = bool(self._auto_accept_var.get())
+        self._app.settings.set("auto_accept_incoming", enabled)
+        self._app.on_settings_changed()
+        self._status.configure(
+            text=(
+                "Auto-accept enabled. New requests will pair immediately."
+                if enabled
+                else "Auto-accept disabled. You'll be prompted before pairing."
+            )
+        )
 
     def _on_save_passphrase(self) -> None:
         new_value = self._passphrase_entry.get()
@@ -898,6 +926,125 @@ class LogsWindow(_BaseWindow):
         self._textbox.see("end")
 
 
+class IncomingWindow(_BaseWindow):
+    """List of devices asking to connect, with Accept / Reject buttons.
+
+    Pending requests are read directly from Syncthing via the REST API.
+    Each click emits an event so the parent process can perform the
+    actual config change (add device + share folder) or record a
+    rejection — keeping all Syncthing mutations on the parent side."""
+
+    def __init__(self, parent: ctk.CTk, app: AppContext, on_close: Callable[[], None]) -> None:
+        super().__init__(parent, f"{config.APP_NAME} — Incoming Requests", (440, 360), on_close)
+        self._app = app
+        self._handled: set[str] = set()
+
+        container = ctk.CTkFrame(self.window, fg_color="transparent")
+        container.pack(fill="both", expand=True, padx=20, pady=20)
+
+        ctk.CTkLabel(
+            container, text="Incoming device requests", font=ctk.CTkFont(size=18, weight="bold")
+        ).pack(pady=(0, 8))
+        ctk.CTkLabel(
+            container,
+            text="Accept a device to start syncing clipboard with it.",
+            font=ctk.CTkFont(size=11),
+            text_color=("gray40", "gray60"),
+        ).pack(pady=(0, 10))
+
+        self._list_frame = ctk.CTkScrollableFrame(container, fg_color=("gray90", "gray17"))
+        self._list_frame.pack(fill="both", expand=True)
+
+        self._status = ctk.CTkLabel(container, text="", font=ctk.CTkFont(size=11))
+        self._status.pack(pady=(8, 0))
+
+        self._refresh()
+        self._schedule_refresh()
+
+    def _schedule_refresh(self) -> None:
+        if not self.exists():
+            return
+        self.window.after(3000, self._auto_refresh)
+
+    def _auto_refresh(self) -> None:
+        if not self.exists():
+            return
+        self._refresh()
+        self._schedule_refresh()
+
+    def _refresh(self) -> None:
+        for child in self._list_frame.winfo_children():
+            child.destroy()
+        try:
+            pending = self._app.client.get_pending_devices() or {}
+        except Exception as exc:
+            ctk.CTkLabel(self._list_frame, text=f"Error: {exc}", text_color="red").pack(pady=10)
+            return
+        rejected = set(self._app.settings.get("rejected_device_ids") or [])
+        visible = [
+            (did, info or {})
+            for did, info in pending.items()
+            if pairing.normalize_device_id(did) and did not in rejected and did not in self._handled
+        ]
+        if not visible:
+            ctk.CTkLabel(
+                self._list_frame,
+                text="No pending requests.\nAsk the other device to pair with this one.",
+                font=ctk.CTkFont(size=12),
+                justify="center",
+            ).pack(pady=30)
+            return
+        for device_id, info in visible:
+            self._build_row(device_id, info)
+
+    def _build_row(self, device_id: str, info: dict) -> None:
+        row = ctk.CTkFrame(self._list_frame, fg_color=("gray85", "gray22"))
+        row.pack(fill="x", padx=4, pady=4)
+        row.grid_columnconfigure(0, weight=1)
+
+        name = info.get("name") or device_id[:7]
+        name_lbl = ctk.CTkLabel(row, text=str(name), font=ctk.CTkFont(size=13, weight="bold"), anchor="w")
+        name_lbl.grid(row=0, column=0, sticky="we", padx=10, pady=(8, 0))
+
+        short_id = device_id[:24] + "…"
+        id_lbl = ctk.CTkLabel(row, text=short_id, font=ctk.CTkFont(size=10), anchor="w")
+        id_lbl.grid(row=1, column=0, sticky="we", padx=10, pady=(0, 8))
+
+        accept_btn = ctk.CTkButton(
+            row,
+            text="Accept",
+            width=70,
+            fg_color=config.ACCENT_COLOR,
+            hover_color=config.ACCENT_HOVER,
+            command=lambda did=device_id: self._accept(did),
+        )
+        accept_btn.grid(row=0, column=1, rowspan=2, padx=(0, 6))
+
+        reject_btn = ctk.CTkButton(
+            row,
+            text="Reject",
+            width=70,
+            fg_color="transparent",
+            border_width=1,
+            text_color=("gray30", "gray80"),
+            hover_color=("gray75", "gray30"),
+            command=lambda did=device_id: self._reject(did),
+        )
+        reject_btn.grid(row=0, column=2, rowspan=2, padx=(0, 10))
+
+    def _accept(self, device_id: str) -> None:
+        self._handled.add(device_id)
+        self._app.on_accept_device(device_id)
+        self._status.configure(text=f"Accepted {device_id[:7]}.")
+        self._refresh()
+
+    def _reject(self, device_id: str) -> None:
+        self._handled.add(device_id)
+        self._app.on_reject_device(device_id)
+        self._status.configure(text=f"Rejected {device_id[:7]}.")
+        self._refresh()
+
+
 # ---------------------------------------------------------------------------
 # Child-process entry point
 # ---------------------------------------------------------------------------
@@ -939,6 +1086,8 @@ def _run_child(window_name: str) -> int:
         SettingsWindow(root, app, on_close=_quit)
     elif window_name == "logs":
         LogsWindow(root, on_close=_quit)
+    elif window_name == "incoming":
+        IncomingWindow(root, app, on_close=_quit)
     else:
         log.error("Unknown window: %s", window_name)
         return 1
