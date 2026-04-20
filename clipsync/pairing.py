@@ -127,29 +127,37 @@ class WebcamQRScanner:
             cap.release()
 
 
-class PendingDeviceAccepter:
-    """Background loop that polls Syncthing for pending device requests and
-    auto-accepts them, then auto-shares the clipsync folder with them.
+class PendingDeviceWatcher:
+    """Poll Syncthing for pending device requests and notify the app.
 
-    This is what makes pairing ergonomic: once device A adds device B,
-    device B's instance notices the pending request and reciprocates
-    without the user having to do anything on that side."""
+    When `auto_accept` is True the watcher falls back to the original
+    zero-interaction behavior: incoming requests are paired immediately.
+    When False (the default in 0.1.1+), the watcher only notifies the
+    app about new pending requests so the user can accept or reject
+    them from the tray; devices previously rejected are skipped."""
 
     def __init__(
         self,
         client: SyncthingClient,
+        on_pending: Callable[[str, dict[str, object]], None] | None = None,
         on_accepted: Callable[[str], None] | None = None,
+        is_rejected: Callable[[str], bool] | None = None,
+        auto_accept: Callable[[], bool] | None = None,
         interval: float = config.PAIRING_POLL_INTERVAL,
     ) -> None:
         self._client = client
+        self._on_pending = on_pending
         self._on_accepted = on_accepted
+        self._is_rejected = is_rejected or (lambda _did: False)
+        self._auto_accept = auto_accept or (lambda: False)
         self._interval = interval
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        self._notified: set[str] = set()
 
     def start(self) -> None:
         self._stop.clear()
-        self._thread = threading.Thread(target=self._run, name="clipsync-pair-accept", daemon=True)
+        self._thread = threading.Thread(target=self._run, name="clipsync-pair-watch", daemon=True)
         self._thread.start()
 
     def stop(self) -> None:
@@ -157,30 +165,58 @@ class PendingDeviceAccepter:
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=3)
 
+    def forget(self, device_id: str) -> None:
+        """Allow the user to be re-notified about a device after it has been
+        accepted or rejected. Called by the app after it records the outcome."""
+        self._notified.discard(device_id)
+
     def _run(self) -> None:
         while not self._stop.is_set():
             try:
                 self._tick()
             except Exception:
-                log.exception("Error in pending device accepter")
+                log.exception("Error in pending device watcher")
             if self._stop.wait(self._interval):
                 break
 
     def _tick(self) -> None:
         pending = self._client.get_pending_devices() or {}
+        seen: set[str] = set()
         for device_id, info in pending.items():
             normalized = normalize_device_id(device_id)
             if not normalized:
                 continue
-            name = (info or {}).get("name") or normalized[:7]
-            try:
-                self._client.add_device(normalized, name=name)
-                self._client.share_folder_with_device(normalized)
-                log.info("Auto-accepted device %s", normalized)
-                if self._on_accepted is not None:
-                    self._on_accepted(normalized)
-            except Exception:
-                log.exception("Failed to auto-accept %s", normalized)
+            seen.add(normalized)
+            if self._is_rejected(normalized):
+                continue
+            info_dict = info or {}
+            if self._auto_accept():
+                name = info_dict.get("name") or normalized[:7]
+                try:
+                    self._client.add_device(normalized, name=str(name))
+                    self._client.share_folder_with_device(normalized)
+                    log.info("Auto-accepted device %s", normalized)
+                    if self._on_accepted is not None:
+                        self._on_accepted(normalized)
+                except Exception:
+                    log.exception("Failed to auto-accept %s", normalized)
+                continue
+            if normalized in self._notified:
+                continue
+            self._notified.add(normalized)
+            log.info("Pending device request from %s", normalized)
+            if self._on_pending is not None:
+                try:
+                    self._on_pending(normalized, info_dict)
+                except Exception:
+                    log.exception("on_pending callback raised")
+        # Drop notifications for device IDs no longer pending so that if
+        # the same device tries again later we prompt the user again.
+        self._notified &= seen
+
+
+# Kept for backwards compat with older callers that imported the original name.
+PendingDeviceAccepter = PendingDeviceWatcher
 
 
 def pair_with_device(client: SyncthingClient, device_id: str, name: str = "") -> None:
@@ -190,3 +226,13 @@ def pair_with_device(client: SyncthingClient, device_id: str, name: str = "") ->
         raise ValueError("Invalid device ID")
     client.add_device(normalized, name=name)
     client.share_folder_with_device(normalized)
+
+
+def accept_pending_device(client: SyncthingClient, device_id: str, name: str = "") -> str:
+    """Accept a pending incoming device. Returns the normalized device ID."""
+    normalized = normalize_device_id(device_id)
+    if not normalized:
+        raise ValueError("Invalid device ID")
+    client.add_device(normalized, name=name or normalized[:7])
+    client.share_folder_with_device(normalized)
+    return normalized

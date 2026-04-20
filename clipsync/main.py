@@ -27,7 +27,8 @@ from PIL import Image, ImageDraw
 
 from . import config
 from .clipboard import ClipboardSync
-from .pairing import PendingDeviceAccepter
+from .pairing import PendingDeviceWatcher, accept_pending_device
+from .single_instance import AlreadyRunning, SingleInstance
 from .syncthing import SyncthingError, SyncthingService
 from .ui import UIController
 
@@ -64,10 +65,12 @@ class ClipSyncApp:
         self.settings = config.Settings()
         self.syncthing = SyncthingService(self.settings)
         self.clipboard: ClipboardSync | None = None
-        self.accepter: PendingDeviceAccepter | None = None
+        self.watcher: PendingDeviceWatcher | None = None
         self.ui = UIController(on_event=self._handle_ui_event)
         self.tray: pystray.Icon | None = None
         self._quitting = threading.Event()
+        self._pending_lock = threading.Lock()
+        self._pending: dict[str, dict[str, object]] = {}
 
     def start(self) -> None:
         config.configure_logging()
@@ -80,11 +83,14 @@ class ClipSyncApp:
         self.clipboard = ClipboardSync(self.settings)
         self.clipboard.start()
 
-        self.accepter = PendingDeviceAccepter(
+        self.watcher = PendingDeviceWatcher(
             self.syncthing.client,
+            on_pending=self._on_pending_device,
             on_accepted=self._on_device_accepted,
+            is_rejected=self._is_device_rejected,
+            auto_accept=lambda: bool(self.settings.get("auto_accept_incoming")),
         )
-        self.accepter.start()
+        self.watcher.start()
 
         if not self.settings.get("first_run_completed"):
             self.settings.set("first_run_completed", True)
@@ -117,6 +123,11 @@ class ClipSyncApp:
     def _run_tray(self) -> None:
         image = _load_or_create_icon()
         menu = pystray.Menu(
+            pystray.MenuItem(
+                self._incoming_menu_title,
+                lambda _i, _it: self.ui.open("incoming"),
+                visible=lambda _item: self._pending_count() > 0,
+            ),
             pystray.MenuItem("Add Device", lambda _i, _it: self.ui.open("pairing")),
             pystray.MenuItem("Connected Devices", lambda _i, _it: self.ui.open("devices")),
             pystray.MenuItem(
@@ -170,6 +181,73 @@ class ClipSyncApp:
         log.info("Quit requested from tray")
         icon.stop()
 
+    def _pending_count(self) -> int:
+        with self._pending_lock:
+            return len(self._pending)
+
+    def _incoming_menu_title(self, _item: pystray.MenuItem) -> str:
+        count = self._pending_count()
+        return f"Incoming Requests ({count})" if count else "Incoming Requests"
+
+    def _is_device_rejected(self, device_id: str) -> bool:
+        rejected = self.settings.get("rejected_device_ids") or []
+        return device_id in rejected
+
+    def _on_pending_device(self, device_id: str, info: dict[str, object]) -> None:
+        """Called from the watcher thread when a new incoming request arrives."""
+        with self._pending_lock:
+            self._pending[device_id] = dict(info or {})
+        if self.tray is not None:
+            try:
+                self.tray.update_menu()
+            except Exception:
+                log.debug("Tray menu update failed", exc_info=True)
+        self._notify(
+            "Device wants to connect",
+            f"{device_id[:7]} is requesting to sync — open the tray to accept.",
+        )
+
+    def _accept_device(self, device_id: str) -> None:
+        assert self.syncthing.client is not None
+        info: dict[str, object]
+        with self._pending_lock:
+            info = self._pending.pop(device_id, {})
+        name = str(info.get("name") or "") or device_id[:7]
+        try:
+            accept_pending_device(self.syncthing.client, device_id, name=name)
+        except Exception:
+            log.exception("Failed to accept %s", device_id)
+            with self._pending_lock:
+                self._pending[device_id] = info
+            return
+        if self.watcher is not None:
+            self.watcher.forget(device_id)
+        self._on_device_accepted(device_id)
+        if self.tray is not None:
+            try:
+                self.tray.update_menu()
+            except Exception:
+                pass
+
+    def _reject_device(self, device_id: str) -> None:
+        with self._pending_lock:
+            self._pending.pop(device_id, None)
+        rejected = list(self.settings.get("rejected_device_ids") or [])
+        if device_id not in rejected:
+            rejected.append(device_id)
+            self.settings.set("rejected_device_ids", rejected)
+        if self.watcher is not None:
+            self.watcher.forget(device_id)
+        if self.tray is not None:
+            try:
+                self.tray.update_menu()
+            except Exception:
+                pass
+
+    def pending_snapshot(self) -> list[dict[str, object]]:
+        with self._pending_lock:
+            return [{"deviceID": k, **v} for k, v in self._pending.items()]
+
     # UI event dispatch ------------------------------------------------------
 
     def _handle_ui_event(self, evt: dict) -> None:
@@ -188,6 +266,14 @@ class ClipSyncApp:
                 self._on_folder_changed(path)
         elif kind == "reset":
             log.info("Devices reset from UI")
+        elif kind == "accept_device":
+            device_id = evt.get("device_id")
+            if isinstance(device_id, str):
+                self._accept_device(device_id)
+        elif kind == "reject_device":
+            device_id = evt.get("device_id")
+            if isinstance(device_id, str):
+                self._reject_device(device_id)
         else:
             log.debug("Unhandled UI event: %s", evt)
 
@@ -223,8 +309,8 @@ class ClipSyncApp:
             self.ui.close_all()
         except Exception:
             log.exception("Error closing UI subprocesses")
-        if self.accepter is not None:
-            self.accepter.stop()
+        if self.watcher is not None:
+            self.watcher.stop()
         if self.clipboard is not None:
             self.clipboard.stop()
         try:
@@ -260,16 +346,26 @@ def _install_signal_handlers(app: ClipSyncApp) -> None:
 
 
 def main() -> int:
-    app = ClipSyncApp()
-    _install_signal_handlers(app)
+    config.configure_logging()
+    guard = SingleInstance()
     try:
-        app.start()
-    except KeyboardInterrupt:
-        app._shutdown()
-    except Exception:
-        log.exception("Fatal error in main")
-        return 1
-    return 0
+        guard.acquire()
+    except AlreadyRunning:
+        log.info("Another ClipSync instance is already running; exiting.")
+        return 0
+    try:
+        app = ClipSyncApp()
+        _install_signal_handlers(app)
+        try:
+            app.start()
+        except KeyboardInterrupt:
+            app._shutdown()
+        except Exception:
+            log.exception("Fatal error in main")
+            return 1
+        return 0
+    finally:
+        guard.release()
 
 
 if __name__ == "__main__":

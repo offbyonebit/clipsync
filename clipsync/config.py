@@ -78,6 +78,8 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "sync_folder": str(SYNC_FOLDER),
     "first_run_completed": False,
     "encryption_passphrase": "",
+    "auto_accept_incoming": False,
+    "rejected_device_ids": [],
 }
 
 
