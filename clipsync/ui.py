@@ -20,7 +20,7 @@ from pathlib import Path
 import customtkinter as ctk
 from PIL import Image
 
-from . import config, pairing
+from . import __version__, config, pairing, update
 from .autostart import is_autostart_enabled, set_autostart
 from .syncthing import SyncthingClient
 
@@ -805,6 +805,22 @@ class SettingsWindow(_BaseWindow):
         )
         reset_btn.pack(fill="x", pady=(0, 6))
 
+        update_row = ctk.CTkFrame(container, fg_color="transparent")
+        update_row.pack(fill="x", pady=(8, 0))
+        self._update_btn = ctk.CTkButton(
+            update_row,
+            text=f"Check for updates (v{__version__})",
+            fg_color="transparent",
+            border_width=1,
+            text_color=config.ACCENT_COLOR,
+            border_color=config.ACCENT_COLOR,
+            hover_color=config.ACCENT_HOVER,
+            command=self._on_check_update,
+        )
+        self._update_btn.pack(fill="x")
+        self._download_btn: ctk.CTkButton | None = None
+        self._update_url = update.RELEASES_HTML_URL
+
         self._status = ctk.CTkLabel(container, text="", font=ctk.CTkFont(size=11))
         self._status.pack(pady=(8, 0))
 
@@ -867,6 +883,53 @@ class SettingsWindow(_BaseWindow):
 
     def _on_logs_closed(self) -> None:
         self._logs_window = None
+
+    def _on_check_update(self) -> None:
+        self._status.configure(text="Checking for updates…")
+        self._update_btn.configure(state="disabled")
+        threading.Thread(target=self._update_worker, daemon=True).start()
+
+    def _update_worker(self) -> None:
+        try:
+            info = update.check_for_update()
+        except Exception as exc:
+            log.exception("Update check failed")
+            message = f"Couldn't check for updates: {exc}"
+            self.window.after(0, lambda: self._finish_update_check(None, message))
+            return
+        self.window.after(0, lambda: self._finish_update_check(info, None))
+
+    def _finish_update_check(self, info: update.UpdateInfo | None, error: str | None) -> None:
+        if not self.exists():
+            return
+        try:
+            self._update_btn.configure(state="normal")
+        except Exception:
+            pass
+        if error is not None:
+            self._status.configure(text=error)
+            return
+        assert info is not None
+        if not info.update_available:
+            self._status.configure(text=f"You're up to date (v{info.current_version}).")
+            return
+        self._update_url = info.release_url
+        self._status.configure(text=f"Update available: v{info.latest_version} (you have v{info.current_version}).")
+        if self._download_btn is None:
+            self._download_btn = ctk.CTkButton(
+                self._update_btn.master,
+                text="Download update",
+                fg_color=config.ACCENT_COLOR,
+                hover_color=config.ACCENT_HOVER,
+                command=self._on_download_clicked,
+            )
+            self._download_btn.pack(fill="x", pady=(6, 0))
+
+    def _on_download_clicked(self) -> None:
+        if update.open_download_page(self._update_url):
+            self._status.configure(text="Opened the download page in your browser.")
+        else:
+            self._status.configure(text=f"Couldn't open the browser. Visit: {self._update_url}")
 
     def _on_reset(self) -> None:
         confirm = ctk.CTkToplevel(self.window)
@@ -942,9 +1005,9 @@ class IncomingWindow(_BaseWindow):
         container = ctk.CTkFrame(self.window, fg_color="transparent")
         container.pack(fill="both", expand=True, padx=20, pady=20)
 
-        ctk.CTkLabel(
-            container, text="Incoming device requests", font=ctk.CTkFont(size=18, weight="bold")
-        ).pack(pady=(0, 8))
+        ctk.CTkLabel(container, text="Incoming device requests", font=ctk.CTkFont(size=18, weight="bold")).pack(
+            pady=(0, 8)
+        )
         ctk.CTkLabel(
             container,
             text="Accept a device to start syncing clipboard with it.",

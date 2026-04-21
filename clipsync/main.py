@@ -25,7 +25,7 @@ from pathlib import Path
 import pystray
 from PIL import Image, ImageDraw
 
-from . import config
+from . import config, update
 from .clipboard import ClipboardSync
 from .pairing import PendingDeviceWatcher, accept_pending_device
 from .single_instance import AlreadyRunning, SingleInstance
@@ -137,6 +137,7 @@ class ClipSyncApp:
             ),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Settings", lambda _i, _it: self.ui.open("settings")),
+            pystray.MenuItem("Check for Updates…", self._menu_check_updates),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Quit", self._menu_quit),
         )
@@ -180,6 +181,24 @@ class ClipSyncApp:
     def _menu_quit(self, icon: pystray.Icon, _item: pystray.MenuItem) -> None:
         log.info("Quit requested from tray")
         icon.stop()
+
+    def _menu_check_updates(self, _icon: pystray.Icon, _item: pystray.MenuItem) -> None:
+        threading.Thread(target=self._check_updates_worker, daemon=True).start()
+
+    def _check_updates_worker(self) -> None:
+        try:
+            info = update.check_for_update()
+        except Exception as exc:
+            log.exception("Update check failed")
+            self._notify("Update check failed", f"Could not reach GitHub: {exc}")
+            return
+        if info.update_available:
+            self._notify(
+                f"Update available: v{info.latest_version}",
+                "Open Settings → Check for updates to download.",
+            )
+        else:
+            self._notify("You're up to date", f"Running the latest version (v{info.current_version}).")
 
     def _pending_count(self) -> int:
         with self._pending_lock:
