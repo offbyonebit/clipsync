@@ -106,6 +106,8 @@ for the icon to actually show up.
 - Encryption passphrase.
 - View Syncthing logs.
 - Reset / unpair all devices.
+- Check for updates (compares against the latest GitHub release and opens the
+  download page — no auto-install, no phone-home on startup).
 
 Settings changes from the UI take effect immediately; hand-editing
 `settings.json` is also picked up, the file is watched for changes.
