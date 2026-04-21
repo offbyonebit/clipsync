@@ -289,6 +289,126 @@ def prepare_home(binary: Path, settings: config.Settings) -> str:
     return device_id
 
 
+def _find_orphan_syncthing_pids(binary_path: Path) -> list[int]:
+    """Return PIDs of syncthing processes running from our managed binary.
+
+    Match by executable path, not just name: a user may have an unrelated
+    Syncthing install on the same machine that we must not touch.
+    """
+    target = str(binary_path).lower() if platform.system() == "Windows" else str(binary_path)
+    creationflags = 0
+    if platform.system() == "Windows":
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+    if platform.system() == "Windows":
+        ps_script = (
+            "Get-CimInstance Win32_Process -Filter \"Name='syncthing.exe'\" | "
+            "ForEach-Object { \"$($_.ProcessId)|$($_.ExecutablePath)\" }"
+        )
+        try:
+            result = subprocess.run(
+                ["powershell", "-NoProfile", "-Command", ps_script],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+                creationflags=creationflags,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+            return []
+        pids: list[int] = []
+        for line in (result.stdout or "").splitlines():
+            pid_part, sep, exe_part = line.strip().partition("|")
+            if not sep or not pid_part.isdigit():
+                continue
+            if exe_part.strip().lower() == target:
+                pids.append(int(pid_part))
+        return pids
+
+    try:
+        result = subprocess.run(
+            ["ps", "-eo", "pid=,comm=,command="],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return []
+    pids = []
+    for line in (result.stdout or "").splitlines():
+        parts = line.strip().split(None, 2)
+        if len(parts) < 3 or parts[1] != "syncthing":
+            continue
+        pid_str, _, command = parts
+        first_token = command.split(None, 1)[0]
+        if first_token == target and pid_str.isdigit():
+            pids.append(int(pid_str))
+    return pids
+
+
+def _kill_pid(pid: int) -> None:
+    if platform.system() == "Windows":
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        subprocess.run(
+            ["taskkill", "/F", "/PID", str(pid)],
+            capture_output=True,
+            timeout=5,
+            check=False,
+            creationflags=creationflags,
+        )
+        return
+    import os
+    import signal as _signal
+
+    try:
+        os.kill(pid, _signal.SIGTERM)
+    except (ProcessLookupError, PermissionError):
+        return
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return
+        time.sleep(0.1)
+    try:
+        os.kill(pid, _signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
+def kill_orphaned_syncthings() -> int:
+    """Terminate leftover syncthings from a previous, ungracefully-killed run.
+
+    If the Python parent is force-killed (OS kill, crash, logoff during a
+    hang), its Syncthing child is not cascaded the signal. It keeps
+    holding the database lock and GUI port, and every future clipsync
+    startup then spawn-and-dies in a 10s loop forever. Sweeping these on
+    start makes the service self-healing.
+    """
+    binary = config.syncthing_binary_path()
+    if not binary.exists():
+        return 0
+    try:
+        pids = _find_orphan_syncthing_pids(binary)
+    except Exception:
+        log.debug("Orphan scan failed", exc_info=True)
+        return 0
+    killed = 0
+    for pid in pids:
+        try:
+            _kill_pid(pid)
+            killed += 1
+            log.info("Terminated orphaned syncthing process (pid=%s)", pid)
+        except Exception:
+            log.warning("Could not terminate orphan syncthing pid=%s", pid, exc_info=True)
+    if killed:
+        # Give the OS a beat to release the DB lock and port 8385.
+        time.sleep(1.0)
+    return killed
+
+
 class SyncthingClient:
     """Thin wrapper over the Syncthing REST API used by the app."""
 
@@ -470,6 +590,7 @@ class SyncthingService:
     def start(self) -> None:
         config.ensure_directories()
         self._binary = ensure_binary()
+        kill_orphaned_syncthings()
         self._device_id = prepare_home(self._binary, self._settings)
         self.client = SyncthingClient(self._settings.get("api_key"))
         self._spawn()
@@ -496,11 +617,45 @@ class SyncthingService:
         with self._lock:
             self._proc = subprocess.Popen(
                 args,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
                 stdin=subprocess.DEVNULL,
+                bufsize=1,
+                encoding="utf-8",
+                errors="replace",
                 creationflags=creationflags,
             )
+            proc = self._proc
+        threading.Thread(
+            target=self._pump_output,
+            args=(proc,),
+            name="syncthing-output",
+            daemon=True,
+        ).start()
+
+    def _pump_output(self, proc: subprocess.Popen) -> None:
+        """Forward syncthing's stdout+stderr to our logger line by line.
+
+        Without this the subprocess exits with just `code 1` in our log,
+        which is useless for diagnosing startup failures (DB locked, port
+        bound, bad config, etc.). The reader must keep draining the pipe
+        or syncthing will eventually block on write.
+        """
+        stream = proc.stdout
+        if stream is None:
+            return
+        try:
+            for line in iter(stream.readline, ""):
+                line = line.rstrip()
+                if line:
+                    log.info("syncthing: %s", line)
+        except Exception:
+            log.debug("Syncthing output pump error", exc_info=True)
+        finally:
+            try:
+                stream.close()
+            except Exception:
+                pass
 
     def _watch(self) -> None:
         while not self._stop.is_set():
