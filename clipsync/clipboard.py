@@ -265,7 +265,14 @@ class ClipboardSync:
         payload = _encrypt(encoded, passphrase) if passphrase else encoded
         tmp = path.with_name(path.name + ".tmp")
         tmp.write_bytes(payload)
-        tmp.replace(path)
+        for attempt in range(10):
+            try:
+                tmp.replace(path)
+                return
+            except PermissionError:
+                if attempt == 9:
+                    raise
+                time.sleep(0.1)
 
     def _read_image_file(self) -> bytes | None:
         """Return PNG bytes from the shared image file, decrypting if needed."""
@@ -306,7 +313,14 @@ class ClipboardSync:
         payload = _encrypt(png_bytes, passphrase) if passphrase else png_bytes
         tmp = path.with_name(path.name + ".tmp")
         tmp.write_bytes(payload)
-        tmp.replace(path)
+        for attempt in range(10):
+            try:
+                tmp.replace(path)
+                return
+            except PermissionError:
+                if attempt == 9:
+                    raise
+                time.sleep(0.1)
 
     def _seed_from_file(self) -> None:
         """Prime _last_synced from disk so we don't re-emit stale content on startup.
