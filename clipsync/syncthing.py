@@ -249,6 +249,22 @@ def _patch_config(home: Path, api_key: str, folder_path: Path, device_id: str) -
     _xml_set(gui, "apikey", api_key)
     _xml_set(gui, "theme", "default")
 
+    # Preserve the folder's existing device-share list across restarts.
+    # Without this, pairing.share_folder_with_device() only re-adds peers
+    # in response to *new* pending-device events — already-paired peers
+    # silently drop out of the share list on every restart, leaving
+    # Syncthing connected at the device level but detached at the folder
+    # level (completion=0, remoteState=unknown).
+    import copy as _copy
+
+    preserved_device_elements: list[ET.Element] = []
+    existing_folder = next(
+        (f for f in root.findall("folder") if f.get("id") == config.CLIPBOARD_FOLDER_ID),
+        None,
+    )
+    if existing_folder is not None:
+        preserved_device_elements = [_copy.deepcopy(d) for d in existing_folder.findall("device")]
+
     for folder in list(root.findall("folder")):
         root.remove(folder)
 
@@ -262,9 +278,22 @@ def _patch_config(home: Path, api_key: str, folder_path: Path, device_id: str) -
     folder.set("fsWatcherDelayS", "1")
     folder.set("ignorePerms", "false")
     folder.set("autoNormalize", "true")
-    fdev = ET.SubElement(folder, "device")
-    fdev.set("id", device_id)
-    fdev.set("introducedBy", "")
+
+    seen_ids: set[str] = set()
+    for dev_el in preserved_device_elements:
+        did = dev_el.get("id", "")
+        if not did or did in seen_ids:
+            continue
+        folder.append(dev_el)
+        seen_ids.add(did)
+    if device_id not in seen_ids:
+        fdev = ET.SubElement(folder, "device")
+        fdev.set("id", device_id)
+        fdev.set("introducedBy", "")
+        seen_ids.add(device_id)
+    peers_preserved = len(seen_ids) - 1
+    if peers_preserved:
+        log.info("Preserved %d folder peer(s) across restart", peers_preserved)
 
     options = root.find("options")
     if options is None:
