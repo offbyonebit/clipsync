@@ -22,11 +22,11 @@ jobs:
             artifact_name: ClipSync-macos-arm64
             artifact_path: dist/ClipSync.app
             archive: zip
-          - runner: [self-hosted, windows]
+          - runner: windows-latest
             artifact_name: ClipSync-windows-x86_64
             artifact_path: dist/ClipSync
             archive: zip
-          - runner: [self-hosted, linux]
+          - runner: ubuntu-latest
             artifact_name: ClipSync-linux-x86_64
             artifact_path: dist/clipsync
             archive: tar.gz
@@ -85,7 +85,7 @@ jobs:
   release:
     name: Attach artifacts to GitHub Release
     needs: build
-    runs-on: [self-hosted, linux]
+    runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
