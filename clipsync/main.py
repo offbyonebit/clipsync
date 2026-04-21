@@ -27,6 +27,7 @@ from PIL import Image, ImageDraw
 
 from . import config, update
 from .clipboard import ClipboardSync
+from .debug import LogMirror
 from .pairing import PendingDeviceWatcher, accept_pending_device
 from .single_instance import AlreadyRunning, SingleInstance
 from .syncthing import SyncthingError, SyncthingService
@@ -65,6 +66,7 @@ class ClipSyncApp:
         self.settings = config.Settings()
         self.syncthing = SyncthingService(self.settings)
         self.clipboard: ClipboardSync | None = None
+        self.log_mirror: LogMirror | None = None
         self.watcher: PendingDeviceWatcher | None = None
         self.ui = UIController(on_event=self._handle_ui_event)
         self.tray: pystray.Icon | None = None
@@ -82,6 +84,9 @@ class ClipSyncApp:
         assert self.syncthing.client is not None
         self.clipboard = ClipboardSync(self.settings)
         self.clipboard.start()
+
+        self.log_mirror = LogMirror(self.settings)
+        self.log_mirror.start()
 
         self.watcher = PendingDeviceWatcher(
             self.syncthing.client,
@@ -335,6 +340,8 @@ class ClipSyncApp:
             log.exception("Error closing UI subprocesses")
         if self.watcher is not None:
             self.watcher.stop()
+        if self.log_mirror is not None:
+            self.log_mirror.stop()
         if self.clipboard is not None:
             self.clipboard.stop()
         try:
