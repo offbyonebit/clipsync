@@ -124,19 +124,24 @@ class ClipSyncApp:
         image = _load_or_create_icon()
         menu = pystray.Menu(
             pystray.MenuItem(
+                "Open ClipSync",
+                lambda _i, _it: self.ui.open("tabbed:devices"),
+                default=True,
+            ),
+            pystray.MenuItem(
                 self._incoming_menu_title,
                 lambda _i, _it: self.ui.open("incoming"),
                 visible=lambda _item: self._pending_count() > 0,
             ),
-            pystray.MenuItem("Add Device", lambda _i, _it: self.ui.open("pairing")),
-            pystray.MenuItem("Connected Devices", lambda _i, _it: self.ui.open("devices")),
+            pystray.MenuItem("Add Device", lambda _i, _it: self.ui.open("tabbed:pair")),
+            pystray.MenuItem("Connected Devices", lambda _i, _it: self.ui.open("tabbed:devices")),
             pystray.MenuItem(
                 "Pause Sync",
                 self._menu_toggle_pause,
                 checked=lambda _item: bool(self.settings.get("sync_paused")),
             ),
             pystray.Menu.SEPARATOR,
-            pystray.MenuItem("Settings", lambda _i, _it: self.ui.open("settings")),
+            pystray.MenuItem("Settings", lambda _i, _it: self.ui.open("tabbed:settings")),
             pystray.MenuItem("Check for Updates…", self._menu_check_updates),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Quit", self._menu_quit),
