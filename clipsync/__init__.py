@@ -1,3 +1,3 @@
 """ClipSync: peer-to-peer clipboard sync over Syncthing."""
 
-__version__ = "0.1.2"
+__version__ = "0.2.0"
