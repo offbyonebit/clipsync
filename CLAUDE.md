@@ -41,7 +41,7 @@ ClipSync syncs the system clipboard across platforms by writing to a single shar
 **Key modules:**
 
 - `config.py` — platform-specific paths, JSON-backed `Settings` class with auto-reload on file change, all shared constants
-- `syncthing.py` — downloads pinned Syncthing binary (`SYNCTHING_VERSION = "v2.0.16"`), generates config, patches it to expose private API on `127.0.0.1:8385`, manages subprocess lifecycle, kills orphans on restart
+- `syncthing.py` — downloads pinned Syncthing binary (`SYNCTHING_VERSION = "v1.27.10"`), generates config, patches it to expose private API on `127.0.0.1:8385`, manages subprocess lifecycle, kills orphans on restart
 - `clipboard.py` — OUT loop polls system clipboard every 0.5s and writes changes to the sync file; IN loop uses a watchdog file observer to apply remote changes back to the system clipboard. A shared-last-value guard prevents ping-pong. Optional Fernet encryption (AES-128-CBC + HMAC-SHA256, PBKDF2 key derivation) is signalled by a `CSENC` magic header prefix on the ciphertext.
 - `pairing.py` — QR code generation for device IDs, webcam scanning via OpenCV, background poller that auto-accepts or notifies on pending Syncthing device requests
 - `ui.py` — CustomTkinter windows are spawned as **subprocesses**. The child process emits JSON events to stdout; the parent `UIController` reads and dispatches them. This keeps the tray (main thread) responsive on all platforms.
