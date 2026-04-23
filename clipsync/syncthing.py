@@ -115,11 +115,42 @@ def _extract_binary(data: bytes, ext: str, dest_dir: Path) -> Path:
     return target
 
 
+def _binary_version(binary: Path) -> str:
+    """Return the version string reported by the binary, e.g. 'v1.27.10'."""
+    try:
+        result = subprocess.run(
+            [str(binary), "--version"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        for part in (result.stdout or "").split():
+            if part.startswith("v") and part[1:2].isdigit():
+                return part
+    except Exception:
+        pass
+    return ""
+
+
 def ensure_binary(version: str = config.SYNCTHING_VERSION) -> Path:
-    """Return the path to a working Syncthing binary, downloading if needed."""
+    """Return the path to a working Syncthing binary at exactly *version*.
+
+    Re-downloads if the binary is missing, empty, or was self-upgraded to a
+    different version (Syncthing replaces its own binary on upgrade, which
+    would otherwise silently drift from the pinned version).
+    """
     binary = config.syncthing_binary_path()
     if binary.exists() and binary.stat().st_size > 0:
-        return binary
+        on_disk = _binary_version(binary)
+        want = version if version.startswith("v") else f"v{version}"
+        if on_disk == want:
+            return binary
+        log.info(
+            "Syncthing binary is %s but pinned version is %s; re-downloading",
+            on_disk,
+            want,
+        )
     _, _, ext = _platform_archive_info()
     url = _release_asset_url(version)
     try:
@@ -638,6 +669,7 @@ class SyncthingService:
             f"--home={config.SYNCTHING_HOME}",
             "--no-browser",
             "--no-restart",
+            "--no-upgrade",
         ]
         log.info("Spawning: %s", " ".join(args))
         creationflags = 0
