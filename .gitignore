@@ -15,3 +15,7 @@ Thumbs.db
 *.log
 .idea/
 .vscode/
+
+# Claude Code's per-project state (settings, session logs, transcripts).
+# Local to each clone and should not be shared across machines.
+.claude/
