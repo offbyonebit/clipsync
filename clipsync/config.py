@@ -35,8 +35,8 @@ CLIPBOARD_POLL_INTERVAL = 0.5
 
 PAIRING_POLL_INTERVAL = 5.0
 
-PAIRING_WINDOW_SIZE = (420, 620)
-SETTINGS_WINDOW_SIZE = (420, 560)
+PAIRING_WINDOW_SIZE = (420, 560)
+SETTINGS_WINDOW_SIZE = (420, 480)
 
 
 def _app_data_dir() -> Path:
@@ -82,6 +82,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "rejected_device_ids": [],
     "history_enabled": True,
     "history_max_items": 50,
+    "theme": "System",
 }
 
 HISTORY_FILE = APP_DATA_DIR / "clipsync_history.json"
