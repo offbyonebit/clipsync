@@ -78,6 +78,41 @@ def _release_asset_url(version: str) -> str:
     return f"https://github.com/syncthing/syncthing/releases/download/{v}/{stem}.{ext}"
 
 
+# SHA-256 hashes of known-good Syncthing binaries for supply-chain verification.
+# Expand this dictionary as new platforms/versions are validated.
+_KNOWN_BINARY_HASHES: dict[tuple[str, str, str], str] = {
+    ("linux", "amd64", "v2.0.16"): (
+        "ef9fd7380fc3a4a000e2cc213e56697a091d7b5cd6e540026b14566bc85e3a4b"
+    ),
+}
+
+
+def _verify_binary_hash(binary: Path, version: str) -> None:
+    """Raise SyncthingError if the binary hash doesn't match the known value."""
+    try:
+        os_name, arch, _ext = _platform_archive_info()
+    except SyncthingError:
+        log.warning("Cannot determine platform for binary hash verification; skipping")
+        return
+
+    key = (os_name, arch, version if version.startswith("v") else f"v{version}")
+    expected = _KNOWN_BINARY_HASHES.get(key)
+    if expected is None:
+        log.warning("No known hash for %s %s %s; skipping verification", *key)
+        return
+
+    import hashlib
+
+    h = hashlib.sha256(binary.read_bytes()).hexdigest()
+    if h != expected:
+        binary.unlink(missing_ok=True)
+        raise SyncthingError(
+            f"Syncthing binary hash mismatch for {key}: expected {expected}, got {h}. "
+            f"The binary has been deleted. Please retry."
+        )
+    log.info("Syncthing binary hash verified for %s", key)
+
+
 def _download(url: str) -> bytes:
     log.info("Downloading %s", url)
     req = Request(url, headers={"User-Agent": "ClipSync/1.0"})
@@ -158,6 +193,7 @@ def ensure_binary(version: str = config.SYNCTHING_VERSION) -> Path:
     except URLError as exc:
         raise SyncthingError(f"Failed to download Syncthing: {exc}") from exc
     extracted = _extract_binary(data, ext, config.SYNCTHING_BIN_DIR)
+    _verify_binary_hash(extracted, version)
     log.info("Installed syncthing binary at %s", extracted)
     return extracted
 

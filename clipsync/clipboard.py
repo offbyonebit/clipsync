@@ -33,6 +33,7 @@ from watchdog.events import FileSystemEvent, FileSystemEventHandler
 from watchdog.observers import Observer
 
 from . import config
+from .crypto import decrypt, encrypt, is_encrypted
 from .history import ClipboardHistory
 
 log = logging.getLogger(__name__)
@@ -42,47 +43,6 @@ def _normalize_newlines(s: str) -> str:
     """Collapse CRLF/CR to LF so Windows's clipboard normalization does not
     look like a real change to the OUT loop after a remote update."""
     return s.replace("\r\n", "\n").replace("\r", "\n")
-
-
-# Encrypted payloads start with this magic header so a receiver can
-# detect them and either decrypt or reject without corrupting its own
-# clipboard with ciphertext bytes.
-_ENC_MAGIC = b"CSENC\x00"
-
-
-def _derive_key(passphrase: str) -> bytes:
-    import base64
-
-    from cryptography.hazmat.primitives import hashes
-    from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
-
-    kdf = PBKDF2HMAC(
-        algorithm=hashes.SHA256(),
-        length=32,
-        salt=b"clipsync-v1-salt",
-        iterations=120_000,
-    )
-    return base64.urlsafe_b64encode(kdf.derive(passphrase.encode("utf-8")))
-
-
-def _encrypt(payload: bytes, passphrase: str) -> bytes:
-    """Encrypt arbitrary bytes with Fernet and prepend the CSENC magic header."""
-    from cryptography.fernet import Fernet
-
-    token = Fernet(_derive_key(passphrase)).encrypt(payload)
-    return _ENC_MAGIC + token
-
-
-def _decrypt(data: bytes, passphrase: str) -> bytes | None:
-    """Decrypt a CSENC-prefixed payload. Returns raw bytes, or None on failure."""
-    from cryptography.fernet import Fernet, InvalidToken
-
-    if not data.startswith(_ENC_MAGIC):
-        return None
-    try:
-        return Fernet(_derive_key(passphrase)).decrypt(data[len(_ENC_MAGIC) :])
-    except (InvalidToken, ValueError):
-        return None
 
 
 def _read_image_from_system_clipboard() -> bytes | None:
@@ -229,7 +189,7 @@ class ClipboardSync:
         except OSError as exc:
             log.debug("File read failed: %s", exc)
             return None
-        if data.startswith(_ENC_MAGIC):
+        if is_encrypted(data):
             passphrase = self._passphrase()
             if not passphrase:
                 err = "encrypted payload but no passphrase configured"
@@ -237,7 +197,7 @@ class ClipboardSync:
                     log.warning("Cannot read clipboard: %s", err)
                     self._last_decrypt_error = err
                 return None
-            decrypted = _decrypt(data, passphrase)
+            decrypted = decrypt(data, passphrase)
             if decrypted is None:
                 err = "decrypt failed (passphrase mismatch?)"
                 if err != self._last_decrypt_error:
@@ -264,12 +224,13 @@ class ClipboardSync:
         path.parent.mkdir(parents=True, exist_ok=True)
         passphrase = self._passphrase()
         encoded = text.encode("utf-8")
-        payload = _encrypt(encoded, passphrase) if passphrase else encoded
+        payload = encrypt(encoded, passphrase) if passphrase else encoded
         tmp = path.with_name(path.name + ".tmp")
         tmp.write_bytes(payload)
         for attempt in range(10):
             try:
                 tmp.replace(path)
+                config.set_file_permissions(path)
                 return
             except PermissionError:
                 if attempt == 9:
@@ -286,7 +247,7 @@ class ClipboardSync:
         except OSError as exc:
             log.debug("Image file read failed: %s", exc)
             return None
-        if data.startswith(_ENC_MAGIC):
+        if is_encrypted(data):
             passphrase = self._passphrase()
             if not passphrase:
                 err = "encrypted payload but no passphrase configured"
@@ -294,7 +255,7 @@ class ClipboardSync:
                     log.warning("Cannot read clipboard image: %s", err)
                     self._last_decrypt_error = err
                 return None
-            decrypted = _decrypt(data, passphrase)
+            decrypted = decrypt(data, passphrase)
             if decrypted is None:
                 err = "decrypt failed (passphrase mismatch?)"
                 if err != self._last_decrypt_error:
@@ -312,12 +273,13 @@ class ClipboardSync:
         path = self.clipboard_image_file
         path.parent.mkdir(parents=True, exist_ok=True)
         passphrase = self._passphrase()
-        payload = _encrypt(png_bytes, passphrase) if passphrase else png_bytes
+        payload = encrypt(png_bytes, passphrase) if passphrase else png_bytes
         tmp = path.with_name(path.name + ".tmp")
         tmp.write_bytes(payload)
         for attempt in range(10):
             try:
                 tmp.replace(path)
+                config.set_file_permissions(path)
                 return
             except PermissionError:
                 if attempt == 9:

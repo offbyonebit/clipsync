@@ -82,6 +82,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "rejected_device_ids": [],
     "history_enabled": True,
     "history_max_items": 50,
+    "history_auto_clear_minutes": 0,
     "theme": "System",
 }
 
@@ -128,6 +129,7 @@ class Settings:
         with tmp.open("w", encoding="utf-8") as fh:
             json.dump(self._data, fh, indent=2)
         os.replace(tmp, self._path)
+        set_file_permissions(self._path)
         try:
             self._mtime_ns = self._path.stat().st_mtime_ns
         except OSError:
@@ -185,6 +187,14 @@ def ensure_directories() -> None:
     """Create all app directories. Safe to call repeatedly."""
     for directory in (APP_DATA_DIR, SYNCTHING_HOME, SYNCTHING_BIN_DIR, SYNC_FOLDER):
         directory.mkdir(parents=True, exist_ok=True)
+
+
+def set_file_permissions(path: Path) -> None:
+    """Restrict file access to owner-only where possible (Unix)."""
+    try:
+        os.chmod(path, 0o600)
+    except (OSError, AttributeError):
+        pass
 
 
 def configure_logging() -> None:
