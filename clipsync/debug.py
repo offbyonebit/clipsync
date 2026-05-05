@@ -55,9 +55,7 @@ class LogMirror:
 
     def start(self) -> None:
         self._stop.clear()
-        self._thread = threading.Thread(
-            target=self._loop, name="clipsync-logmirror", daemon=True
-        )
+        self._thread = threading.Thread(target=self._loop, name="clipsync-logmirror", daemon=True)
         self._thread.start()
         log.info("LogMirror started (host=%s)", self._hostname)
 

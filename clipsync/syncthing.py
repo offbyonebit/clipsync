@@ -363,7 +363,7 @@ def _find_orphan_syncthing_pids(binary_path: Path) -> list[int]:
     if platform.system() == "Windows":
         ps_script = (
             "Get-CimInstance Win32_Process -Filter \"Name='syncthing.exe'\" | "
-            "ForEach-Object { \"$($_.ProcessId)|$($_.ExecutablePath)\" }"
+            'ForEach-Object { "$($_.ProcessId)|$($_.ExecutablePath)" }'
         )
         try:
             result = subprocess.run(
