@@ -18,10 +18,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: [self-hosted, macos]
-            artifact_name: ClipSync-macos-arm64
-            artifact_path: dist/ClipSync.app
-            archive: zip
+          # macOS is built manually on a self-hosted runner and uploaded separately.
+          # - runner: [self-hosted, macos]
+          #   artifact_name: ClipSync-macos-arm64
+          #   artifact_path: dist/ClipSync.app
+          #   archive: zip
           - runner: windows-latest
             artifact_name: ClipSync-windows-x86_64
             artifact_path: dist/ClipSync
