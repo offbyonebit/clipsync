@@ -26,7 +26,7 @@ from .syncthing import SyncthingClient
 
 log = logging.getLogger(__name__)
 
-_WINDOWS = ("pairing", "devices", "settings", "logs", "incoming", "tabbed")
+_WINDOWS = ("pairing", "devices", "settings", "logs", "incoming", "tabbed", "history")
 
 
 def _center_window(window: ctk.CTkToplevel | ctk.CTk, width: int, height: int) -> None:
@@ -1181,6 +1181,178 @@ class IncomingWindow(_BaseWindow):
 # ---------------------------------------------------------------------------
 
 
+class HistoryWindow(_BaseWindow):
+    """Scrollable list of recent clipboard entries with copy-on-click."""
+
+    def __init__(self, parent: ctk.CTk, on_close: Callable[[], None]) -> None:
+        super().__init__(parent, f"{config.APP_NAME} — Clipboard History", (480, 520), on_close)
+        container = ctk.CTkFrame(self.window, fg_color="transparent")
+        container.pack(fill="both", expand=True, padx=16, pady=16)
+
+        header = ctk.CTkFrame(container, fg_color="transparent")
+        header.pack(fill="x", pady=(0, 10))
+        ctk.CTkLabel(header, text="Clipboard History", font=ctk.CTkFont(size=18, weight="bold")).pack(side="left")
+        self._status = ctk.CTkLabel(header, text="", font=ctk.CTkFont(size=11), text_color=("gray40", "gray60"))
+        self._status.pack(side="right")
+
+        self._list_frame = ctk.CTkScrollableFrame(container, fg_color=("gray90", "gray17"))
+        self._list_frame.pack(fill="both", expand=True)
+
+        btn_row = ctk.CTkFrame(container, fg_color="transparent")
+        btn_row.pack(fill="x", pady=(10, 0))
+        ctk.CTkButton(
+            btn_row,
+            text="Refresh",
+            fg_color=config.ACCENT_COLOR,
+            hover_color=config.ACCENT_HOVER,
+            width=100,
+            command=self._refresh,
+        ).pack(side="left")
+        ctk.CTkButton(
+            btn_row,
+            text="Clear All",
+            fg_color=("gray75", "gray30"),
+            hover_color=("gray65", "gray40"),
+            width=100,
+            command=self._confirm_clear,
+        ).pack(side="right")
+
+        self._refresh()
+
+    def _refresh(self) -> None:
+        from .history import ClipboardHistory
+
+        for w in self._list_frame.winfo_children():
+            w.destroy()
+
+        history = ClipboardHistory()
+        entries = list(reversed(history.get_entries()))
+
+        if not entries:
+            ctk.CTkLabel(
+                self._list_frame,
+                text="No clipboard history yet.\nItems appear here as you copy text.",
+                font=ctk.CTkFont(size=12),
+                text_color=("gray50", "gray60"),
+                justify="center",
+            ).pack(pady=40)
+            self._status.configure(text="0 entries")
+            return
+
+        self._status.configure(text=f"{len(entries)} entries")
+
+        import time as _time
+
+        now = _time.time()
+        for entry in entries:
+            self._build_row(entry, now)
+
+    def _build_row(self, entry: object, now: float) -> None:
+        from datetime import datetime
+
+        ts = getattr(entry, "timestamp", 0.0)
+        text = getattr(entry, "text", "")
+        source = getattr(entry, "source", "local")
+
+        dt = datetime.fromtimestamp(ts)
+        age = now - ts
+        time_str = dt.strftime("%I:%M %p").lstrip("0") if age < 86400 else dt.strftime("%b %d %I:%M %p").lstrip("0")
+
+        preview = text.replace("\n", " ").replace("\r", " ")
+        if len(preview) > 72:
+            preview = preview[:72] + "..."
+
+        row = ctk.CTkFrame(self._list_frame, fg_color=("white", "gray20"), corner_radius=6)
+        row.pack(fill="x", padx=4, pady=3)
+        row.grid_columnconfigure(1, weight=1)
+
+        source_label = "[Remote]" if source == "remote" else "[Local]"
+        meta = ctk.CTkLabel(
+            row,
+            text=f"{time_str}  {source_label}",
+            font=ctk.CTkFont(size=10),
+            text_color=("gray50", "gray55"),
+            anchor="w",
+        )
+        meta.grid(row=0, column=0, columnspan=2, sticky="ew", padx=10, pady=(6, 0))
+
+        preview_label = ctk.CTkLabel(
+            row,
+            text=preview or "(empty)",
+            font=ctk.CTkFont(size=12),
+            anchor="w",
+            justify="left",
+        )
+        preview_label.grid(row=1, column=0, columnspan=2, sticky="ew", padx=10, pady=(2, 6))
+
+        copy_btn = ctk.CTkButton(
+            row,
+            text="Copy",
+            width=56,
+            height=24,
+            font=ctk.CTkFont(size=11),
+            fg_color=config.ACCENT_COLOR,
+            hover_color=config.ACCENT_HOVER,
+            command=lambda t=text, b=None: self._copy_entry(t),
+        )
+        copy_btn.grid(row=0, column=2, rowspan=2, padx=(0, 8), pady=6)
+
+    def _copy_entry(self, text: str) -> None:
+        try:
+            import pyperclip
+
+            pyperclip.copy(text)
+            self._status.configure(text="Copied!")
+            self.window.after(1500, lambda: self._status.configure(text=""))
+        except Exception as exc:
+            log.warning("Copy failed: %s", exc)
+
+    def _confirm_clear(self) -> None:
+        dialog = ctk.CTkToplevel(self.window)
+        dialog.title("Clear History")
+        dialog.resizable(False, False)
+        _center_window(dialog, 320, 140)
+        dialog.lift()
+        dialog.focus_force()
+        dialog.grab_set()
+
+        ctk.CTkLabel(dialog, text="Clear all clipboard history?", font=ctk.CTkFont(size=13)).pack(pady=(24, 4))
+        ctk.CTkLabel(
+            dialog,
+            text="This cannot be undone.",
+            font=ctk.CTkFont(size=11),
+            text_color=("gray50", "gray60"),
+        ).pack()
+
+        btn_row = ctk.CTkFrame(dialog, fg_color="transparent")
+        btn_row.pack(pady=14)
+
+        def do_clear() -> None:
+            _emit("clear_history")
+            from .history import ClipboardHistory
+
+            ClipboardHistory().clear()
+            dialog.destroy()
+            self._refresh()
+
+        ctk.CTkButton(
+            btn_row,
+            text="Cancel",
+            width=90,
+            fg_color=("gray75", "gray30"),
+            hover_color=("gray65", "gray40"),
+            command=dialog.destroy,
+        ).pack(side="left", padx=6)
+        ctk.CTkButton(
+            btn_row,
+            text="Clear All",
+            width=90,
+            fg_color=config.ACCENT_COLOR,
+            hover_color=config.ACCENT_HOVER,
+            command=do_clear,
+        ).pack(side="left", padx=6)
+
+
 def _run_child(window_name: str) -> int:
     """Entry point invoked as `python -m clipsync.ui <window>` by UIController."""
     config.configure_logging()
@@ -1233,6 +1405,8 @@ def _run_child(window_name: str) -> int:
         LogsWindow(root, on_close=_quit)
     elif kind == "incoming":
         IncomingWindow(root, app, on_close=_quit)
+    elif kind == "history":
+        HistoryWindow(root, on_close=_quit)
     else:
         log.error("Unknown window: %s", window_name)
         return 1

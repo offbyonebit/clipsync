@@ -33,6 +33,7 @@ from watchdog.events import FileSystemEvent, FileSystemEventHandler
 from watchdog.observers import Observer
 
 from . import config
+from .history import ClipboardHistory
 
 log = logging.getLogger(__name__)
 
@@ -179,6 +180,7 @@ class ClipboardSync:
         self._last_read_error: str | None = None
         self._last_write_error: str | None = None
         self._last_decrypt_error: str | None = None
+        self._history = ClipboardHistory(settings)
 
     @property
     def clipboard_file(self) -> Path:
@@ -429,6 +431,7 @@ class ClipboardSync:
         try:
             self._write_file(current)
             log.info("OUT: %d chars written", len(current))
+            self._history.add_entry(current, "local")
         except OSError:
             log.exception("Failed to write clipboard file")
 
@@ -469,6 +472,7 @@ class ClipboardSync:
             with self._lock:
                 self._last_synced = content
             log.info("IN: %d chars applied to clipboard", len(content))
+            self._history.add_entry(content, "remote")
 
     def _on_image_file_changed(self) -> None:
         image = self._read_image_file()
