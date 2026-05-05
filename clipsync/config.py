@@ -80,7 +80,11 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "encryption_passphrase": "",
     "auto_accept_incoming": False,
     "rejected_device_ids": [],
+    "history_enabled": True,
+    "history_max_items": 50,
 }
+
+HISTORY_FILE = APP_DATA_DIR / "clipsync_history.json"
 
 
 class Settings:

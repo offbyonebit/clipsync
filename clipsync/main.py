@@ -138,6 +138,7 @@ class ClipSyncApp:
                 lambda _i, _it: self.ui.open("incoming"),
                 visible=lambda _item: self._pending_count() > 0,
             ),
+            pystray.MenuItem("Clipboard History", lambda _i, _it: self.ui.open("history")),
             pystray.MenuItem("Add Device", lambda _i, _it: self.ui.open("tabbed:pair")),
             pystray.MenuItem("Connected Devices", lambda _i, _it: self.ui.open("tabbed:devices")),
             pystray.MenuItem(
@@ -293,6 +294,10 @@ class ClipSyncApp:
             path = evt.get("path")
             if isinstance(path, str):
                 self._on_folder_changed(path)
+        elif kind == "clear_history":
+            if self.clipboard is not None:
+                self.clipboard._history.clear()
+            log.info("Clipboard history cleared from UI")
         elif kind == "reset":
             log.info("Devices reset from UI")
         elif kind == "accept_device":
