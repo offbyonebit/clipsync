@@ -145,3 +145,10 @@ code paths are present) but hasn't been as heavily exercised.
 MIT — see [LICENSE](LICENSE). You can fork, modify, and redistribute
 (including commercially), but the copyright notice must travel with the
 code.
+
+## Support
+
+This project is free and I don't ask for anything. If it's useful to you,
+a star on the repo is appreciated — and if you want to follow along with
+other things I'm building, you can find them under
+[@offbyonebit](https://github.com/offbyonebit).
