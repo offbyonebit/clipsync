@@ -3,6 +3,9 @@
 Tracks clipboard changes and stores them in a separate JSON file so users
 can access previous clipboard entries without relying on the sync engine's
 last-value mechanism. Thread-safe with atomic file operations.
+
+When an encryption passphrase is set, the history file is encrypted at rest
+using the same Fernet-based scheme as the clipboard sync file.
 """
 
 from __future__ import annotations
@@ -15,6 +18,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from . import config
+from .crypto import decrypt, encrypt, is_encrypted
 
 if TYPE_CHECKING:
     pass
@@ -44,28 +48,75 @@ class ClipboardHistory:
     """Thread-safe clipboard history manager.
 
     Persists entries to a JSON file with atomic writes. Deduplication
-    prevents duplicate entries from rapid polling cycles.
+    prevents duplicate entries from rapid polling cycles. Old entries are
+    pruned automatically based on the user's auto-clear setting.
     """
 
     def __init__(self, settings: config.Settings | None = None) -> None:
         self._path = config.HISTORY_FILE
         self._lock = threading.RLock()
         self._entries: list[HistoryEntry] = []
+        self._settings = settings
         self._max_items: int = 50 if settings is None else int(settings.get("history_max_items", 50) or 50)
         self._enabled: bool = True if settings is None else bool(settings.get("history_enabled", True))
         self._load()
+
+    def _passphrase(self) -> str:
+        if self._settings is None:
+            return ""
+        val = self._settings.get("encryption_passphrase") or ""
+        return val if isinstance(val, str) else ""
+
+    def _auto_clear_minutes(self) -> int:
+        if self._settings is None:
+            return 0
+        val = self._settings.get("history_auto_clear_minutes")
+        return int(val) if isinstance(val, int) and val > 0 else 0
+
+    def _prune_old(self) -> None:
+        minutes = self._auto_clear_minutes()
+        if minutes <= 0:
+            return
+        cutoff = time.time() - (minutes * 60)
+        self._entries = [e for e in self._entries if e.timestamp > cutoff]
 
     def _load(self) -> None:
         if not self._path.exists():
             return
         try:
-            with self._path.open("r", encoding="utf-8") as fh:
-                data = json.load(fh)
+            raw = self._path.read_bytes()
+        except OSError as exc:
+            log.warning("Failed to read clipboard history: %s", exc)
+            return
+
+        if is_encrypted(raw):
+            passphrase = self._passphrase()
+            if not passphrase:
+                log.warning("History file is encrypted but no passphrase is configured")
+                return
+            decrypted = decrypt(raw, passphrase)
+            if decrypted is None:
+                log.warning("Failed to decrypt clipboard history (passphrase mismatch?)")
+                return
+            try:
+                data = json.loads(decrypted.decode("utf-8"))
+            except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                log.warning("Failed to parse decrypted clipboard history: %s", exc)
+                return
+        else:
+            try:
+                data = json.loads(raw.decode("utf-8"))
+            except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                log.warning("Failed to load clipboard history: %s", exc)
+                return
+
+        try:
             entries = [HistoryEntry.from_dict(e) for e in data.get("entries", [])]
             entries.sort(key=lambda e: e.timestamp)
             with self._lock:
                 self._entries = entries[-self._max_items :] if len(entries) > self._max_items else entries
-        except (OSError, json.JSONDecodeError, KeyError, ValueError) as exc:
+                self._prune_old()
+        except (KeyError, ValueError) as exc:
             log.warning("Failed to load clipboard history: %s", exc)
 
     def _persist(self) -> None:
@@ -74,9 +125,13 @@ class ClipboardHistory:
         tmp = self._path.with_suffix(".json.tmp")
         try:
             self._path.parent.mkdir(parents=True, exist_ok=True)
-            with tmp.open("w", encoding="utf-8") as fh:
-                json.dump({"entries": [e.to_dict() for e in self._entries]}, fh, indent=2)
+            payload = json.dumps({"entries": [e.to_dict() for e in self._entries]}, indent=2).encode("utf-8")
+            passphrase = self._passphrase()
+            if passphrase:
+                payload = encrypt(payload, passphrase)
+            tmp.write_bytes(payload)
             tmp.replace(self._path)
+            config.set_file_permissions(self._path)
         except OSError as exc:
             log.warning("Failed to persist clipboard history: %s", exc)
 
@@ -91,6 +146,7 @@ class ClipboardHistory:
             self._entries.append(HistoryEntry(text=text, timestamp=time.time(), source=source))
             while len(self._entries) > self._max_items:
                 self._entries.pop(0)
+            self._prune_old()
         self._persist()
 
     def get_entries(self) -> list[HistoryEntry]:

@@ -779,6 +779,37 @@ class _SettingsContent:
         else:
             self._theme_seg.set("System")
 
+        ctk.CTkLabel(container, text="Clipboard history auto-clear", font=ctk.CTkFont(size=11)).pack(
+            anchor="w", pady=(14, 2)
+        )
+        self._auto_clear_options: dict[str, int] = {
+            "Never": 0,
+            "5 minutes": 5,
+            "15 minutes": 15,
+            "30 minutes": 30,
+            "1 hour": 60,
+            "4 hours": 240,
+            "24 hours": 1440,
+        }
+        auto_clear_row = ctk.CTkFrame(container, fg_color="transparent")
+        auto_clear_row.pack(fill="x", pady=(2, 0))
+        current_auto_clear = int(app.settings.get("history_auto_clear_minutes") or 0)
+        auto_clear_label = {v: k for k, v in self._auto_clear_options.items()}.get(current_auto_clear, "Never")
+        self._auto_clear_menu = ctk.CTkOptionMenu(
+            auto_clear_row,
+            values=list(self._auto_clear_options.keys()),
+            command=self._on_auto_clear_changed,
+            fg_color=("gray85", "gray25"),
+            button_color=config.ACCENT_COLOR,
+            button_hover_color=config.ACCENT_HOVER,
+            text_color="white",
+            dropdown_fg_color=("gray90", "gray20"),
+            dropdown_hover_color=("gray80", "gray30"),
+            dropdown_text_color="white",
+        )
+        self._auto_clear_menu.pack(side="left")
+        self._auto_clear_menu.set(auto_clear_label)
+
         ctk.CTkLabel(container, text="Encryption passphrase (optional)", font=ctk.CTkFont(size=11)).pack(
             anchor="w", pady=(14, 2)
         )
@@ -898,6 +929,14 @@ class _SettingsContent:
         self._app.on_settings_changed()
         ctk.set_appearance_mode(value)
         self._status.configure(text=f"Theme set to {value}.")
+
+    def _on_auto_clear_changed(self, value: str) -> None:
+        minutes = self._auto_clear_options.get(value, 0)
+        self._app.settings.set("history_auto_clear_minutes", minutes)
+        self._app.on_settings_changed()
+        self._status.configure(
+            text=(f"History auto-clear set to {value}." if minutes > 0 else "History auto-clear disabled.")
+        )
 
     def _on_save_passphrase(self) -> None:
         new_value = self._passphrase_entry.get()
