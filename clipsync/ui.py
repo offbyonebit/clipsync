@@ -1300,7 +1300,8 @@ class IncomingWindow(_BaseWindow):
 class HistoryWindow(_BaseWindow):
     """Scrollable list of recent clipboard entries with copy-on-click and search."""
 
-    def __init__(self, parent: ctk.CTk, on_close: Callable[[], None]) -> None:
+    def __init__(self, parent: ctk.CTk, app: object, on_close: Callable[[], None]) -> None:
+        self._app = app
         super().__init__(parent, f"{config.APP_NAME} — Clipboard History", (480, 520), on_close)
         container = ctk.CTkFrame(self.window, fg_color="transparent")
         container.pack(fill="both", expand=True, padx=16, pady=16)
@@ -1356,7 +1357,7 @@ class HistoryWindow(_BaseWindow):
         for w in self._list_frame.winfo_children():
             w.destroy()
 
-        history = ClipboardHistory()
+        history = ClipboardHistory(self._app.settings)
         self._all_entries = list(reversed(history.get_entries()))
 
         query = self._search_var.get().strip().lower()
@@ -1490,7 +1491,7 @@ class HistoryWindow(_BaseWindow):
             _emit("clear_history")
             from .history import ClipboardHistory
 
-            ClipboardHistory().clear()
+            ClipboardHistory(self._app.settings).clear()
             dialog.destroy()
             self._refresh()
 
@@ -1570,7 +1571,7 @@ def _run_child(window_name: str) -> int:
     elif kind == "incoming":
         IncomingWindow(root, app, on_close=_quit)
     elif kind == "history":
-        HistoryWindow(root, on_close=_quit)
+        HistoryWindow(root, app, on_close=_quit)
     else:
         log.error("Unknown window: %s", window_name)
         return 1
