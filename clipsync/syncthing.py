@@ -670,7 +670,7 @@ class SyncthingService:
     def __init__(self, settings: config.Settings) -> None:
         self._settings = settings
         self._binary: Path | None = None
-        self._proc: subprocess.Popen[bytes] | None = None
+        self._proc: subprocess.Popen[str] | None = None
         self._device_id: str = ""
         self._stop = threading.Event()
         self._monitor: threading.Thread | None = None

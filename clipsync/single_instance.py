@@ -37,7 +37,7 @@ class SingleInstance:
                 import msvcrt
 
                 try:
-                    msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+                    msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)  # type: ignore[attr-defined]
                 except OSError as exc:
                     raise AlreadyRunning(str(self._path)) from exc
             else:
@@ -63,7 +63,7 @@ class SingleInstance:
 
                 try:
                     fh.seek(0)
-                    msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+                    msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)  # type: ignore[attr-defined]
                 except OSError:
                     pass
             else:

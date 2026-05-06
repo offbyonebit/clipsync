@@ -345,7 +345,7 @@ class _PairingContent:
 
     def _render_qr(self, device_id: str) -> None:
         qr_img = pairing.generate_qr(device_id, box_size=4, border=2)
-        qr_img = qr_img.resize((110, 110), Image.NEAREST)
+        qr_img = qr_img.resize((110, 110), Image.Resampling.NEAREST)
         ctk_img = ctk.CTkImage(light_image=qr_img, dark_image=qr_img, size=(110, 110))
         self._qr_label.configure(image=ctk_img)
         self._qr_label.image = ctk_img  # keep reference
@@ -497,7 +497,7 @@ class _PairingContent:
         except ImportError:
             return
         try:
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)  # type: ignore[call-overload]
             h, w = rgb.shape[:2]
             target_w, target_h = self._preview_size
             scale = min(target_w / w, target_h / h)
@@ -1300,7 +1300,7 @@ class IncomingWindow(_BaseWindow):
 class HistoryWindow(_BaseWindow):
     """Scrollable list of recent clipboard entries with copy-on-click and search."""
 
-    def __init__(self, parent: ctk.CTk, app: object, on_close: Callable[[], None]) -> None:
+    def __init__(self, parent: ctk.CTk, app: AppContext, on_close: Callable[[], None]) -> None:
         self._app = app
         super().__init__(parent, f"{config.APP_NAME} — Clipboard History", (480, 520), on_close)
         container = ctk.CTkFrame(self.window, fg_color="transparent")
