@@ -24,7 +24,7 @@ jobs:
           cache: pip
 
       - name: Install dependencies
-        run: pip install -r requirements.txt ruff mypy
+        run: pip install -r requirements.txt ruff mypy pytest
 
       - name: Lint
         run: ruff check clipsync/ tests/
