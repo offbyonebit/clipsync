@@ -81,9 +81,7 @@ def _release_asset_url(version: str) -> str:
 # SHA-256 hashes of known-good Syncthing binaries for supply-chain verification.
 # Expand this dictionary as new platforms/versions are validated.
 _KNOWN_BINARY_HASHES: dict[tuple[str, str, str], str] = {
-    ("linux", "amd64", "v2.0.16"): (
-        "ef9fd7380fc3a4a000e2cc213e56697a091d7b5cd6e540026b14566bc85e3a4b"
-    ),
+    ("linux", "amd64", "v2.0.16"): ("ef9fd7380fc3a4a000e2cc213e56697a091d7b5cd6e540026b14566bc85e3a4b"),
 }
 
 
