@@ -134,7 +134,7 @@ class ClipboardSync:
         self._settings = settings
         self._stop = threading.Event()
         self._poll_thread: threading.Thread | None = None
-        self._observer: Observer | None = None
+        self._observer: Observer | None = None  # type: ignore[valid-type]
         self._last_synced: str | bytes | None = None
         self._lock = threading.Lock()
         self._last_read_error: str | None = None
@@ -483,12 +483,12 @@ class _ClipboardFileHandler(FileSystemEventHandler):
     def on_modified(self, event: FileSystemEvent) -> None:
         if event.is_directory:
             return
-        self._dispatch(event.src_path)
+        self._dispatch(event.src_path if isinstance(event.src_path, str) else event.src_path.decode())
 
     def on_created(self, event: FileSystemEvent) -> None:
         if event.is_directory:
             return
-        self._dispatch(event.src_path)
+        self._dispatch(event.src_path if isinstance(event.src_path, str) else event.src_path.decode())
 
     def on_moved(self, event: FileSystemEvent) -> None:
         if event.is_directory:
