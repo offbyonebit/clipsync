@@ -1,0 +1,32 @@
+---
+name: General Issue
+description: File a general issue or question
+title: "[Issue]: "
+labels: ["question"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to fill out this issue!
+  - type: textarea
+    id: description
+    attributes:
+      label: Describe the issue or question
+      description: A clear and concise description of your issue or question.
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating System
+      description: Which operating system are you using?
+      options:
+        - Windows
+        - macOS
+        - Linux
+        - Not applicable
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Add any other context about the issue here.
