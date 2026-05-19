@@ -34,9 +34,12 @@ from watchdog.observers import Observer
 
 from . import config
 from .crypto import decrypt, encrypt, is_encrypted
+from .debug import _safe_hostname
 from .history import ClipboardHistory
 
 log = logging.getLogger(__name__)
+
+_HOSTNAME = _safe_hostname()
 
 
 def _normalize_newlines(s: str) -> str:
@@ -158,7 +161,7 @@ class ClipboardSync:
         self._poll_thread = threading.Thread(target=self._out_loop, name="clipsync-out", daemon=True)
         self._poll_thread.start()
         self._start_watcher()
-        log.info("Clipboard sync started")
+        log.info("Clipboard sync started (host=%s)", _HOSTNAME)
 
     def stop(self) -> None:
         self._stop.set()
@@ -359,6 +362,7 @@ class ClipboardSync:
             return False
 
     def _out_loop(self) -> None:
+        _heartbeat_counter = 0
         while not self._stop.is_set():
             try:
                 if not self._is_paused():
@@ -367,6 +371,17 @@ class ClipboardSync:
                 log.exception("Error in OUT loop")
             if self._stop.wait(config.CLIPBOARD_POLL_INTERVAL):
                 break
+            _heartbeat_counter += 1
+            if _heartbeat_counter >= 12:
+                _heartbeat_counter = 0
+                with self._lock:
+                    last = self._last_synced
+                log.info(
+                    "HEARTBEAT (host=%s): last_synced=%s, paused=%s",
+                    _HOSTNAME,
+                    (repr(last[:40]) + "...") if isinstance(last, str) and len(last) > 40 else repr(last),
+                    self._is_paused(),
+                )
 
     def _out_tick(self) -> None:
         # Images take priority: if the clipboard has an image, sync it.
@@ -378,9 +393,9 @@ class ClipboardSync:
                 self._last_synced = image
             try:
                 self._write_image_file(image)
-                log.info("OUT: %d bytes image written", len(image))
+                log.info("OUT [%s]: %d bytes image written", _HOSTNAME, len(image))
             except OSError:
-                log.exception("Failed to write image file")
+                log.exception("OUT [%s]: Failed to write image file", _HOSTNAME)
             return
 
         current = self._read_clipboard()
@@ -392,10 +407,10 @@ class ClipboardSync:
             self._last_synced = current
         try:
             self._write_file(current)
-            log.info("OUT: %d chars written", len(current))
+            log.info("OUT [%s]: %d chars written", _HOSTNAME, len(current))
             self._history.add_entry(current, "local")
         except OSError:
-            log.exception("Failed to write clipboard file")
+            log.exception("OUT [%s]: Failed to write clipboard file", _HOSTNAME)
 
     def _start_watcher(self) -> None:
         handler = _ClipboardFileHandler(self)
@@ -424,16 +439,18 @@ class ClipboardSync:
             return
         with self._lock:
             if content == self._last_synced:
+                log.debug("IN [%s]: file changed but content already synced (%d chars)", _HOSTNAME, len(content))
                 return
         current = self._read_clipboard()
         if current == content:
             with self._lock:
                 self._last_synced = content
+            log.debug("IN [%s]: file change was self-originated (%d chars)", _HOSTNAME, len(content))
             return
         if self._write_clipboard(content):
             with self._lock:
                 self._last_synced = content
-            log.info("IN: %d chars applied to clipboard", len(content))
+            log.info("IN [%s]: %d chars applied to clipboard", _HOSTNAME, len(content))
             self._history.add_entry(content, "remote")
 
     def _on_image_file_changed(self) -> None:
@@ -442,16 +459,18 @@ class ClipboardSync:
             return
         with self._lock:
             if image == self._last_synced:
+                log.debug("IN [%s]: image file changed but already synced (%d bytes)", _HOSTNAME, len(image))
                 return
         current = self._read_clipboard_image()
         if current == image:
             with self._lock:
                 self._last_synced = image
+            log.debug("IN [%s]: image file change was self-originated (%d bytes)", _HOSTNAME, len(image))
             return
         if self._write_clipboard_image(image):
             with self._lock:
                 self._last_synced = image
-            log.info("IN: %d bytes image applied to clipboard", len(image))
+            log.info("IN [%s]: %d bytes image applied to clipboard", _HOSTNAME, len(image))
 
 
 class _ClipboardFileHandler(FileSystemEventHandler):
