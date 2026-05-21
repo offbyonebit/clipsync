@@ -38,7 +38,8 @@ log = logging.getLogger(__name__)
 
 _DOWNLOAD_TIMEOUT = 120
 _API_TIMEOUT = 10
-_STARTUP_WAIT = 30
+_STARTUP_PING_TIMEOUT = 3  # short per-attempt timeout during startup probing
+_STARTUP_WAIT = 60  # initial scan on Windows with slow storage can exceed 30s
 _RESTART_DELAY = 10
 
 
@@ -498,8 +499,9 @@ def kill_orphaned_syncthings() -> int:
         except Exception:
             log.warning("Could not terminate orphan syncthing pid=%s", pid, exc_info=True)
     if killed:
-        # Give the OS a beat to release the DB lock and port 8385.
-        time.sleep(1.0)
+        # Windows needs a few seconds to release Syncthing's LevelDB lock file
+        # after the process exits; 1s was not enough on slow storage.
+        time.sleep(3.0)
     return killed
 
 
@@ -542,17 +544,24 @@ class SyncthingClient:
                 return resp.text
         return None
 
-    def ping(self) -> bool:
+    def ping(self, timeout: float = _API_TIMEOUT) -> bool:
         try:
-            self._get("/rest/system/ping")
+            self._session.get(self._url("/rest/system/ping"), timeout=timeout)
             return True
         except requests.RequestException:
             return False
 
     def wait_until_ready(self, timeout: float = _STARTUP_WAIT) -> bool:
+        """Poll until Syncthing responds to ping or the deadline passes.
+
+        Uses _STARTUP_PING_TIMEOUT (3s) instead of the normal _API_TIMEOUT
+        (10s) per attempt. With the old 10s/attempt + 30s window we only got
+        2-3 tries; now we get ~17 in a 60s window, which survives the initial
+        DB scan on slow Windows storage.
+        """
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            if self.ping():
+            if self.ping(timeout=_STARTUP_PING_TIMEOUT):
                 return True
             time.sleep(0.5)
         return False
