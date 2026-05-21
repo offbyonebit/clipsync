@@ -18,6 +18,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 import customtkinter as ctk
+import requests
 from PIL import Image
 
 from . import __version__, config, pairing, update
@@ -588,10 +589,27 @@ class _DevicesContent:
     def _refresh(self) -> None:
         for child in self._list_frame.winfo_children():
             child.destroy()
+        ctk.CTkLabel(self._list_frame, text="Loading…", text_color=("gray50", "gray60")).pack(pady=20)
+        threading.Thread(target=self._do_refresh, daemon=True).start()
+
+    def _do_refresh(self) -> None:
         try:
-            devices = self._app.client.connected_devices()
+            devices: list[dict] = self._app.client.connected_devices()
+            error: str | None = None
+        except requests.RequestException:
+            devices = []
+            error = "Syncthing is not responding"
         except Exception as exc:
-            ctk.CTkLabel(self._list_frame, text=f"Error: {exc}", text_color="red").pack(pady=10)
+            devices = []
+            error = str(exc)
+        if self._exists():
+            self._win.after(0, self._apply_refresh, devices, error)
+
+    def _apply_refresh(self, devices: list[dict], error: str | None) -> None:
+        for child in self._list_frame.winfo_children():
+            child.destroy()
+        if error:
+            ctk.CTkLabel(self._list_frame, text=error, text_color="red").pack(pady=10)
             return
         if not devices:
             empty = ctk.CTkFrame(self._list_frame, fg_color="transparent")
@@ -1214,10 +1232,27 @@ class IncomingWindow(_BaseWindow):
     def _refresh(self) -> None:
         for child in self._list_frame.winfo_children():
             child.destroy()
+        ctk.CTkLabel(self._list_frame, text="Loading…", text_color=("gray50", "gray60")).pack(pady=20)
+        threading.Thread(target=self._do_refresh, daemon=True).start()
+
+    def _do_refresh(self) -> None:
         try:
-            pending = self._app.client.get_pending_devices() or {}
+            pending: dict = self._app.client.get_pending_devices() or {}
+            error: str | None = None
+        except requests.RequestException:
+            pending = {}
+            error = "Syncthing is not responding"
         except Exception as exc:
-            ctk.CTkLabel(self._list_frame, text=f"Error: {exc}", text_color="red").pack(pady=10)
+            pending = {}
+            error = str(exc)
+        if self.exists():
+            self.window.after(0, self._apply_refresh, pending, error)
+
+    def _apply_refresh(self, pending: dict, error: str | None) -> None:
+        for child in self._list_frame.winfo_children():
+            child.destroy()
+        if error:
+            ctk.CTkLabel(self._list_frame, text=error, text_color="red").pack(pady=10)
             return
         rejected = set(self._app.settings.get("rejected_device_ids") or [])
         visible = [
