@@ -697,19 +697,34 @@ class SyncthingService:
 
     def _spawn(self) -> None:
         assert self._binary is not None
-        args = [
-            str(self._binary),
-            "serve",
-            f"--home={config.SYNCTHING_HOME}",
-            "--no-browser",
-            "--no-restart",
-            "--no-upgrade",
-        ]
-        log.info("Spawning: %s", " ".join(args))
-        creationflags = 0
-        if platform.system() == "Windows":
-            creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         with self._lock:
+            old = self._proc
+            if old is not None and old.poll() is None:
+                log.info("Terminating existing Syncthing process (pid=%s)", old.pid)
+                try:
+                    old.terminate()
+                    try:
+                        old.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        old.kill()
+                        old.wait(timeout=3)
+                except ProcessLookupError:
+                    pass
+                except Exception:
+                    log.warning("Error terminating previous Syncthing", exc_info=True)
+
+            args = [
+                str(self._binary),
+                "serve",
+                f"--home={config.SYNCTHING_HOME}",
+                "--no-browser",
+                "--no-restart",
+                "--no-upgrade",
+            ]
+            log.info("Spawning: %s", " ".join(args))
+            creationflags = 0
+            if platform.system() == "Windows":
+                creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
             self._proc = subprocess.Popen(
                 args,
                 stdout=subprocess.PIPE,
@@ -754,7 +769,8 @@ class SyncthingService:
 
     def _watch(self) -> None:
         while not self._stop.is_set():
-            proc = self._proc
+            with self._lock:
+                proc = self._proc
             if proc is None:
                 break
             rc = proc.poll()
