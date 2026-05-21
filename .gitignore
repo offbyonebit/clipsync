@@ -19,3 +19,6 @@ Thumbs.db
 # Claude Code's per-project state (settings, session logs, transcripts).
 # Local to each clone and should not be shared across machines.
 .claude/
+
+# Integration tests (require real display server, only run locally)
+tests/integration/

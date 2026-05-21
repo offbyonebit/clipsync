@@ -4,7 +4,7 @@ Peer-to-peer clipboard sync for Windows, macOS, and Linux. Copy on one machine,
 paste on another. No account, no cloud, no central server. The data never
 leaves your devices.
 
-Verified working across Mac and Windows, across different networks.
+Verified working across Windows, macOS, and Linux, across different networks.
 
 ## Why this exists
 
@@ -137,8 +137,7 @@ Settings changes from the UI take effect immediately; hand-editing
 
 ## Status
 
-Working on Windows and macOS. Linux should work (the autostart and clipboard
-code paths are present) but hasn't been as heavily exercised.
+Fully tested and working on Windows, macOS, and Linux.
 
 ## License
 
