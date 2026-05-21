@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import io
 import logging
+import queue
 import subprocess
 import sys
 import threading
@@ -137,6 +138,8 @@ class ClipboardSync:
         self._settings = settings
         self._stop = threading.Event()
         self._poll_thread: threading.Thread | None = None
+        self._in_thread: threading.Thread | None = None
+        self._in_queue: queue.SimpleQueue[str] = queue.SimpleQueue()
         self._observer: Observer | None = None  # type: ignore[valid-type]
         self._last_synced: str | bytes | None = None
         self._lock = threading.Lock()
@@ -160,6 +163,8 @@ class ClipboardSync:
         self._seed_from_file()
         self._poll_thread = threading.Thread(target=self._out_loop, name="clipsync-out", daemon=True)
         self._poll_thread.start()
+        self._in_thread = threading.Thread(target=self._in_loop, name="clipsync-in", daemon=True)
+        self._in_thread.start()
         self._start_watcher()
         log.info("Clipboard sync started (host=%s)", _HOSTNAME)
 
@@ -172,6 +177,10 @@ class ClipboardSync:
             except Exception:
                 log.exception("Error stopping file observer")
             self._observer = None
+        # Unblock _in_loop which may be waiting on the queue
+        self._in_queue.put("")
+        if self._in_thread and self._in_thread.is_alive():
+            self._in_thread.join(timeout=3)
         if self._poll_thread and self._poll_thread.is_alive():
             self._poll_thread.join(timeout=3)
         log.info("Clipboard sync stopped")
@@ -412,6 +421,37 @@ class ClipboardSync:
         except OSError:
             log.exception("OUT [%s]: Failed to write clipboard file", _HOSTNAME)
 
+    def _in_loop(self) -> None:
+        """Drain _in_queue and apply remote file changes to the local clipboard.
+
+        Watchdog dispatches events on its own internal thread (backed by a
+        thread pool on Windows). Doing clipboard I/O there blocks the pool and
+        causes pool-exhaustion errors. This loop runs on a thread we own so
+        watchdog events are always handled off the pool in bounded time.
+        """
+        _last_processed: dict[str, float] = {}
+        while True:
+            try:
+                path = self._in_queue.get(timeout=0.5)
+            except queue.Empty:
+                if self._stop.is_set():
+                    break
+                continue
+            if not path:  # sentinel posted by stop()
+                break
+            if self._stop.is_set():
+                break
+            if self._is_paused():
+                continue
+            now = time.monotonic()
+            if now - _last_processed.get(path, 0.0) < 0.1:
+                continue
+            _last_processed[path] = now
+            try:
+                self._on_file_changed(path)
+            except Exception:
+                log.exception("Error in IN loop")
+
     def _start_watcher(self) -> None:
         handler = _ClipboardFileHandler(self)
         observer = Observer()
@@ -480,13 +520,19 @@ class _ClipboardFileHandler(FileSystemEventHandler):
         super().__init__()
         self._sync = sync
         self._debounce_until = 0.0
+        # Fast name-based pre-filter to avoid Path.resolve() on every event.
+        # Syncthing generates many temp-file events; most are irrelevant.
+        self._target_names = {config.CLIPBOARD_FILENAME, config.CLIPBOARD_IMAGE_FILENAME}
+        # Cache resolved targets once so _matches doesn't re-resolve per event.
+        self._resolved_text = sync.clipboard_file.resolve()
+        self._resolved_image = sync.clipboard_image_file.resolve()
 
     def _matches(self, path: str) -> bool:
+        if Path(path).name not in self._target_names:
+            return False
         try:
             resolved = Path(path).resolve()
-            return (
-                resolved == self._sync.clipboard_file.resolve() or resolved == self._sync.clipboard_image_file.resolve()
-            )
+            return resolved == self._resolved_text or resolved == self._resolved_image
         except OSError:
             return False
 
@@ -497,7 +543,9 @@ class _ClipboardFileHandler(FileSystemEventHandler):
         if now < self._debounce_until:
             return
         self._debounce_until = now + 0.1
-        self._sync._on_file_changed(path)
+        # Non-blocking: hand off to _in_loop so the watchdog thread pool
+        # is never held by clipboard I/O (avoids pool exhaustion on Windows).
+        self._sync._in_queue.put(path)
 
     def on_modified(self, event: FileSystemEvent) -> None:
         if event.is_directory:
