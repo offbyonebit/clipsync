@@ -16,6 +16,7 @@ import time
 from collections.abc import Callable
 
 import qrcode
+import requests
 from PIL import Image
 
 from . import config
@@ -174,6 +175,8 @@ class PendingDeviceWatcher:
         while not self._stop.is_set():
             try:
                 self._tick()
+            except requests.RequestException as exc:
+                log.warning("Pending device watcher: Syncthing not responding (%s)", exc)
             except Exception:
                 log.exception("Error in pending device watcher")
             if self._stop.wait(self._interval):

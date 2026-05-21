@@ -510,6 +510,7 @@ class SyncthingClient:
         self._base = base_url.rstrip("/")
         self._session = requests.Session()
         self._session.headers["X-API-Key"] = api_key
+        self._cached_device_id: str | None = None
 
     def _url(self, path: str) -> str:
         return f"{self._base}{path}"
@@ -557,8 +558,10 @@ class SyncthingClient:
         return False
 
     def get_device_id(self) -> str:
-        status = self._get("/rest/system/status")
-        return status["myID"]
+        if self._cached_device_id is None:
+            status = self._get("/rest/system/status")
+            self._cached_device_id = status["myID"]
+        return self._cached_device_id
 
     def get_config(self) -> dict[str, Any]:
         return self._get("/rest/config")
@@ -646,7 +649,11 @@ class SyncthingClient:
         """Return a list of {deviceID, name, connected, address} for paired devices."""
         devices = self.get_devices()
         my_id = self.get_device_id()
-        connections = self.get_connections().get("connections") or {}
+        try:
+            connections = self.get_connections().get("connections") or {}
+        except requests.RequestException:
+            # Connection status is best-effort; don't fail the whole call.
+            connections = {}
         out: list[dict[str, Any]] = []
         for d in devices:
             did = d.get("deviceID")

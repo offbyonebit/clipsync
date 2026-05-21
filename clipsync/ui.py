@@ -552,6 +552,7 @@ class _DevicesContent:
     ) -> None:
         self._win = window
         self._app = app
+        self._refreshing = False
 
         ctk.CTkLabel(container, text="Connected devices", font=ctk.CTkFont(size=18, weight="bold")).pack(pady=(0, 10))
 
@@ -578,7 +579,7 @@ class _DevicesContent:
     def _schedule_refresh(self) -> None:
         if not self._exists():
             return
-        self._win.after(3000, self._auto_refresh)
+        self._win.after(10_000, self._auto_refresh)
 
     def _auto_refresh(self) -> None:
         if not self._exists():
@@ -587,6 +588,9 @@ class _DevicesContent:
         self._schedule_refresh()
 
     def _refresh(self) -> None:
+        if self._refreshing:
+            return
+        self._refreshing = True
         for child in self._list_frame.winfo_children():
             child.destroy()
         ctk.CTkLabel(self._list_frame, text="Loading…", text_color=("gray50", "gray60")).pack(pady=20)
@@ -604,8 +608,11 @@ class _DevicesContent:
             error = str(exc)
         if self._exists():
             self._win.after(0, self._apply_refresh, devices, error)
+        else:
+            self._refreshing = False
 
     def _apply_refresh(self, devices: list[dict], error: str | None) -> None:
+        self._refreshing = False
         for child in self._list_frame.winfo_children():
             child.destroy()
         if error:
@@ -1195,6 +1202,7 @@ class IncomingWindow(_BaseWindow):
         super().__init__(parent, f"{config.APP_NAME} — Incoming Requests", (440, 360), on_close)
         self._app = app
         self._handled: set[str] = set()
+        self._refreshing = False
 
         container = ctk.CTkFrame(self.window, fg_color="transparent")
         container.pack(fill="both", expand=True, padx=20, pady=20)
@@ -1221,7 +1229,7 @@ class IncomingWindow(_BaseWindow):
     def _schedule_refresh(self) -> None:
         if not self.exists():
             return
-        self.window.after(3000, self._auto_refresh)
+        self.window.after(10_000, self._auto_refresh)
 
     def _auto_refresh(self) -> None:
         if not self.exists():
@@ -1230,6 +1238,9 @@ class IncomingWindow(_BaseWindow):
         self._schedule_refresh()
 
     def _refresh(self) -> None:
+        if self._refreshing:
+            return
+        self._refreshing = True
         for child in self._list_frame.winfo_children():
             child.destroy()
         ctk.CTkLabel(self._list_frame, text="Loading…", text_color=("gray50", "gray60")).pack(pady=20)
@@ -1247,8 +1258,11 @@ class IncomingWindow(_BaseWindow):
             error = str(exc)
         if self.exists():
             self.window.after(0, self._apply_refresh, pending, error)
+        else:
+            self._refreshing = False
 
     def _apply_refresh(self, pending: dict, error: str | None) -> None:
+        self._refreshing = False
         for child in self._list_frame.winfo_children():
             child.destroy()
         if error:
