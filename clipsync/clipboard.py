@@ -43,6 +43,9 @@ log = logging.getLogger(__name__)
 _HOSTNAME = _safe_hostname()
 
 
+_PNG_HEADER = b"\x89PNG\r\n\x1a\n"
+
+
 def _normalize_newlines(s: str) -> str:
     """Collapse CRLF/CR to LF so Windows's clipboard normalization does not
     look like a real change to the OUT loop after a remote update."""
@@ -63,14 +66,17 @@ def _read_image_from_system_clipboard() -> bytes | None:
             return buf.getvalue()
         except Exception:
             return None
-    # Linux: try xclip then wl-paste
+    # Linux: try xclip then wl-paste.
+    # Some xclip versions return text content with exit 0 even when asked for
+    # image/png and no image is on the clipboard.  Guard with a PNG magic-byte
+    # check so we never mistake text bytes for image data.
     for cmd in (
         ["xclip", "-selection", "clipboard", "-t", "image/png", "-o"],
         ["wl-paste", "--type", "image/png"],
     ):
         try:
             result = subprocess.run(cmd, capture_output=True, timeout=3)
-            if result.returncode == 0 and result.stdout:
+            if result.returncode == 0 and result.stdout and result.stdout[:8] == _PNG_HEADER:
                 return result.stdout
         except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
             continue
@@ -277,7 +283,10 @@ class ClipboardSync:
             if self._last_decrypt_error is not None:
                 log.info("Decrypt recovered")
                 self._last_decrypt_error = None
-            return decrypted
+            data = decrypted
+        if not data.startswith(_PNG_HEADER):
+            log.debug("IN [%s]: clipboard.png contains non-PNG data (%d bytes); skipping", _HOSTNAME, len(data))
+            return None
         return data
 
     def _write_image_file(self, png_bytes: bytes) -> None:
