@@ -17,6 +17,7 @@ Lifecycle on quit:
 from __future__ import annotations
 
 import logging
+import platform
 import signal
 import sys
 import threading
@@ -57,6 +58,76 @@ def _load_or_create_icon(size: int = 64) -> Image.Image:
     except OSError:
         pass
     return img
+
+
+_WM_UPDATE_MENU = 0x8100
+
+
+def _patch_tray_for_windows(icon: pystray.Icon) -> None:
+    """Make pystray Icon.update_menu() thread-safe on Windows.
+
+    On Windows, pystray uses TrackPopupMenuEx to show the tray context
+    menu.  This call blocks the Win32 message loop until the user
+    selects an item or dismisses the menu.  If a background thread
+    calls ``update_menu()`` while the menu is displayed, the underlying
+    DestroyMenu frees the HMENU handle out from under TrackPopupMenuEx,
+    making the menu visually present but completely unresponsive to
+    clicks.
+
+    This patch:
+
+    1. Replaces ``icon.update_menu`` with a version that, when called
+       from a background thread, posts a custom Win32 message
+       (WM_APP+256) to the icon's window so the actual menu rebuild
+       always runs on the message-loop thread.
+    2. Wraps the WM_NOTIFY handler to set a flag while
+       TrackPopupMenuEx is active.  If a menu update arrives during
+       that window, it is deferred until TrackPopupMenuEx returns.
+    """
+    import ctypes
+
+    from pystray._util import win32
+
+    icon._clipsync_menu_showing = False
+    icon._clipsync_menu_dirty = False
+
+    original_update_menu = icon.update_menu
+    original_on_notify = icon._message_handlers[win32.WM_NOTIFY]
+
+    def _do_update_menu() -> None:
+        if icon._clipsync_menu_showing:
+            icon._clipsync_menu_dirty = True
+            return
+        original_update_menu()
+
+    icon._message_handlers[_WM_UPDATE_MENU] = lambda _w, _l: _do_update_menu()
+
+    def _thread_safe_update_menu() -> None:
+        if not icon._running:
+            return
+        if threading.current_thread() is getattr(icon, "_thread", None):
+            _do_update_menu()
+        else:
+            hwnd = icon._hwnd
+            if hwnd:
+                ctypes.windll.user32.PostMessageW(hwnd, _WM_UPDATE_MENU, 0, 0)
+
+    icon.update_menu = _thread_safe_update_menu
+
+    def _patched_on_notify(wparam: object, lparam: object) -> object:
+        if lparam == win32.WM_RBUTTONUP and icon._menu_handle:
+            icon._clipsync_menu_showing = True
+            try:
+                return original_on_notify(wparam, lparam)
+            finally:
+                icon._clipsync_menu_showing = False
+                if icon._clipsync_menu_dirty:
+                    icon._clipsync_menu_dirty = False
+                    icon.update_menu()
+        else:
+            return original_on_notify(wparam, lparam)
+
+    icon._message_handlers[win32.WM_NOTIFY] = _patched_on_notify
 
 
 class ClipSyncApp:
@@ -164,6 +235,8 @@ class ClipSyncApp:
             self._shutdown()
 
     def _on_tray_ready(self, icon: pystray.Icon) -> None:
+        if platform.system() == "Windows":
+            _patch_tray_for_windows(icon)
         icon.visible = True
         if self._pending_first_run_notice:
             self._pending_first_run_notice = False
@@ -186,8 +259,6 @@ class ClipSyncApp:
         paused = not bool(self.settings.get("sync_paused"))
         self.settings.set("sync_paused", paused)
         self._on_pause_changed(paused)
-        if self.tray is not None:
-            self.tray.update_menu()
 
     def _menu_quit(self, icon: pystray.Icon, _item: pystray.MenuItem) -> None:
         log.info("Quit requested from tray")
