@@ -152,7 +152,8 @@ class ClipSyncApp:
 
         self._start_syncthing_with_retry()
 
-        assert self.syncthing.client is not None
+        if self.syncthing.client is None:
+            raise RuntimeError("Syncthing started but REST client was not initialized")
         self.clipboard = ClipboardSync(self.settings)
         self.clipboard.start()
 
@@ -309,7 +310,9 @@ class ClipSyncApp:
         )
 
     def _accept_device(self, device_id: str) -> None:
-        assert self.syncthing.client is not None
+        if self.syncthing.client is None:
+            log.error("Cannot accept device %s: Syncthing client not available", device_id)
+            return
         info: dict[str, object]
         with self._pending_lock:
             info = self._pending.pop(device_id, {})

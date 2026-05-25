@@ -87,7 +87,8 @@ class UIController:
 
     def _read_events(self, proc: subprocess.Popen[str]) -> None:
         try:
-            assert proc.stdout is not None
+            if proc.stdout is None:
+                raise RuntimeError("UI subprocess has no stdout pipe")
             for line in proc.stdout:
                 line = line.strip()
                 if not line:
@@ -1020,7 +1021,8 @@ class _SettingsContent:
         if error is not None:
             self._status.configure(text=error)
             return
-        assert info is not None
+        if info is None:
+            return
         if not info.update_available:
             self._status.configure(text=f"You're up to date (v{info.current_version}).")
             return
