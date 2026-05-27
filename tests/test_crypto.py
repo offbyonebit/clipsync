@@ -2,11 +2,8 @@
 
 from __future__ import annotations
 
-import pytest
-
 from clipsync import crypto
 from clipsync.crypto import _ENC_MAGIC_V0, _ENC_MAGIC_V1, _LEGACY_SALT, _derive_key
-
 
 # ---------------------------------------------------------------------------
 # Encrypt / decrypt round-trip

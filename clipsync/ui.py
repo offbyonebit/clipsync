@@ -499,7 +499,7 @@ class _PairingContent:
         except ImportError:
             return
         try:
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)  # type: ignore[call-overload]
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             h, w = rgb.shape[:2]
             target_w, target_h = self._preview_size
             scale = min(target_w / w, target_h / h)
