@@ -110,7 +110,7 @@ def _patch_tray_for_windows(icon: pystray.Icon) -> None:
         else:
             hwnd = icon._hwnd
             if hwnd:
-                ctypes.windll.user32.PostMessageW(hwnd, _WM_UPDATE_MENU, 0, 0)
+                ctypes.windll.user32.PostMessageW(hwnd, _WM_UPDATE_MENU, 0, 0)  # type: ignore[attr-defined]
 
     icon.update_menu = _thread_safe_update_menu
 

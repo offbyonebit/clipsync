@@ -146,7 +146,7 @@ class ClipboardSync:
         self._poll_thread: threading.Thread | None = None
         self._in_thread: threading.Thread | None = None
         self._in_queue: queue.SimpleQueue[str] = queue.SimpleQueue()
-        self._observer: Observer | None = None  # type: ignore[valid-type]
+        self._observer: Observer | None = None
         self._last_synced: str | bytes | None = None
         self._lock = threading.Lock()
         self._last_read_error: str | None = None
