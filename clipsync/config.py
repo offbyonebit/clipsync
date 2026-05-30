@@ -208,7 +208,10 @@ def configure_logging() -> None:
         "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
-    file_handler = logging.FileHandler(LOG_FILE, encoding="utf-8")
+    from logging.handlers import RotatingFileHandler
+    file_handler = RotatingFileHandler(
+        LOG_FILE, encoding="utf-8", maxBytes=10 * 1024 * 1024, backupCount=3
+    )
     file_handler.setFormatter(fmt)
     stream_handler = logging.StreamHandler()
     stream_handler.setFormatter(fmt)

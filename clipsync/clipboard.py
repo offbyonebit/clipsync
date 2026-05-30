@@ -394,7 +394,7 @@ class ClipboardSync:
                 _heartbeat_counter = 0
                 with self._lock:
                     last = self._last_synced
-                log.info(
+                log.debug(
                     "HEARTBEAT (host=%s): last_synced=%s, paused=%s",
                     _HOSTNAME,
                     (repr(last[:40]) + "...") if isinstance(last, str) and len(last) > 40 else repr(last),
