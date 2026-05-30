@@ -51,7 +51,15 @@ ciphertext.
 
 ## Install
 
+```bash
+pip install offbyonebit-clipsync
+clipsync
 ```
+
+> **Note:** the PyPI package name is `offbyonebit-clipsync` (the name `clipsync` was already taken).
+
+**Or run from source:**
+```bash
 pip install -r requirements.txt
 python -m clipsync
 ```
