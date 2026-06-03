@@ -712,7 +712,8 @@ class SyncthingService:
         self._monitor.start()
 
     def _spawn(self) -> None:
-        assert self._binary is not None
+        if self._binary is None:
+            raise RuntimeError("Cannot spawn Syncthing: binary path not set")
         with self._lock:
             old = self._proc
             if old is not None and old.poll() is None:
