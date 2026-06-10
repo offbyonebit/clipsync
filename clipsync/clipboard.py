@@ -45,11 +45,42 @@ _HOSTNAME = _safe_hostname()
 
 _PNG_HEADER = b"\x89PNG\r\n\x1a\n"
 
+# Minimum seconds between image-clipboard polls on Linux.  Checking for images
+# requires running xclip/wl-paste which sends X11 SelectionRequests to the
+# clipboard owner (typically a browser).  Browsers service these on their main
+# thread, so polling at the same 0.5 s interval as text caused paste freezes.
+_LINUX_IMAGE_CHECK_INTERVAL = 2.0
+
 
 def _normalize_newlines(s: str) -> str:
     """Collapse CRLF/CR to LF so Windows's clipboard normalization does not
     look like a real change to the OUT loop after a remote update."""
     return s.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def _linux_clipboard_has_image() -> bool:
+    """Return True only when the Linux clipboard advertises image/png via TARGETS.
+
+    This is a cheap pre-check: the clipboard owner (e.g. a browser) responds to
+    TARGETS requests immediately on its main thread without serialising any data.
+    By gating the full image/png fetch on this check we avoid sending expensive
+    SelectionRequests when the clipboard holds text, which was the root cause of
+    browsers freezing on paste.
+    """
+    for cmd in (
+        ["xclip", "-selection", "clipboard", "-t", "TARGETS", "-o"],
+        ["wl-paste", "--list-types"],
+    ):
+        try:
+            result = subprocess.run(cmd, capture_output=True, timeout=1)
+        except FileNotFoundError:
+            continue  # Tool not installed; try the next one.
+        except (subprocess.TimeoutExpired, OSError):
+            continue
+        # Once a tool responds, treat its answer as authoritative for this
+        # display-server type — no need to consult the other tool.
+        return result.returncode == 0 and b"image/png" in result.stdout
+    return False
 
 
 def _read_image_from_system_clipboard() -> bytes | None:
@@ -66,7 +97,11 @@ def _read_image_from_system_clipboard() -> bytes | None:
             return buf.getvalue()
         except Exception:
             return None
-    # Linux: try xclip then wl-paste.
+    # Linux: check TARGETS first so we never send an image/png SelectionRequest
+    # to the clipboard owner when only text is present.  Without this gate,
+    # xclip hammered the browser's main thread every 0.5 s, causing paste freezes.
+    if not _linux_clipboard_has_image():
+        return None
     # Some xclip versions return text content with exit 0 even when asked for
     # image/png and no image is on the clipboard.  Guard with a PNG magic-byte
     # check so we never mistake text bytes for image data.
@@ -152,6 +187,7 @@ class ClipboardSync:
         self._last_read_error: str | None = None
         self._last_write_error: str | None = None
         self._last_decrypt_error: str | None = None
+        self._last_image_check: float = 0.0
         self._history = ClipboardHistory(settings)
 
     @property
@@ -403,18 +439,30 @@ class ClipboardSync:
 
     def _out_tick(self) -> None:
         # Images take priority: if the clipboard has an image, sync it.
-        image = self._read_clipboard_image()
-        if image is not None:
-            with self._lock:
-                if image == self._last_synced:
-                    return
-                self._last_synced = image
-            try:
-                self._write_image_file(image)
-                log.info("OUT [%s]: %d bytes image written", _HOSTNAME, len(image))
-            except OSError:
-                log.exception("OUT [%s]: Failed to write image file", _HOSTNAME)
-            return
+        # On Linux, throttle image checks to _LINUX_IMAGE_CHECK_INTERVAL seconds
+        # (vs the normal 0.5 s text-poll rate).  Even with the TARGETS pre-check
+        # inside _read_clipboard_image, every image-check tick still spawns an
+        # xclip subprocess that sends an X11 SelectionRequest to the clipboard
+        # owner; keeping this at 0.5 s was enough to freeze browsers on paste.
+        now = time.monotonic()
+        _do_image_check = sys.platform in ("win32", "darwin") or (
+            now - self._last_image_check >= _LINUX_IMAGE_CHECK_INTERVAL
+        )
+        if _do_image_check:
+            if sys.platform not in ("win32", "darwin"):
+                self._last_image_check = now
+            image = self._read_clipboard_image()
+            if image is not None:
+                with self._lock:
+                    if image == self._last_synced:
+                        return
+                    self._last_synced = image
+                try:
+                    self._write_image_file(image)
+                    log.info("OUT [%s]: %d bytes image written", _HOSTNAME, len(image))
+                except OSError:
+                    log.exception("OUT [%s]: Failed to write image file", _HOSTNAME)
+                return
 
         current = self._read_clipboard()
         if current is None or current == "":
