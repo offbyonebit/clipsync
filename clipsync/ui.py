@@ -27,7 +27,7 @@ from .syncthing import SyncthingClient
 
 log = logging.getLogger(__name__)
 
-_WINDOWS = ("pairing", "devices", "settings", "logs", "incoming", "tabbed", "history")
+_WINDOWS = ("pairing", "devices", "settings", "logs", "incoming", "tabbed", "history", "file_picker")
 
 
 def _center_window(window: ctk.CTkToplevel | ctk.CTk, width: int, height: int) -> None:
@@ -1621,6 +1621,23 @@ def _run_child(window_name: str) -> int:
         IncomingWindow(root, app, on_close=_quit)
     elif kind == "history":
         HistoryWindow(root, app, on_close=_quit)
+    elif kind == "file_picker":
+        # Lightweight path: open a native file dialog, emit the result, done.
+        # No CTk window needed -- just a hidden Tk root to host the dialog.
+        import tkinter as tk
+        from tkinter import filedialog
+
+        root.destroy()  # discard the CTk root, use a plain Tk one
+        tk_root = tk.Tk()
+        tk_root.withdraw()
+        path = filedialog.askopenfilename(
+            title="Select file to send",
+            parent=tk_root,
+        )
+        tk_root.destroy()
+        if path:
+            _emit("file_selected", path=path)
+        return 0
     else:
         log.error("Unknown window: %s", window_name)
         return 1
