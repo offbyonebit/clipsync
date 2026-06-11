@@ -50,7 +50,7 @@ _HOSTNAME = _safe_hostname()
 _PNG_HEADER = b"\x89PNG\r\n\x1a\n"
 
 # Sentinel pushed onto the XFixes queue by stop() to unblock the OUT loop.
-_STOP_SENTINEL = None
+_STOP_SENTINEL = object()
 
 
 def _try_start_xfixes_watcher() -> "queue.SimpleQueue[object] | None":
@@ -74,9 +74,13 @@ def _try_start_xfixes_watcher() -> "queue.SimpleQueue[object] | None":
     except ImportError:
         return None
 
+    # Probe: resolve extension opcode/event numbers once; pass them into the
+    # watcher thread so it can skip a redundant query_extension round-trip.
     try:
         _d = display.Display()
         _ext = _d.query_extension("XFIXES")
+        _opcode = _ext.major_opcode
+        _first_event = _ext.first_event
         _d.close()
         if not _ext.present:
             return None
@@ -103,7 +107,7 @@ def _try_start_xfixes_watcher() -> "queue.SimpleQueue[object] | None":
         )
 
     class _SelectionNotify(rq.Event):  # type: ignore[misc]
-        _code = None
+        _code = _first_event
         _fields = rq.Struct(
             rq.Card8("type"), rq.Card8("subtype"), rq.Card16("sequence_number"),
             rq.Window("window"), rq.Card32("selection"), rq.Card32("owner"),
@@ -115,29 +119,25 @@ def _try_start_xfixes_watcher() -> "queue.SimpleQueue[object] | None":
     def _watch() -> None:
         try:
             d = display.Display()
-            ext = d.query_extension("XFIXES")
-            if not ext.present:
-                return
-            d.display.extension_major_opcodes["XFIXES"] = ext.major_opcode
-            _SelectionNotify._code = ext.first_event
-            d.display.add_extension_event(ext.first_event, _SelectionNotify)
+            d.display.extension_major_opcodes["XFIXES"] = _opcode
+            d.display.add_extension_event(_first_event, _SelectionNotify)
             _QueryVersion(
-                display=d.display, opcode=ext.major_opcode,
+                display=d.display, opcode=_opcode,
                 client_major=5, client_minor=0,
             )
             d.sync()
             root = d.screen().root
             clipboard_atom = d.intern_atom("CLIPBOARD")
             _SelectSelectionInput(
-                display=d.display, opcode=ext.major_opcode,
+                display=d.display, opcode=_opcode,
                 window=root, selection=clipboard_atom,
                 event_mask=1,  # SelectionSetOwnerMask
             )
             d.flush()
-            log.debug("XFixes clipboard watcher active (event_base=%d)", ext.first_event)
+            log.debug("XFixes clipboard watcher active (event_base=%d)", _first_event)
             while True:
                 e = d.next_event()
-                if e.type == ext.first_event:
+                if e.type == _first_event:
                     notify_q.put(True)
         except Exception:
             log.debug("XFixes watcher stopped", exc_info=True)
@@ -177,11 +177,7 @@ class _XlibClipboardOwner:
     """
 
     def __init__(self) -> None:
-        import os
-
-        from Xlib import X, display  # type: ignore[import]
-
-        from Xlib import Xatom  # type: ignore[import]
+        from Xlib import X, Xatom, display  # type: ignore[import]
 
         self._X = X
         self._d = display.Display()
@@ -193,11 +189,9 @@ class _XlibClipboardOwner:
         self._TARGETS = self._d.intern_atom("TARGETS")
         self._XA_ATOM = Xatom.ATOM      # type for lists of atoms (= 4)
         self._XA_STRING = Xatom.STRING  # plain ASCII/Latin-1 string type (= 31)
-        self._d.flush()
 
         self._content: str | None = None
         self._content_lock = threading.Lock()
-        self._stopped = False
 
         # Self-pipe: writing a byte wakes the event loop.
         self._pipe_r, self._pipe_w = os.pipe()
@@ -209,31 +203,25 @@ class _XlibClipboardOwner:
 
     def set(self, text: str) -> None:
         """Store `text` and signal the event loop to take CLIPBOARD ownership."""
-        import os
-
         with self._content_lock:
             self._content = text
         os.write(self._pipe_w, b"\x01")
 
     def close(self) -> None:
         """Signal the event loop to exit and release clipboard ownership."""
-        import os
-
-        self._stopped = True
         try:
             os.write(self._pipe_w, b"\xff")
         except OSError:
             pass
 
     def _event_loop(self) -> None:
-        import os
         import select
 
         X = self._X
         x_fd = self._d.fileno()
 
         try:
-            while not self._stopped:
+            while True:
                 rlist, _, _ = select.select([x_fd, self._pipe_r], [], [], 10.0)
 
                 if self._pipe_r in rlist:
@@ -666,10 +654,8 @@ class ClipboardSync:
     def _write_clipboard(self, value: str) -> bool:
         if self._clipboard_owner is not None:
             try:
-                t0 = time.monotonic()
                 self._clipboard_owner.set(value)
-                elapsed_ms = (time.monotonic() - t0) * 1000
-                log.debug("xlib clipboard set in %.2f ms (%d chars)", elapsed_ms, len(value))
+                log.debug("xlib clipboard set (%d chars)", len(value))
                 if self._last_write_error is not None:
                     log.info("Clipboard write recovered")
                     self._last_write_error = None
@@ -681,10 +667,8 @@ class ClipboardSync:
                     self._last_write_error = msg
                 # fall through to pyperclip
         try:
-            t0 = time.monotonic()
             pyperclip.copy(value)
-            elapsed_ms = (time.monotonic() - t0) * 1000
-            log.debug("clipboard write (pyperclip) took %.1f ms (%d chars)", elapsed_ms, len(value))
+            log.debug("clipboard write (pyperclip) (%d chars)", len(value))
         except Exception as exc:
             msg = f"{type(exc).__name__}: {exc}"
             if msg != self._last_write_error:
@@ -728,12 +712,6 @@ class ClipboardSync:
                     val = self._xfixes_queue.get(timeout=_HEARTBEAT_INTERVAL)
                     if val is _STOP_SENTINEL:
                         break
-                    # Drain any extra events that arrived while we were busy.
-                    while True:
-                        try:
-                            self._xfixes_queue.get_nowait()
-                        except queue.Empty:
-                            break
                 except queue.Empty:
                     pass  # heartbeat timeout -- fall through to log only
                 else:
