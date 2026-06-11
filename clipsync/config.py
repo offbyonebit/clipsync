@@ -197,13 +197,16 @@ def set_file_permissions(path: Path) -> None:
         pass
 
 
-def configure_logging() -> None:
+def configure_logging(level: int = logging.INFO) -> None:
     """Wire up root logger to write to both the log file and stderr."""
     ensure_directories()
     root = logging.getLogger()
     if getattr(root, "_clipsync_configured", False):
         return
-    root.setLevel(logging.INFO)
+    # Honour CLIPSYNC_LOG_LEVEL env var (DEBUG, INFO, WARNING, ERROR).
+    if "CLIPSYNC_LOG_LEVEL" in os.environ:
+        level = getattr(logging, os.environ["CLIPSYNC_LOG_LEVEL"].upper(), level)
+    root.setLevel(level)
     fmt = logging.Formatter(
         "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
