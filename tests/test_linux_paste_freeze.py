@@ -1,25 +1,32 @@
 """Regression tests for the Linux paste-freeze bug.
 
-Root cause: _out_tick called _read_clipboard_image() on every 0.5 s poll tick.
-On Linux that spawns xclip which sends an X11 SelectionRequest to the clipboard
-owner (typically a browser).  Browsers service these on their main thread, so
-hammering at 0.5 s caused the browser to freeze when the user tried to paste.
+Root cause: the OUT loop used to poll the clipboard every 0.5 s, and image
+checks ran on every poll tick.  On Linux that spawns xclip which sends an X11
+SelectionRequest to the clipboard owner (typically a browser).  Browsers
+service these on their main thread, so hammering at 0.5 s caused the browser
+to freeze when the user tried to paste.
 
 The fix has two parts:
-  1. _read_image_from_system_clipboard() now runs a cheap TARGETS/list-types
+  1. _read_image_from_system_clipboard() runs a cheap TARGETS/list-types
      pre-check and only fetches image bytes when the clipboard actually
-     advertises image/png.  This is enforced even during the IN-loop
-     self-originated check so we never send image/png SelectionRequests when
-     the clipboard holds text.
-  2. _out_tick() rate-limits image checks on Linux to _LINUX_IMAGE_CHECK_INTERVAL
-     seconds (default 2 s) instead of every poll tick.
+     advertises image/png, so no image/png SelectionRequest is ever sent
+     when the clipboard holds text.
+  2. The OUT loop no longer polls on Linux: a clipboard-owner watcher built on
+     the X11 XFIXES extension wakes _out_tick() only when the CLIPBOARD
+     selection owner actually changes (i.e. the user copied something), with
+     a 300 ms debounce so we don't compete with an immediate paste in the same
+     gesture.  xclip/wl-paste is therefore invoked on real clipboard changes
+     only, never on a fixed interval.  Wayland and environments without
+     XFIXES fall back to polling at CLIPBOARD_POLL_INTERVAL, same as before.
 """
 
 from __future__ import annotations
 
 import io
+import queue
 import subprocess
 import sys
+import threading
 import time
 import types
 import unittest.mock as mock
@@ -32,8 +39,7 @@ import clipsync.clipboard as clipboard_module
 from clipsync import config
 from clipsync.clipboard import (
     ClipboardSync,
-    _LINUX_IMAGE_CHECK_INTERVAL,
-    _linux_clipboard_has_image,
+    _STOP_SENTINEL,
     _read_image_from_system_clipboard,
 )
 
@@ -65,59 +71,48 @@ def _wait_for(predicate, timeout: float = 5.0, interval: float = 0.05) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# _linux_clipboard_has_image unit tests
+# _read_image_from_system_clipboard: TARGETS gate on Linux
+#
+# The TARGETS pre-check used to live in a separate _linux_clipboard_has_image()
+# helper; it's now inlined directly into _read_image_from_system_clipboard(),
+# so these tests exercise that function end-to-end instead of a standalone
+# boolean helper.
 # ---------------------------------------------------------------------------
 
 
-class TestLinuxClipboardHasImage:
-    """Unit tests for the TARGETS pre-check helper."""
+class TestReadImageGate:
+    """The TARGETS pre-check must prevent image/png requests when no image present."""
 
-    def _run(self, cmd, **kwargs):
-        """Default subprocess.run stub: xclip not found, wl-paste not found."""
-        raise FileNotFoundError
+    @pytest.fixture(autouse=True)
+    def _force_linux(self, monkeypatch):
+        monkeypatch.setattr(sys, "platform", "linux")
 
-    def test_returns_false_when_no_tools_installed(self, monkeypatch):
-        monkeypatch.setattr(subprocess, "run", self._run)
-        assert _linux_clipboard_has_image() is False
-
-    def test_returns_false_when_xclip_targets_has_no_image(self, monkeypatch):
-        def fake_run(cmd, **kwargs):
-            if "TARGETS" in cmd or "--list-types" in cmd:
-                result = mock.Mock()
-                result.returncode = 0
-                result.stdout = b"UTF8_STRING\ntext/plain\nTARGETS\n"
-                return result
-            raise AssertionError(f"Unexpected command: {cmd}")
-
-        monkeypatch.setattr(subprocess, "run", fake_run)
-        assert _linux_clipboard_has_image() is False
-
-    def test_returns_true_when_xclip_targets_includes_image_png(self, monkeypatch):
-        def fake_run(cmd, **kwargs):
-            if "TARGETS" in cmd:
-                result = mock.Mock()
-                result.returncode = 0
-                result.stdout = b"UTF8_STRING\nimage/png\ntext/plain\n"
-                return result
-            raise AssertionError(f"Unexpected command: {cmd}")
-
-        monkeypatch.setattr(subprocess, "run", fake_run)
-        assert _linux_clipboard_has_image() is True
+    def test_returns_none_when_no_tools_installed_at_all(self, monkeypatch):
+        monkeypatch.setattr(subprocess, "run", lambda *a, **kw: (_ for _ in ()).throw(FileNotFoundError()))
+        assert _read_image_from_system_clipboard() is None
 
     def test_falls_back_to_wl_paste_when_xclip_missing(self, monkeypatch):
+        """If xclip isn't installed, the TARGETS check must still try wl-paste."""
+
         def fake_run(cmd, **kwargs):
             if cmd[0] == "xclip":
                 raise FileNotFoundError
-            # wl-paste --list-types
-            result = mock.Mock()
-            result.returncode = 0
-            result.stdout = b"image/png\ntext/plain\n"
-            return result
+            if "--list-types" in cmd:
+                result = mock.Mock()
+                result.returncode = 0
+                result.stdout = b"image/png\ntext/plain\n"
+                return result
+            if "image/png" in cmd:
+                result = mock.Mock()
+                result.returncode = 0
+                result.stdout = FAKE_PNG
+                return result
+            raise AssertionError(f"Unexpected command: {cmd}")
 
         monkeypatch.setattr(subprocess, "run", fake_run)
-        assert _linux_clipboard_has_image() is True
+        assert _read_image_from_system_clipboard() == FAKE_PNG
 
-    def test_returns_false_when_xclip_exits_nonzero(self, monkeypatch):
+    def test_returns_none_when_targets_exits_nonzero(self, monkeypatch):
         """A non-zero exit from TARGETS means the clipboard is empty or an error
         occurred — in both cases there is no image."""
 
@@ -128,39 +123,31 @@ class TestLinuxClipboardHasImage:
             return result
 
         monkeypatch.setattr(subprocess, "run", fake_run)
-        assert _linux_clipboard_has_image() is False
+        assert _read_image_from_system_clipboard() is None
 
     def test_skips_timed_out_tool_continues_to_next(self, monkeypatch):
+        """If xclip's TARGETS check times out, wl-paste must still be tried."""
         calls: list[str] = []
 
         def fake_run(cmd, **kwargs):
             calls.append(cmd[0])
             if cmd[0] == "xclip":
                 raise subprocess.TimeoutExpired(cmd, 1)
-            # wl-paste returns image/png
+            if "--list-types" in cmd:
+                result = mock.Mock()
+                result.returncode = 0
+                result.stdout = b"image/png\n"
+                return result
             result = mock.Mock()
             result.returncode = 0
-            result.stdout = b"image/png\n"
+            result.stdout = FAKE_PNG
             return result
 
         monkeypatch.setattr(subprocess, "run", fake_run)
-        result = _linux_clipboard_has_image()
+        result = _read_image_from_system_clipboard()
         assert "xclip" in calls
         assert "wl-paste" in calls
-        assert result is True
-
-
-# ---------------------------------------------------------------------------
-# _read_image_from_system_clipboard: TARGETS gate on Linux
-# ---------------------------------------------------------------------------
-
-
-class TestReadImageGate:
-    """The TARGETS pre-check must prevent image/png requests when no image present."""
-
-    @pytest.fixture(autouse=True)
-    def _force_linux(self, monkeypatch):
-        monkeypatch.setattr(sys, "platform", "linux")
+        assert result == FAKE_PNG
 
     def test_skips_image_fetch_when_targets_has_no_image(self, monkeypatch):
         """When TARGETS returns no image/png the image/png fetch must not run."""
@@ -212,15 +199,24 @@ class TestReadImageGate:
 
 
 # ---------------------------------------------------------------------------
-# _out_tick: rate-limiting on Linux
+# _out_loop: XFixes-event-driven dispatch on Linux
+#
+# There is no interval-based throttle anymore. Instead, when an XFixes
+# watcher is available, _out_loop blocks on _xfixes_queue and only calls
+# _out_tick() when the CLIPBOARD selection owner actually changes, after a
+# 300 ms debounce. These tests drive _out_loop directly with a fake queue
+# standing in for the real XFixes watcher thread.
 # ---------------------------------------------------------------------------
 
 
-class TestOutTickRateLimiting:
-    """Image checks in _out_tick must be throttled on Linux."""
+class TestOutLoopEventDriven:
+    """_out_tick must run only on real clipboard-owner-change events, debounced."""
 
     @pytest.fixture(autouse=True)
-    def _force_linux(self, monkeypatch):
+    def _force_linux(self, tmp_path, monkeypatch):
+        # tmp_path must be resolved before the platform patch: pytest's own
+        # tmp_path fixture checks sys.platform to decide whether to call
+        # os.getuid(), which doesn't exist on real Windows.
         monkeypatch.setattr(sys, "platform", "linux")
 
     def _make_sync(self, tmp_path) -> ClipboardSync:
@@ -228,86 +224,100 @@ class TestOutTickRateLimiting:
         settings.set("sync_folder", str(tmp_path / "sync"))
         (tmp_path / "sync").mkdir()
         sync = ClipboardSync(settings)
-        sync._read_clipboard = lambda: "hello"  # type: ignore[method-assign]
+        sync._read_clipboard = lambda: None  # type: ignore[method-assign]
+        sync._read_clipboard_image = lambda: None  # type: ignore[method-assign]
         sync._write_clipboard = lambda v: True  # type: ignore[method-assign]
         return sync
 
-    def test_image_check_skipped_when_recently_checked(self, tmp_path):
-        """If _last_image_check was just set, _read_clipboard_image must not be called."""
+    def _run_loop(self, sync: ClipboardSync) -> threading.Thread:
+        sync._xfixes_queue = queue.SimpleQueue()
+        t = threading.Thread(target=sync._out_loop, daemon=True)
+        t.start()
+        return t
+
+    def _stop_loop(self, sync: ClipboardSync, t: threading.Thread) -> None:
+        sync._stop.set()
+        sync._xfixes_queue.put(_STOP_SENTINEL)
+        t.join(timeout=2.0)
+        assert not t.is_alive(), "_out_loop did not exit after stop sentinel"
+
+    def test_out_tick_runs_once_at_startup_with_no_events(self, tmp_path):
+        """Only the initial tick fires; the loop must not poll while idle."""
         sync = self._make_sync(tmp_path)
-        image_check_count = {"n": 0}
+        tick_count = {"n": 0}
+        sync._out_tick = lambda: tick_count.__setitem__("n", tick_count["n"] + 1)  # type: ignore[method-assign]
 
-        def counting_image_read():
-            image_check_count["n"] += 1
-            return None
+        t = self._run_loop(sync)
+        try:
+            time.sleep(0.5)  # well past the 300 ms debounce window, no events sent
+            assert tick_count["n"] == 1, f"Expected only the initial tick, got {tick_count['n']}"
+        finally:
+            self._stop_loop(sync, t)
 
-        sync._read_clipboard_image = counting_image_read  # type: ignore[method-assign]
-        sync._last_image_check = time.monotonic()  # pretend we just checked
-
-        sync._out_tick()
-
-        assert image_check_count["n"] == 0, (
-            f"Image check ran despite throttle; called {image_check_count['n']} time(s)"
-        )
-
-    def test_image_check_runs_when_interval_elapsed(self, tmp_path, monkeypatch):
-        """After _LINUX_IMAGE_CHECK_INTERVAL has elapsed, the check must fire."""
-        monkeypatch.setattr(clipboard_module, "_LINUX_IMAGE_CHECK_INTERVAL", 0.0)
+    def test_out_tick_runs_after_xfixes_event_with_debounce(self, tmp_path):
+        """An event must trigger a tick, but only after the ~300 ms debounce."""
         sync = self._make_sync(tmp_path)
-        image_check_count = {"n": 0}
+        tick_times: list[float] = []
+        sync._out_tick = lambda: tick_times.append(time.monotonic())  # type: ignore[method-assign]
 
-        def counting_image_read():
-            image_check_count["n"] += 1
-            return None
+        t = self._run_loop(sync)
+        try:
+            time.sleep(0.05)  # let the initial tick land
+            event_time = time.monotonic()
+            sync._xfixes_queue.put(True)
+            assert _wait_for(lambda: len(tick_times) >= 2, timeout=2.0), "second tick never fired"
+            gap = tick_times[1] - event_time
+            assert gap >= 0.25, f"Tick fired too soon after event (after {gap:.3f}s); debounce not honoured"
+        finally:
+            self._stop_loop(sync, t)
 
-        sync._read_clipboard_image = counting_image_read  # type: ignore[method-assign]
-        sync._last_image_check = 0.0  # never checked
-
-        sync._out_tick()
-
-        assert image_check_count["n"] == 1, (
-            f"Expected 1 image check but got {image_check_count['n']}"
-        )
-
-    def test_text_sync_still_works_when_image_check_throttled(self, tmp_path, monkeypatch):
-        """Text clipboard sync must not be blocked by the image throttle."""
+    def test_rapid_events_during_debounce_collapse_to_one_tick(self, tmp_path):
+        """Multiple events arriving within the debounce window must cause one tick, not one per event."""
         sync = self._make_sync(tmp_path)
-        sync._last_image_check = time.monotonic()  # throttle image check
-        sync._last_synced = None  # force a text sync
-        write_count = {"n": 0}
+        tick_count = {"n": 0}
+        sync._out_tick = lambda: tick_count.__setitem__("n", tick_count["n"] + 1)  # type: ignore[method-assign]
 
-        original_write_file = sync._write_file
+        t = self._run_loop(sync)
+        try:
+            time.sleep(0.05)  # let the initial tick land
+            for _ in range(5):
+                sync._xfixes_queue.put(True)
+                time.sleep(0.01)  # all within the 300 ms debounce window
+            assert _wait_for(lambda: tick_count["n"] >= 2, timeout=2.0), "follow-up tick never fired"
+            time.sleep(0.5)  # give any erroneous extra ticks time to show up
+            assert tick_count["n"] == 2, f"Expected exactly 2 ticks (initial + 1 collapsed), got {tick_count['n']}"
+        finally:
+            self._stop_loop(sync, t)
 
-        def counting_write(text: str) -> None:
-            write_count["n"] += 1
-            # Don't actually write to disk in this unit test
-            pass
+    def test_stop_sentinel_exits_promptly_without_ticking(self, tmp_path):
+        """Stopping while idle must not produce a spurious tick."""
+        sync = self._make_sync(tmp_path)
+        tick_count = {"n": 0}
+        sync._out_tick = lambda: tick_count.__setitem__("n", tick_count["n"] + 1)  # type: ignore[method-assign]
 
-        sync._write_file = counting_write  # type: ignore[method-assign]
-        sync._out_tick()
-
-        assert write_count["n"] == 1, (
-            f"Expected text to be written once but got {write_count['n']} write(s)"
-        )
-
-    def test_image_check_interval_is_at_least_two_seconds(self):
-        """Guard against accidentally reducing the interval back to 0.5 s."""
-        assert _LINUX_IMAGE_CHECK_INTERVAL >= 2.0, (
-            f"_LINUX_IMAGE_CHECK_INTERVAL={_LINUX_IMAGE_CHECK_INTERVAL} is too small; "
-            "values < 2 s risk reintroducing the paste-freeze bug"
-        )
+        t = self._run_loop(sync)
+        time.sleep(0.05)
+        start = time.monotonic()
+        self._stop_loop(sync, t)
+        assert time.monotonic() - start < 1.0, "loop took too long to exit on stop sentinel"
+        assert tick_count["n"] == 1, "only the initial tick should have fired"
 
 
 # ---------------------------------------------------------------------------
-# End-to-end: image sync still works with throttling enabled
+# End-to-end: image sync still works on the Linux polling fallback
+#
+# These instances run start()/stop() directly; on a machine without a real
+# X display (true in CI and on this dev box), _try_start_xfixes_watcher()
+# fails to open the display and returns None, so ClipboardSync falls back to
+# plain polling at CLIPBOARD_POLL_INTERVAL -- exercising the same path Wayland
+# users hit.
 # ---------------------------------------------------------------------------
 
 
 @pytest.fixture
 def two_sided_linux(tmp_path, monkeypatch):
-    """Two ClipboardSync instances on a shared folder, image interval shrunk for speed."""
+    """Two ClipboardSync instances on a shared folder, polling at a fast interval for speed."""
     monkeypatch.setattr(config, "CLIPBOARD_POLL_INTERVAL", POLL)
-    monkeypatch.setattr(clipboard_module, "_LINUX_IMAGE_CHECK_INTERVAL", POLL * 2)
     monkeypatch.setattr(clipboard_module, "Observer", PollingObserver)
     monkeypatch.setattr(sys, "platform", "linux")
 
@@ -346,45 +356,19 @@ def two_sided_linux(tmp_path, monkeypatch):
     b.stop()
 
 
-def test_image_syncs_with_linux_throttle(two_sided_linux) -> None:
-    """Images must still reach the remote peer even when the Linux throttle is active."""
+def test_image_syncs_on_linux_polling_fallback(two_sided_linux) -> None:
+    """Images must still reach the remote peer when XFixes is unavailable."""
     _, _, _, img_a, _, img_b = two_sided_linux
     img_a["image"] = FAKE_PNG
     assert _wait_for(lambda: img_b["image"] == FAKE_PNG, timeout=5.0), (
-        f"Image did not sync under Linux throttle; got {img_b['image']!r}"
+        f"Image did not sync on polling fallback; got {img_b['image']!r}"
     )
 
 
-def test_text_syncs_normally_under_linux_throttle(two_sided_linux) -> None:
-    """Text sync must not be disrupted by the image-check rate limiter."""
+def test_text_syncs_on_linux_polling_fallback(two_sided_linux) -> None:
+    """Text sync must work normally alongside image checks on the polling path."""
     _, _, txt_a, _, txt_b, _ = two_sided_linux
     txt_a["value"] = "paste freeze fixed"
     assert _wait_for(lambda: txt_b["value"] == "paste freeze fixed"), (
         f"Text did not sync; got {txt_b['value']!r}"
     )
-
-
-def test_image_polling_frequency_bounded_on_linux(two_sided_linux, monkeypatch) -> None:
-    """The image read must not be called more often than _LINUX_IMAGE_CHECK_INTERVAL."""
-    a, _, _, _, _, _ = two_sided_linux
-    image_check_times: list[float] = []
-    original = a._read_clipboard_image
-
-    def tracking_read():
-        image_check_times.append(time.monotonic())
-        return original()
-
-    a._read_clipboard_image = tracking_read  # type: ignore[method-assign]
-
-    observe_duration = POLL * 30  # ~1.5 s at POLL=0.05
-    time.sleep(observe_duration)
-
-    if len(image_check_times) >= 2:
-        gaps = [image_check_times[i + 1] - image_check_times[i] for i in range(len(image_check_times) - 1)]
-        min_gap = min(gaps)
-        # Allow 20 % tolerance below the configured interval.
-        threshold = clipboard_module._LINUX_IMAGE_CHECK_INTERVAL * 0.8
-        assert min_gap >= threshold, (
-            f"Image check fired too frequently: min gap {min_gap:.3f}s < threshold {threshold:.3f}s. "
-            f"Gaps: {[f'{g:.3f}' for g in gaps]}"
-        )
