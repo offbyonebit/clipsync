@@ -69,14 +69,35 @@ class UIController:
                 cmd = [sys.executable, "ui", window]
             else:
                 cmd = [sys.executable, "-m", "clipsync.ui", window]
-            proc = subprocess.Popen(
-                cmd,
+            # Route child stderr to the log file so crashes are visible instead
+            # of silently swallowed.  Open in binary-append so it doesn't race
+            # with the parent's RotatingFileHandler.
+            try:
+                stderr_fh = open(config.LOG_FILE, "ab")
+            except OSError:
+                stderr_fh = subprocess.DEVNULL  # type: ignore[assignment]
+            kwargs: dict = dict(
                 stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
+                stderr=stderr_fh,
                 stdin=subprocess.DEVNULL,
                 text=True,
                 bufsize=1,
             )
+            if sys.platform == "win32":
+                kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+            proc = subprocess.Popen(cmd, **kwargs)
+            if stderr_fh is not subprocess.DEVNULL:
+                stderr_fh.close()
+            if sys.platform == "win32":
+                # Grant the child permission to bring its window to the
+                # foreground.  Without this, Windows' foreground-activation
+                # lock silently ignores lift()/focus_force() calls from a
+                # process that wasn't directly activated by user input.
+                try:
+                    import ctypes
+                    ctypes.windll.user32.AllowSetForegroundWindow(proc.pid)  # type: ignore[attr-defined]
+                except Exception:
+                    pass
             self._procs[key] = proc
         threading.Thread(
             target=self._read_events,
@@ -103,6 +124,8 @@ class UIController:
                     log.exception("UI event handler raised")
         finally:
             proc.wait()
+            if proc.returncode not in (0, None, -15):  # -15 = SIGTERM on Unix
+                log.warning("UI child process exited with code %d (check log file for details)", proc.returncode)
 
     def close_all(self) -> None:
         with self._lock:
@@ -1581,11 +1604,13 @@ def _run_child(window_name: str) -> int:
 
     app = AppContext(settings=settings, client=client, device_id=device_id)
 
-    # Disable ctk's Windows titlebar manipulation. It does a withdraw/
-    # deiconify dance on init and on every resizable() call, and when
-    # cycles overlap (as they do in a tabbed window) the state capture
-    # races and leaves the window hidden. We lose the dark titlebar on
-    # Windows; that's an acceptable trade for a window that actually opens.
+    # Disable ctk's Windows titlebar manipulation on both CTk and CTkToplevel.
+    # Without this, CTk.__init__ triggers a withdraw/update() dance that makes
+    # the hidden root window briefly appear, and CTkToplevel.resizable() queues
+    # further deiconify callbacks that race with our own withdraw() calls and
+    # can leave windows permanently hidden.  We lose the dark titlebar on
+    # Windows; that's an acceptable trade for windows that reliably open.
+    ctk.CTk._deactivate_windows_window_header_manipulation = True
     ctk.CTkToplevel._deactivate_windows_window_header_manipulation = True
     theme = str(settings.get("theme") or "System")
     if theme not in ("Light", "Dark", "System"):
