@@ -2,8 +2,11 @@
 
 Two loops:
 
-  OUT: poll the local clipboard every CLIPBOARD_POLL_INTERVAL seconds.
-       When it changes, write the value to the shared file.
+  OUT: watch the local clipboard for changes and write them to the shared file.
+       On Linux/X11, clipboard owner changes are detected via the XFIXES
+       extension so no SelectionRequests are ever sent to other apps between
+       copies.  On Wayland or when XFIXES is unavailable the loop falls back
+       to polling every CLIPBOARD_POLL_INTERVAL seconds.
 
   IN:  watch the shared file with watchdog. When it changes, read it
        and set the local clipboard.
@@ -22,6 +25,7 @@ from __future__ import annotations
 
 import io
 import logging
+import os
 import queue
 import subprocess
 import sys
@@ -45,6 +49,267 @@ _HOSTNAME = _safe_hostname()
 
 _PNG_HEADER = b"\x89PNG\r\n\x1a\n"
 
+# Sentinel pushed onto the XFixes queue by stop() to unblock the OUT loop.
+_STOP_SENTINEL = object()
+
+
+def _try_start_xfixes_watcher() -> "queue.SimpleQueue[object] | None":
+    """Start an X11 XFixes clipboard-owner watcher.
+
+    Returns a SimpleQueue that receives a True value each time the CLIPBOARD
+    selection owner changes (i.e. someone copies something).  Returns None if
+    the XFixes extension is unavailable or the display cannot be opened
+    (Wayland, headless, missing python-xlib, etc.).
+
+    Using XFixes means the OUT loop is woken only on actual clipboard changes
+    rather than polling with xclip every 0.5 s.  Polling sends X11
+    SelectionRequests to the clipboard owner (typically a browser) on every
+    tick; browsers service these on their main thread, which caused paste
+    freezes.  With XFixes, clipsync never sends a SelectionRequest unless the
+    user has actually copied something.
+    """
+    try:
+        from Xlib import display  # type: ignore[import]
+        from Xlib.protocol import rq  # type: ignore[import]
+    except ImportError:
+        return None
+
+    # Probe: resolve extension opcode/event numbers once; pass them into the
+    # watcher thread so it can skip a redundant query_extension round-trip.
+    try:
+        _d = display.Display()
+        _ext = _d.query_extension("XFIXES")
+        _opcode = _ext.major_opcode
+        _first_event = _ext.first_event
+        _d.close()
+        if not _ext.present:
+            return None
+    except Exception:
+        return None
+
+    # Inline minimal XFixes protocol definitions -- python-xlib 0.15 doesn't
+    # ship an xfixes module, so we define only what we need here.
+    class _QueryVersion(rq.ReplyRequest):  # type: ignore[misc]
+        _request = rq.Struct(
+            rq.Card8("opcode"), rq.Opcode(0), rq.RequestLength(),
+            rq.Card32("client_major"), rq.Card32("client_minor"),
+        )
+        _reply = rq.Struct(
+            rq.ReplyCode(), rq.Pad(1), rq.Card16("sequence_number"),
+            rq.Card32("length"), rq.Card32("major_version"),
+            rq.Card32("minor_version"), rq.Pad(16),
+        )
+
+    class _SelectSelectionInput(rq.Request):  # type: ignore[misc]
+        _request = rq.Struct(
+            rq.Card8("opcode"), rq.Opcode(2), rq.RequestLength(),
+            rq.Window("window"), rq.Card32("selection"), rq.Card32("event_mask"),
+        )
+
+    class _SelectionNotify(rq.Event):  # type: ignore[misc]
+        _code = _first_event
+        _fields = rq.Struct(
+            rq.Card8("type"), rq.Card8("subtype"), rq.Card16("sequence_number"),
+            rq.Window("window"), rq.Card32("selection"), rq.Card32("owner"),
+            rq.Card32("selection_timestamp"), rq.Card32("timestamp"),
+        )
+
+    notify_q: queue.SimpleQueue[object] = queue.SimpleQueue()
+
+    def _watch() -> None:
+        try:
+            d = display.Display()
+            d.display.extension_major_opcodes["XFIXES"] = _opcode
+            d.display.add_extension_event(_first_event, _SelectionNotify)
+            _QueryVersion(
+                display=d.display, opcode=_opcode,
+                client_major=5, client_minor=0,
+            )
+            d.sync()
+            root = d.screen().root
+            clipboard_atom = d.intern_atom("CLIPBOARD")
+            _SelectSelectionInput(
+                display=d.display, opcode=_opcode,
+                window=root, selection=clipboard_atom,
+                event_mask=1,  # SelectionSetOwnerMask
+            )
+            d.flush()
+            log.debug("XFixes clipboard watcher active (event_base=%d)", _first_event)
+            while True:
+                e = d.next_event()
+                if e.type == _first_event:
+                    notify_q.put(True)
+        except Exception:
+            log.debug("XFixes watcher stopped", exc_info=True)
+
+    t = threading.Thread(target=_watch, name="clipsync-xfixes", daemon=True)
+    t.start()
+    return notify_q
+
+
+def _try_start_xlib_clipboard_owner() -> "_XlibClipboardOwner | None":
+    """Try to create an in-process X11 clipboard owner using python-xlib.
+
+    Returns None on Wayland, missing python-xlib, or any startup error.
+
+    Compared to spawning xclip subprocesses, this approach:
+    - Has zero startup latency (no process fork/exec)
+    - Has no ownership-transition gap (we own the selection immediately)
+    - Responds to SelectionRequests in microseconds (single round trip)
+    """
+    try:
+        from Xlib import display  # type: ignore[import]
+    except ImportError:
+        return None
+    try:
+        return _XlibClipboardOwner()
+    except Exception:
+        log.debug("xlib clipboard owner init failed", exc_info=True)
+        return None
+
+
+class _XlibClipboardOwner:
+    """In-process X11 CLIPBOARD selection owner.
+
+    Owns the CLIPBOARD selection and serves SelectionRequests entirely
+    within the clipsync process.  A select()-based event loop handles both
+    X11 events and a self-pipe used by the IN thread to signal new content.
+    """
+
+    def __init__(self) -> None:
+        from Xlib import X, Xatom, display  # type: ignore[import]
+
+        self._X = X
+        self._d = display.Display()
+        root = self._d.screen().root
+        self._win = root.create_window(0, 0, 1, 1, 0, 0)
+        self._CLIPBOARD = self._d.intern_atom("CLIPBOARD")
+        self._UTF8 = self._d.intern_atom("UTF8_STRING")
+        self._COMPOUND_TEXT = self._d.intern_atom("COMPOUND_TEXT")
+        self._TARGETS = self._d.intern_atom("TARGETS")
+        self._XA_ATOM = Xatom.ATOM      # type for lists of atoms (= 4)
+        self._XA_STRING = Xatom.STRING  # plain ASCII/Latin-1 string type (= 31)
+
+        self._content: str | None = None
+        self._content_lock = threading.Lock()
+
+        # Self-pipe: writing a byte wakes the event loop.
+        self._pipe_r, self._pipe_w = os.pipe()
+
+        self._thread = threading.Thread(
+            target=self._event_loop, name="clipsync-xlib-owner", daemon=True
+        )
+        self._thread.start()
+
+    def set(self, text: str) -> None:
+        """Store `text` and signal the event loop to take CLIPBOARD ownership."""
+        with self._content_lock:
+            self._content = text
+        os.write(self._pipe_w, b"\x01")
+
+    def close(self) -> None:
+        """Signal the event loop to exit and release clipboard ownership."""
+        try:
+            os.write(self._pipe_w, b"\xff")
+        except OSError:
+            pass
+
+    def _event_loop(self) -> None:
+        import select
+
+        X = self._X
+        x_fd = self._d.fileno()
+
+        try:
+            while True:
+                rlist, _, _ = select.select([x_fd, self._pipe_r], [], [], 10.0)
+
+                if self._pipe_r in rlist:
+                    data = os.read(self._pipe_r, 4096)
+                    if b"\xff" in data:
+                        break  # close signal
+                    with self._content_lock:
+                        content = self._content
+                    if content is not None:
+                        self._win.set_selection_owner(self._CLIPBOARD, X.CurrentTime)
+                        self._d.flush()
+                        log.debug(
+                            "xlib clipboard: took CLIPBOARD ownership (%d chars)",
+                            len(content),
+                        )
+
+                while self._d.pending_events():
+                    try:
+                        event = self._d.next_event()
+                        self._handle_event(event)
+                    except Exception:
+                        log.debug("xlib clipboard: error processing event", exc_info=True)
+        except Exception:
+            log.debug("xlib clipboard event loop stopped", exc_info=True)
+        finally:
+            try:
+                self._d.close()
+            except Exception:
+                pass
+            try:
+                os.close(self._pipe_r)
+                os.close(self._pipe_w)
+            except OSError:
+                pass
+
+    def _handle_event(self, event) -> None:
+        X = self._X
+        if event.type == X.SelectionRequest:
+            self._serve_request(event)
+        elif event.type == X.SelectionClear:
+            with self._content_lock:
+                self._content = None
+            log.debug("xlib clipboard: lost CLIPBOARD ownership (SelectionClear)")
+
+    def _serve_request(self, req) -> None:
+        from Xlib.protocol.event import SelectionNotify  # type: ignore[import]
+
+        X = self._X
+        with self._content_lock:
+            content = self._content
+
+        target = req.target
+        # Prefer req.property; fall back to req.target when property is None.
+        prop = req.property if req.property != X.NONE else req.target
+
+        def reply(p: int) -> None:
+            notify = SelectionNotify(
+                time=req.time,
+                requestor=req.requestor,
+                selection=req.selection,
+                target=target,
+                property=p,
+            )
+            req.requestor.send_event(notify)
+            self._d.flush()
+
+        try:
+            if target == self._TARGETS:
+                atoms = [self._TARGETS, self._UTF8, self._XA_STRING, self._COMPOUND_TEXT]
+                req.requestor.change_property(prop, self._XA_ATOM, 32, atoms)
+                reply(prop)
+            elif target in (self._UTF8, self._XA_STRING, self._COMPOUND_TEXT):
+                if content is None:
+                    reply(X.NONE)
+                    return
+                data = content.encode("utf-8")
+                atom_type = self._UTF8 if target == self._UTF8 else self._XA_STRING
+                req.requestor.change_property(prop, atom_type, 8, data)
+                reply(prop)
+            else:
+                reply(X.NONE)
+        except Exception:
+            log.debug("xlib clipboard: error serving SelectionRequest", exc_info=True)
+            try:
+                reply(X.NONE)
+            except Exception:
+                pass
+
 
 def _normalize_newlines(s: str) -> str:
     """Collapse CRLF/CR to LF so Windows's clipboard normalization does not
@@ -66,7 +331,20 @@ def _read_image_from_system_clipboard() -> bytes | None:
             return buf.getvalue()
         except Exception:
             return None
-    # Linux: try xclip then wl-paste.
+    # Linux: check TARGETS first so we never send an image/png SelectionRequest
+    # to the clipboard owner when only text is present.  Without this guard,
+    # xclip would request image data even when the clipboard holds text.
+    for targets_cmd in (
+        ["xclip", "-selection", "clipboard", "-t", "TARGETS", "-o"],
+        ["wl-paste", "--list-types"],
+    ):
+        try:
+            res = subprocess.run(targets_cmd, capture_output=True, timeout=1)
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+            continue
+        if res.returncode != 0 or b"image/png" not in res.stdout:
+            return None
+        break
     # Some xclip versions return text content with exit 0 even when asked for
     # image/png and no image is on the clipboard.  Guard with a PNG magic-byte
     # check so we never mistake text bytes for image data.
@@ -152,6 +430,8 @@ class ClipboardSync:
         self._last_read_error: str | None = None
         self._last_write_error: str | None = None
         self._last_decrypt_error: str | None = None
+        self._xfixes_queue: "queue.SimpleQueue[object] | None" = None
+        self._clipboard_owner: "_XlibClipboardOwner | None" = None
         self._history = ClipboardHistory(settings)
 
     @property
@@ -167,6 +447,19 @@ class ClipboardSync:
     def start(self) -> None:
         self._stop.clear()
         self._seed_from_file()
+        if sys.platform not in ("win32", "darwin"):
+            _no_xfixes = os.environ.get("CLIPSYNC_NO_XFIXES")
+            _no_xlib = os.environ.get("CLIPSYNC_NO_XLIB")
+            self._xfixes_queue = _try_start_xfixes_watcher() if not _no_xfixes else None
+            if self._xfixes_queue is None:
+                log.debug("XFixes unavailable%s; falling back to clipboard polling",
+                          " (CLIPSYNC_NO_XFIXES set)" if _no_xfixes else "")
+            if not _no_xlib:
+                self._clipboard_owner = _try_start_xlib_clipboard_owner()
+            if self._clipboard_owner is None:
+                log.debug("xlib clipboard owner unavailable; using pyperclip for writes")
+            else:
+                log.info("xlib in-process clipboard owner active")
         self._poll_thread = threading.Thread(target=self._out_loop, name="clipsync-out", daemon=True)
         self._poll_thread.start()
         self._in_thread = threading.Thread(target=self._in_loop, name="clipsync-in", daemon=True)
@@ -185,6 +478,13 @@ class ClipboardSync:
             self._observer = None
         # Unblock _in_loop which may be waiting on the queue
         self._in_queue.put("")
+        # Unblock _out_loop if it is waiting on the XFixes queue
+        if self._xfixes_queue is not None:
+            self._xfixes_queue.put(_STOP_SENTINEL)
+        # Release clipboard ownership held by in-process owner.
+        if self._clipboard_owner is not None:
+            self._clipboard_owner.close()
+            self._clipboard_owner = None
         if self._in_thread and self._in_thread.is_alive():
             self._in_thread.join(timeout=3)
         if self._poll_thread and self._poll_thread.is_alive():
@@ -352,8 +652,23 @@ class ClipboardSync:
         return _normalize_newlines(value)
 
     def _write_clipboard(self, value: str) -> bool:
+        if self._clipboard_owner is not None:
+            try:
+                self._clipboard_owner.set(value)
+                log.debug("xlib clipboard set (%d chars)", len(value))
+                if self._last_write_error is not None:
+                    log.info("Clipboard write recovered")
+                    self._last_write_error = None
+                return True
+            except Exception as exc:
+                msg = f"xlib owner: {type(exc).__name__}: {exc}"
+                if msg != self._last_write_error:
+                    log.warning("Clipboard write failed (%s); falling back to pyperclip", msg)
+                    self._last_write_error = msg
+                # fall through to pyperclip
         try:
             pyperclip.copy(value)
+            log.debug("clipboard write (pyperclip) (%d chars)", len(value))
         except Exception as exc:
             msg = f"{type(exc).__name__}: {exc}"
             if msg != self._last_write_error:
@@ -380,18 +695,59 @@ class ClipboardSync:
             return False
 
     def _out_loop(self) -> None:
-        _heartbeat_counter = 0
+        _last_heartbeat = time.monotonic()
+        _HEARTBEAT_INTERVAL = 6.0
+
+        # Initial tick captures whatever is on the clipboard at startup.
+        try:
+            if not self._is_paused():
+                self._out_tick()
+        except Exception:
+            log.exception("Error in OUT loop (initial tick)")
+
         while not self._stop.is_set():
-            try:
+            if self._xfixes_queue is not None:
+                # Event-driven path: block until clipboard owner changes (or stop).
+                try:
+                    val = self._xfixes_queue.get(timeout=_HEARTBEAT_INTERVAL)
+                    if val is _STOP_SENTINEL:
+                        break
+                except queue.Empty:
+                    pass  # heartbeat timeout -- fall through to log only
+                else:
+                    # Brief pause before reading: the XFixes event fires the
+                    # instant the user copies, so if they immediately paste in
+                    # the same browser window, our xclip read would compete
+                    # with the browser serving its own paste on the same thread.
+                    # 300 ms is imperceptible for sync but covers the typical
+                    # copy→paste gesture before we send any SelectionRequest.
+                    if self._stop.wait(0.3):
+                        break
+                    # Clipboard actually changed: read and sync.
+                    if not self._stop.is_set() and not self._is_paused():
+                        # Drain any events that arrived during the debounce.
+                        while True:
+                            try:
+                                self._xfixes_queue.get_nowait()
+                            except queue.Empty:
+                                break
+                        try:
+                            self._out_tick()
+                        except Exception:
+                            log.exception("Error in OUT loop")
+            else:
+                # Polling fallback (Wayland / no XFixes).
+                if self._stop.wait(config.CLIPBOARD_POLL_INTERVAL):
+                    break
                 if not self._is_paused():
-                    self._out_tick()
-            except Exception:
-                log.exception("Error in OUT loop")
-            if self._stop.wait(config.CLIPBOARD_POLL_INTERVAL):
-                break
-            _heartbeat_counter += 1
-            if _heartbeat_counter >= 12:
-                _heartbeat_counter = 0
+                    try:
+                        self._out_tick()
+                    except Exception:
+                        log.exception("Error in OUT loop")
+
+            now = time.monotonic()
+            if now - _last_heartbeat >= _HEARTBEAT_INTERVAL:
+                _last_heartbeat = now
                 with self._lock:
                     last = self._last_synced
                 log.debug(
@@ -490,15 +846,11 @@ class ClipboardSync:
             if content == self._last_synced:
                 log.debug("IN [%s]: file changed but content already synced (%d chars)", _HOSTNAME, len(content))
                 return
-        current = self._read_clipboard()
-        if current == content:
-            with self._lock:
-                self._last_synced = content
-            log.debug("IN [%s]: file change was self-originated (%d chars)", _HOSTNAME, len(content))
-            return
+            # Update _last_synced before the write so that the XFixes event
+            # triggered by pyperclip.copy() below sees no change in the OUT
+            # loop and does not re-read the clipboard.
+            self._last_synced = content
         if self._write_clipboard(content):
-            with self._lock:
-                self._last_synced = content
             log.info("IN [%s]: %d chars applied to clipboard", _HOSTNAME, len(content))
             self._history.add_entry(content, "remote")
 
@@ -510,15 +862,8 @@ class ClipboardSync:
             if image == self._last_synced:
                 log.debug("IN [%s]: image file changed but already synced (%d bytes)", _HOSTNAME, len(image))
                 return
-        current = self._read_clipboard_image()
-        if current == image:
-            with self._lock:
-                self._last_synced = image
-            log.debug("IN [%s]: image file change was self-originated (%d bytes)", _HOSTNAME, len(image))
-            return
+            self._last_synced = image
         if self._write_clipboard_image(image):
-            with self._lock:
-                self._last_synced = image
             log.info("IN [%s]: %d bytes image applied to clipboard", _HOSTNAME, len(image))
 
 

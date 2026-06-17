@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import logging
 import platform
+import shutil
 import signal
 import sys
 import threading
@@ -28,6 +29,7 @@ from PIL import Image, ImageDraw
 
 from . import config, update
 from .clipboard import ClipboardSync
+from .file_transfer import FileTransfer
 from .debug import LogMirror
 from .pairing import PendingDeviceWatcher, accept_pending_device
 from .single_instance import AlreadyRunning, SingleInstance
@@ -137,6 +139,7 @@ class ClipSyncApp:
         self.settings = config.Settings()
         self.syncthing = SyncthingService(self.settings)
         self.clipboard: ClipboardSync | None = None
+        self.file_transfer: FileTransfer | None = None
         self.log_mirror: LogMirror | None = None
         self.watcher: PendingDeviceWatcher | None = None
         self.ui = UIController(on_event=self._handle_ui_event)
@@ -155,6 +158,9 @@ class ClipSyncApp:
         assert self.syncthing.client is not None
         self.clipboard = ClipboardSync(self.settings)
         self.clipboard.start()
+
+        self.file_transfer = FileTransfer(self.settings, on_received=self._on_file_received)
+        self.file_transfer.start()
 
         self.log_mirror = LogMirror(self.settings)
         self.log_mirror.start()
@@ -210,6 +216,7 @@ class ClipSyncApp:
                 visible=lambda _item: self._pending_count() > 0,
             ),
             pystray.MenuItem("Clipboard History", lambda _i, _it: self.ui.open("history")),
+            pystray.MenuItem("Send File…", lambda _i, _it: self.ui.open("file_picker")),
             pystray.MenuItem("Add Device", lambda _i, _it: self.ui.open("tabbed:pair")),
             pystray.MenuItem("Connected Devices", lambda _i, _it: self.ui.open("tabbed:devices")),
             pystray.MenuItem(
@@ -379,6 +386,14 @@ class ClipSyncApp:
             device_id = evt.get("device_id")
             if isinstance(device_id, str):
                 self._reject_device(device_id)
+        elif kind == "file_selected":
+            path = evt.get("path")
+            if isinstance(path, str) and self.file_transfer is not None:
+                threading.Thread(
+                    target=self._send_file_worker,
+                    args=(Path(path),),
+                    daemon=True,
+                ).start()
         else:
             log.debug("Unhandled UI event: %s", evt)
 
@@ -403,6 +418,31 @@ class ClipSyncApp:
             self.clipboard = ClipboardSync(self.settings)
             self.clipboard.start()
 
+    def _send_file_worker(self, source: Path) -> None:
+        if self.file_transfer is None:
+            return
+        try:
+            dest = self.file_transfer.send(source)
+            self._notify("File sent", f"{source.name} ({dest.stat().st_size // 1024} KB)")
+        except Exception as exc:
+            log.exception("Failed to send file %s", source)
+            self._notify("File send failed", str(exc))
+
+    def _on_file_received(self, path: Path, sender: str) -> None:
+        downloads = Path.home() / "Downloads"
+        downloads.mkdir(parents=True, exist_ok=True)
+        dest = downloads / path.name
+        if dest.exists():
+            stem = path.stem
+            suffix = path.suffix
+            i = 1
+            while dest.exists():
+                dest = downloads / f"{stem}_{i}{suffix}"
+                i += 1
+        shutil.copy2(path, dest)
+        log.info("Saved received file to %s", dest)
+        self._notify(f"File from {sender}", f"Saved to ~/Downloads/{dest.name}")
+
     # Shutdown ---------------------------------------------------------------
 
     def _shutdown(self) -> None:
@@ -418,6 +458,8 @@ class ClipSyncApp:
             self.watcher.stop()
         if self.log_mirror is not None:
             self.log_mirror.stop()
+        if self.file_transfer is not None:
+            self.file_transfer.stop()
         if self.clipboard is not None:
             self.clipboard.stop()
         try:

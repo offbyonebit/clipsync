@@ -203,7 +203,11 @@ def configure_logging() -> None:
     root = logging.getLogger()
     if getattr(root, "_clipsync_configured", False):
         return
-    root.setLevel(logging.INFO)
+    level = logging.INFO
+    # Honour CLIPSYNC_LOG_LEVEL env var (DEBUG, INFO, WARNING, ERROR).
+    if "CLIPSYNC_LOG_LEVEL" in os.environ:
+        level = getattr(logging, os.environ["CLIPSYNC_LOG_LEVEL"].upper(), logging.INFO)
+    root.setLevel(level)
     fmt = logging.Formatter(
         "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
