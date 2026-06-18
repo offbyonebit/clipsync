@@ -16,6 +16,7 @@ import sys
 import threading
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any, cast
 
 import customtkinter as ctk
 import requests
@@ -73,7 +74,10 @@ class UIController:
             # of silently swallowed.  Open in binary-append so it doesn't race
             # with the parent's RotatingFileHandler.
             try:
-                stderr_fh = open(config.LOG_FILE, "ab")
+                # Deliberately not a context manager: the handle must outlive
+                # this function for the subprocess's stderr; it's closed
+                # explicitly below once Popen has its own reference.
+                stderr_fh = open(config.LOG_FILE, "ab")  # noqa: SIM115
             except OSError:
                 stderr_fh = subprocess.DEVNULL  # type: ignore[assignment]
             kwargs: dict = dict(
@@ -95,6 +99,7 @@ class UIController:
                 # process that wasn't directly activated by user input.
                 try:
                     import ctypes
+
                     ctypes.windll.user32.AllowSetForegroundWindow(proc.pid)  # type: ignore[attr-defined]
                 except Exception:
                     pass
@@ -521,7 +526,10 @@ class _PairingContent:
         except ImportError:
             return
         try:
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            # frame is `object` at this boundary (the callback interface
+            # doesn't commit to a cv2/numpy type); narrow it here since this
+            # is the one place that actually knows it came from cv2.VideoCapture.
+            rgb = cv2.cvtColor(cast(Any, frame), cv2.COLOR_BGR2RGB)
             h, w = rgb.shape[:2]
             target_w, target_h = self._preview_size
             scale = min(target_w / w, target_h / h)

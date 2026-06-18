@@ -13,6 +13,7 @@ Receiving:
 from __future__ import annotations
 
 import logging
+import os
 import shutil
 import time
 from collections.abc import Callable
@@ -20,6 +21,7 @@ from pathlib import Path
 
 from watchdog.events import FileSystemEvent, FileSystemEventHandler
 from watchdog.observers import Observer
+from watchdog.observers.api import BaseObserver
 
 from . import config
 from .debug import _safe_hostname
@@ -38,7 +40,7 @@ class FileTransfer:
     ) -> None:
         self._settings = settings
         self._on_received = on_received
-        self._observer: Observer | None = None
+        self._observer: BaseObserver | None = None
 
     @property
     def files_dir(self) -> Path:
@@ -105,7 +107,7 @@ class _FileReceiveHandler(FileSystemEventHandler):
 
     def on_created(self, event: FileSystemEvent) -> None:
         if not event.is_directory:
-            self._handle(Path(event.src_path))
+            self._handle(Path(os.fsdecode(event.src_path)))
 
     def on_moved(self, event: FileSystemEvent) -> None:
         # Syncthing uses atomic rename: .syncthing.*.tmp → final name.

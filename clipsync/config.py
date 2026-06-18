@@ -114,14 +114,35 @@ class Settings:
             with self._path.open("r", encoding="utf-8") as fh:
                 loaded = json.load(fh)
         except (OSError, json.JSONDecodeError) as exc:
+            # Do NOT overwrite a corrupted/unreadable file with defaults.
+            # The user may still be able to recover it manually; clobbering
+            # it here turns a transient parse error into permanent data
+            # loss. Stay on defaults in memory and let the next successful
+            # set() re-persist.
             logging.warning("Failed to read settings, using defaults: %s", exc)
-            loaded = {}
+            return
+        if not isinstance(loaded, dict):
+            logging.warning("Settings file did not contain a JSON object; using defaults")
+            return
         merged = dict(DEFAULT_SETTINGS)
         merged.update({k: v for k, v in loaded.items() if k in DEFAULT_SETTINGS})
         if not merged.get("api_key"):
             merged["api_key"] = uuid.uuid4().hex
         self._data = merged
-        self._persist_locked()
+        # Only persist if the on-disk file is incomplete (missing a default
+        # key) or has an empty api_key that we just generated. Otherwise
+        # leave the file alone: rewriting it on every startup is needless
+        # churn and could race with a concurrent writer (e.g. a UI
+        # subprocess that just wrote a new value).
+        loaded_keys = set(loaded.keys())
+        needs_persist = not loaded.get("api_key") or any(k not in loaded_keys for k in DEFAULT_SETTINGS)
+        if needs_persist:
+            self._persist_locked()
+        else:
+            try:
+                self._mtime_ns = self._path.stat().st_mtime_ns
+            except OSError:
+                pass
 
     def _persist_locked(self) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)
@@ -178,6 +199,9 @@ class Settings:
             except (OSError, json.JSONDecodeError) as exc:
                 logging.warning("Failed to reload settings: %s", exc)
                 return
+            if not isinstance(loaded, dict):
+                logging.warning("Settings file did not contain a JSON object; keeping in-memory state")
+                return
             merged = dict(DEFAULT_SETTINGS)
             merged.update({k: v for k, v in loaded.items() if k in DEFAULT_SETTINGS})
             self._data = merged
@@ -213,9 +237,8 @@ def configure_logging() -> None:
         datefmt="%Y-%m-%d %H:%M:%S",
     )
     from logging.handlers import RotatingFileHandler
-    file_handler = RotatingFileHandler(
-        LOG_FILE, encoding="utf-8", maxBytes=10 * 1024 * 1024, backupCount=3
-    )
+
+    file_handler = RotatingFileHandler(LOG_FILE, encoding="utf-8", maxBytes=10 * 1024 * 1024, backupCount=3)
     file_handler.setFormatter(fmt)
     stream_handler = logging.StreamHandler()
     stream_handler.setFormatter(fmt)

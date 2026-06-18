@@ -15,13 +15,10 @@ import logging
 import threading
 import time
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from . import config
 from .crypto import decrypt, encrypt, is_encrypted
-
-if TYPE_CHECKING:
-    pass
 
 log = logging.getLogger(__name__)
 

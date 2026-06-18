@@ -67,6 +67,10 @@ def two_sided(tmp_path, monkeypatch):
     # which would only happen in this test harness (two logical machines
     # share one real folder). Swap in PollingObserver to sidestep that.
     monkeypatch.setattr(clipboard_module, "Observer", PollingObserver)
+    # Force the polling OUT loop; see test_cross_os_sync.py::make_pair for why
+    # a real X11 desktop session would otherwise bypass this test's fakes.
+    monkeypatch.setenv("CLIPSYNC_NO_XFIXES", "1")
+    monkeypatch.setenv("CLIPSYNC_NO_XLIB", "1")
 
     sync_folder = tmp_path / "shared_sync"
     sync_folder.mkdir()

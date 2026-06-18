@@ -27,15 +27,40 @@ log = logging.getLogger(__name__)
 _DEVICE_ID_RE = re.compile(r"^[A-Z2-7]{7}(-[A-Z2-7]{7}){7}$")
 
 
+def _validate_luhn_checksums(device_id: str) -> bool:
+    """Verify the Luhn mod-32 check character in each of the 4 14-char blocks.
+
+    Syncthing device IDs are 56 base32 chars split as 4 x (13 data + 1
+    Luhn check). The hyphens split into 8 groups of 7, so they are not
+    aligned with the Luhn block boundaries; we strip them first.
+    """
+    from .syncthing import _luhn32
+
+    raw = device_id.replace("-", "")
+    if len(raw) != 56:
+        return False
+    for i in range(0, 56, 14):
+        block = raw[i : i + 14]
+        if _luhn32(block[:13]) != block[13]:
+            return False
+    return True
+
+
 def normalize_device_id(raw: str) -> str | None:
-    """Strip whitespace, uppercase, and validate the device ID shape."""
+    """Strip whitespace, uppercase, validate the device ID shape and checksum."""
     if not raw:
         return None
     candidate = raw.strip().upper()
     candidate = re.sub(r"\s+", "", candidate)
-    if _DEVICE_ID_RE.match(candidate):
-        return candidate
-    return None
+    if not _DEVICE_ID_RE.match(candidate):
+        return None
+    # Shape is valid; also check the Luhn mod-32 checksums so a typo'd
+    # (but well-formed) ID is rejected here with a clear "invalid" result
+    # instead of being sent to Syncthing, which would reject it later
+    # with a vaguer error.
+    if not _validate_luhn_checksums(candidate):
+        return None
+    return candidate
 
 
 def generate_qr(device_id: str, box_size: int = 8, border: int = 2) -> Image.Image:
