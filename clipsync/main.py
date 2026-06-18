@@ -17,6 +17,7 @@ Lifecycle on quit:
 from __future__ import annotations
 
 import logging
+import os
 import platform
 import shutil
 import signal
@@ -29,8 +30,8 @@ from PIL import Image, ImageDraw
 
 from . import config, update
 from .clipboard import ClipboardSync
-from .file_transfer import FileTransfer
 from .debug import LogMirror
+from .file_transfer import FileTransfer
 from .pairing import PendingDeviceWatcher, accept_pending_device
 from .single_instance import AlreadyRunning, SingleInstance
 from .syncthing import SyncthingError, SyncthingService
@@ -374,7 +375,7 @@ class ClipSyncApp:
                 self._on_folder_changed(path)
         elif kind == "clear_history":
             if self.clipboard is not None:
-                self.clipboard._history.clear()
+                self.clipboard.clear_history()
             log.info("Clipboard history cleared from UI")
         elif kind == "reset":
             log.info("Devices reset from UI")
@@ -431,15 +432,39 @@ class ClipSyncApp:
     def _on_file_received(self, path: Path, sender: str) -> None:
         downloads = Path.home() / "Downloads"
         downloads.mkdir(parents=True, exist_ok=True)
+        stem = path.stem
+        suffix = path.suffix
+        # Atomically claim the destination filename with O_EXCL to close
+        # the TOCTOU window between two concurrent receives of same-named
+        # files from different senders: previously the exists() check +
+        # copy2 could race and clobber each other.
         dest = downloads / path.name
-        if dest.exists():
-            stem = path.stem
-            suffix = path.suffix
-            i = 1
-            while dest.exists():
-                dest = downloads / f"{stem}_{i}{suffix}"
-                i += 1
-        shutil.copy2(path, dest)
+        fd = -1
+        attempt = 0
+        while attempt < 1000:
+            try:
+                fd = os.open(str(dest), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+                break
+            except FileExistsError:
+                attempt += 1
+                dest = downloads / f"{stem}_{attempt}{suffix}"
+        if fd < 0:
+            log.warning("Could not find free filename for received file %s", path.name)
+            return
+        try:
+            with os.fdopen(fd, "wb") as out, path.open("rb") as src:
+                shutil.copyfileobj(src, out)
+            try:
+                shutil.copystat(path, dest)
+            except OSError:
+                pass
+        except OSError:
+            log.exception("Failed to save received file %s", path)
+            try:
+                dest.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return
         log.info("Saved received file to %s", dest)
         self._notify(f"File from {sender}", f"Saved to ~/Downloads/{dest.name}")
 

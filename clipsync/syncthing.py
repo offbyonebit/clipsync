@@ -79,37 +79,75 @@ def _release_asset_url(version: str) -> str:
     return f"https://github.com/syncthing/syncthing/releases/download/{v}/{stem}.{ext}"
 
 
-# SHA-256 hashes of known-good Syncthing binaries for supply-chain verification.
-# Expand this dictionary as new platforms/versions are validated.
-_KNOWN_BINARY_HASHES: dict[tuple[str, str, str], str] = {
-    ("linux", "amd64", "v2.0.16"): ("ef9fd7380fc3a4a000e2cc213e56697a091d7b5cd6e540026b14566bc85e3a4b"),
-}
+def _fetch_official_sha256sums(version: str) -> dict[str, str]:
+    """Fetch Syncthing's published sha256sum.txt.asc for *version*.
 
-
-def _verify_binary_hash(binary: Path, version: str) -> None:
-    """Raise SyncthingError if the binary hash doesn't match the known value."""
+    Returns a dict mapping archive filename (e.g.
+    ``syncthing-linux-amd64-v2.0.16.tar.gz``) to its lowercase hex
+    SHA-256. Returns an empty dict on any failure (network error,
+    unexpected format). The file is a PGP-signed message; we parse
+    only the ``<hash>  <filename>`` lines and skip the armor header.
+    """
+    v = version if version.startswith("v") else f"v{version}"
+    url = f"https://github.com/syncthing/syncthing/releases/download/{v}/sha256sum.txt.asc"
     try:
-        os_name, arch, _ext = _platform_archive_info()
+        data = _download(url)
+    except URLError as exc:
+        log.warning("Failed to fetch Syncthing sha256sum.txt.asc: %s", exc)
+        return {}
+    out: dict[str, str] = {}
+    for raw_line in data.decode("ascii", errors="replace").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("-----") or line.startswith("Hash:"):
+            continue
+        parts = line.split(None, 1)
+        if len(parts) != 2:
+            continue
+        digest, name = parts
+        name = name.strip().lstrip("*")
+        digest = digest.lower()
+        if len(digest) == 64 and all(c in "0123456789abcdef" for c in digest):
+            out[name] = digest
+    return out
+
+
+def _archive_filename(version: str) -> str:
+    """Return the release asset filename for this platform and version."""
+    os_name, arch, ext = _platform_archive_info()
+    v = version if version.startswith("v") else f"v{version}"
+    return f"syncthing-{os_name}-{arch}-{v}.{ext}"
+
+
+def _verify_archive_hash(data: bytes, version: str) -> None:
+    """Raise SyncthingError if *data* (the downloaded archive bytes) does
+    not match the official Syncthing sha256sum.txt.asc entry for this
+    platform. Falls back to a logged warning (not an error) if the
+    official sums file cannot be fetched or the platform entry is absent.
+    """
+    try:
+        archive_name = _archive_filename(version)
     except SyncthingError:
-        log.warning("Cannot determine platform for binary hash verification; skipping")
+        log.warning("Cannot determine platform for archive hash verification; skipping")
         return
 
-    key = (os_name, arch, version if version.startswith("v") else f"v{version}")
-    expected = _KNOWN_BINARY_HASHES.get(key)
+    sums = _fetch_official_sha256sums(version)
+    expected = sums.get(archive_name)
     if expected is None:
-        log.warning("No known hash for %s %s %s; skipping verification", *key)
+        log.warning(
+            "No hash for %s in sha256sum.txt.asc; skipping archive verification",
+            archive_name,
+        )
         return
 
     import hashlib
 
-    h = hashlib.sha256(binary.read_bytes()).hexdigest()
-    if h != expected:
-        binary.unlink(missing_ok=True)
+    actual = hashlib.sha256(data).hexdigest()
+    if actual != expected:
         raise SyncthingError(
-            f"Syncthing binary hash mismatch for {key}: expected {expected}, got {h}. "
-            f"The binary has been deleted. Please retry."
+            f"Syncthing archive hash mismatch for {archive_name}: "
+            f"expected {expected}, got {actual}. Refusing to extract."
         )
-    log.info("Syncthing binary hash verified for %s", key)
+    log.info("Syncthing archive hash verified for %s", archive_name)
 
 
 def _download(url: str) -> bytes:
@@ -191,8 +229,8 @@ def ensure_binary(version: str = config.SYNCTHING_VERSION) -> Path:
         data = _download(url)
     except URLError as exc:
         raise SyncthingError(f"Failed to download Syncthing: {exc}") from exc
+    _verify_archive_hash(data, version)
     extracted = _extract_binary(data, ext, config.SYNCTHING_BIN_DIR)
-    _verify_binary_hash(extracted, version)
     log.info("Installed syncthing binary at %s", extracted)
     return extracted
 
@@ -766,6 +804,11 @@ class SyncthingService:
         which is useless for diagnosing startup failures (DB locked, port
         bound, bad config, etc.). The reader must keep draining the pipe
         or syncthing will eventually block on write.
+
+        Output is demoted to DEBUG to keep clipsync's own INFO stream
+        readable; syncthing is verbose and its lines are not level-tagged.
+        The monitor thread still logs the exit code at ERROR when the
+        process actually dies, so real failures remain visible.
         """
         stream = proc.stdout
         if stream is None:
@@ -774,7 +817,7 @@ class SyncthingService:
             for line in iter(stream.readline, ""):
                 line = line.rstrip()
                 if line:
-                    log.info("syncthing: %s", line)
+                    log.debug("syncthing: %s", line)
         except Exception:
             log.debug("Syncthing output pump error", exc_info=True)
         finally:

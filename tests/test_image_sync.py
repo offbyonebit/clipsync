@@ -60,6 +60,10 @@ def _wait_for(predicate, timeout: float = 5.0, interval: float = 0.05) -> bool:
 def two_sided(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "CLIPBOARD_POLL_INTERVAL", POLL)
     monkeypatch.setattr(clipboard_module, "Observer", PollingObserver)
+    # Force the polling OUT loop; see test_cross_os_sync.py::make_pair for why
+    # a real X11 desktop session would otherwise bypass this test's fakes.
+    monkeypatch.setenv("CLIPSYNC_NO_XFIXES", "1")
+    monkeypatch.setenv("CLIPSYNC_NO_XLIB", "1")
 
     sync_folder = tmp_path / "shared_sync"
     sync_folder.mkdir()

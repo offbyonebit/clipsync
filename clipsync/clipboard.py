@@ -23,6 +23,7 @@ changes triggers the appropriate IN handler.
 
 from __future__ import annotations
 
+import importlib.util
 import io
 import logging
 import os
@@ -36,6 +37,7 @@ from pathlib import Path
 import pyperclip
 from watchdog.events import FileSystemEvent, FileSystemEventHandler
 from watchdog.observers import Observer
+from watchdog.observers.api import BaseObserver
 
 from . import config
 from .crypto import decrypt, encrypt, is_encrypted
@@ -53,7 +55,7 @@ _PNG_HEADER = b"\x89PNG\r\n\x1a\n"
 _STOP_SENTINEL = object()
 
 
-def _try_start_xfixes_watcher() -> "queue.SimpleQueue[object] | None":
+def _try_start_xfixes_watcher() -> queue.SimpleQueue[object] | None:
     """Start an X11 XFixes clipboard-owner watcher.
 
     Returns a SimpleQueue that receives a True value each time the CLIPBOARD
@@ -69,8 +71,8 @@ def _try_start_xfixes_watcher() -> "queue.SimpleQueue[object] | None":
     user has actually copied something.
     """
     try:
-        from Xlib import display  # type: ignore[import]
-        from Xlib.protocol import rq  # type: ignore[import]
+        from Xlib import display
+        from Xlib.protocol import rq
     except ImportError:
         return None
 
@@ -89,29 +91,45 @@ def _try_start_xfixes_watcher() -> "queue.SimpleQueue[object] | None":
 
     # Inline minimal XFixes protocol definitions -- python-xlib 0.15 doesn't
     # ship an xfixes module, so we define only what we need here.
-    class _QueryVersion(rq.ReplyRequest):  # type: ignore[misc]
+    class _QueryVersion(rq.ReplyRequest):
         _request = rq.Struct(
-            rq.Card8("opcode"), rq.Opcode(0), rq.RequestLength(),
-            rq.Card32("client_major"), rq.Card32("client_minor"),
+            rq.Card8("opcode"),
+            rq.Opcode(0),
+            rq.RequestLength(),
+            rq.Card32("client_major"),
+            rq.Card32("client_minor"),
         )
         _reply = rq.Struct(
-            rq.ReplyCode(), rq.Pad(1), rq.Card16("sequence_number"),
-            rq.Card32("length"), rq.Card32("major_version"),
-            rq.Card32("minor_version"), rq.Pad(16),
+            rq.ReplyCode(),
+            rq.Pad(1),
+            rq.Card16("sequence_number"),
+            rq.Card32("length"),
+            rq.Card32("major_version"),
+            rq.Card32("minor_version"),
+            rq.Pad(16),
         )
 
-    class _SelectSelectionInput(rq.Request):  # type: ignore[misc]
+    class _SelectSelectionInput(rq.Request):
         _request = rq.Struct(
-            rq.Card8("opcode"), rq.Opcode(2), rq.RequestLength(),
-            rq.Window("window"), rq.Card32("selection"), rq.Card32("event_mask"),
+            rq.Card8("opcode"),
+            rq.Opcode(2),
+            rq.RequestLength(),
+            rq.Window("window"),
+            rq.Card32("selection"),
+            rq.Card32("event_mask"),
         )
 
-    class _SelectionNotify(rq.Event):  # type: ignore[misc]
+    class _SelectionNotify(rq.Event):
         _code = _first_event
         _fields = rq.Struct(
-            rq.Card8("type"), rq.Card8("subtype"), rq.Card16("sequence_number"),
-            rq.Window("window"), rq.Card32("selection"), rq.Card32("owner"),
-            rq.Card32("selection_timestamp"), rq.Card32("timestamp"),
+            rq.Card8("type"),
+            rq.Card8("subtype"),
+            rq.Card16("sequence_number"),
+            rq.Window("window"),
+            rq.Card32("selection"),
+            rq.Card32("owner"),
+            rq.Card32("selection_timestamp"),
+            rq.Card32("timestamp"),
         )
 
     notify_q: queue.SimpleQueue[object] = queue.SimpleQueue()
@@ -122,15 +140,19 @@ def _try_start_xfixes_watcher() -> "queue.SimpleQueue[object] | None":
             d.display.extension_major_opcodes["XFIXES"] = _opcode
             d.display.add_extension_event(_first_event, _SelectionNotify)
             _QueryVersion(
-                display=d.display, opcode=_opcode,
-                client_major=5, client_minor=0,
+                display=d.display,
+                opcode=_opcode,
+                client_major=5,
+                client_minor=0,
             )
             d.sync()
             root = d.screen().root
             clipboard_atom = d.intern_atom("CLIPBOARD")
             _SelectSelectionInput(
-                display=d.display, opcode=_opcode,
-                window=root, selection=clipboard_atom,
+                display=d.display,
+                opcode=_opcode,
+                window=root,
+                selection=clipboard_atom,
                 event_mask=1,  # SelectionSetOwnerMask
             )
             d.flush()
@@ -147,7 +169,7 @@ def _try_start_xfixes_watcher() -> "queue.SimpleQueue[object] | None":
     return notify_q
 
 
-def _try_start_xlib_clipboard_owner() -> "_XlibClipboardOwner | None":
+def _try_start_xlib_clipboard_owner() -> _XlibClipboardOwner | None:
     """Try to create an in-process X11 clipboard owner using python-xlib.
 
     Returns None on Wayland, missing python-xlib, or any startup error.
@@ -157,9 +179,7 @@ def _try_start_xlib_clipboard_owner() -> "_XlibClipboardOwner | None":
     - Has no ownership-transition gap (we own the selection immediately)
     - Responds to SelectionRequests in microseconds (single round trip)
     """
-    try:
-        from Xlib import display  # type: ignore[import]
-    except ImportError:
+    if importlib.util.find_spec("Xlib") is None:
         return None
     try:
         return _XlibClipboardOwner()
@@ -177,7 +197,7 @@ class _XlibClipboardOwner:
     """
 
     def __init__(self) -> None:
-        from Xlib import X, Xatom, display  # type: ignore[import]
+        from Xlib import X, Xatom, display
 
         self._X = X
         self._d = display.Display()
@@ -187,7 +207,7 @@ class _XlibClipboardOwner:
         self._UTF8 = self._d.intern_atom("UTF8_STRING")
         self._COMPOUND_TEXT = self._d.intern_atom("COMPOUND_TEXT")
         self._TARGETS = self._d.intern_atom("TARGETS")
-        self._XA_ATOM = Xatom.ATOM      # type for lists of atoms (= 4)
+        self._XA_ATOM = Xatom.ATOM  # type for lists of atoms (= 4)
         self._XA_STRING = Xatom.STRING  # plain ASCII/Latin-1 string type (= 31)
 
         self._content: str | None = None
@@ -196,9 +216,7 @@ class _XlibClipboardOwner:
         # Self-pipe: writing a byte wakes the event loop.
         self._pipe_r, self._pipe_w = os.pipe()
 
-        self._thread = threading.Thread(
-            target=self._event_loop, name="clipsync-xlib-owner", daemon=True
-        )
+        self._thread = threading.Thread(target=self._event_loop, name="clipsync-xlib-owner", daemon=True)
         self._thread.start()
 
     def set(self, text: str) -> None:
@@ -267,7 +285,7 @@ class _XlibClipboardOwner:
             log.debug("xlib clipboard: lost CLIPBOARD ownership (SelectionClear)")
 
     def _serve_request(self, req) -> None:
-        from Xlib.protocol.event import SelectionNotify  # type: ignore[import]
+        from Xlib.protocol.event import SelectionNotify
 
         X = self._X
         with self._content_lock:
@@ -424,14 +442,14 @@ class ClipboardSync:
         self._poll_thread: threading.Thread | None = None
         self._in_thread: threading.Thread | None = None
         self._in_queue: queue.SimpleQueue[str] = queue.SimpleQueue()
-        self._observer: Observer | None = None
+        self._observer: BaseObserver | None = None
         self._last_synced: str | bytes | None = None
         self._lock = threading.Lock()
         self._last_read_error: str | None = None
         self._last_write_error: str | None = None
         self._last_decrypt_error: str | None = None
-        self._xfixes_queue: "queue.SimpleQueue[object] | None" = None
-        self._clipboard_owner: "_XlibClipboardOwner | None" = None
+        self._xfixes_queue: queue.SimpleQueue[object] | None = None
+        self._clipboard_owner: _XlibClipboardOwner | None = None
         self._history = ClipboardHistory(settings)
 
     @property
@@ -452,8 +470,10 @@ class ClipboardSync:
             _no_xlib = os.environ.get("CLIPSYNC_NO_XLIB")
             self._xfixes_queue = _try_start_xfixes_watcher() if not _no_xfixes else None
             if self._xfixes_queue is None:
-                log.debug("XFixes unavailable%s; falling back to clipboard polling",
-                          " (CLIPSYNC_NO_XFIXES set)" if _no_xfixes else "")
+                log.debug(
+                    "XFixes unavailable%s; falling back to clipboard polling",
+                    " (CLIPSYNC_NO_XFIXES set)" if _no_xfixes else "",
+                )
             if not _no_xlib:
                 self._clipboard_owner = _try_start_xlib_clipboard_owner()
             if self._clipboard_owner is None:
@@ -490,6 +510,14 @@ class ClipboardSync:
         if self._poll_thread and self._poll_thread.is_alive():
             self._poll_thread.join(timeout=3)
         log.info("Clipboard sync stopped")
+
+    def clear_history(self) -> None:
+        """Drop all stored clipboard history entries (called from UI events).
+
+        Exposed as a public method so callers don't need to reach into
+        the private _history attribute.
+        """
+        self._history.clear()
 
     def _passphrase(self) -> str:
         val = self._settings.get("encryption_passphrase") or ""

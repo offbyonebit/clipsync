@@ -84,6 +84,16 @@ def make_pair(tmp_path, monkeypatch):
     (os_a, os_b) pair sharing one sync folder."""
     monkeypatch.setattr(config, "CLIPBOARD_POLL_INTERVAL", POLL)
     monkeypatch.setattr(clipboard_module, "Observer", PollingObserver)
+    # Force the polling OUT loop regardless of the host's own display state.
+    # On a real X11 desktop, start() opportunistically wires up a *real*
+    # XFixes watcher tied to the actual system clipboard; the OUT loop then
+    # waits on real selection-owner-change events instead of polling, so
+    # this test's fake clipboard.set() (which never touches the real X
+    # server) would never trigger a sync. Headless CI has no DISPLAY so it
+    # falls back to polling naturally, but that shouldn't be required to
+    # pass on a Linux dev machine with a graphical session.
+    monkeypatch.setenv("CLIPSYNC_NO_XFIXES", "1")
+    monkeypatch.setenv("CLIPSYNC_NO_XLIB", "1")
 
     syncs: list[ClipboardSync] = []
 

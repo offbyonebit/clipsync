@@ -1,0 +1,6 @@
+# Build / dev tooling. Install with: pip install -r requirements-dev.txt
+-r requirements.txt
+pyinstaller>=6.3.0
+ruff>=0.6.0
+mypy>=1.10
+pytest>=8.0

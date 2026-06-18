@@ -28,7 +28,6 @@ import subprocess
 import sys
 import threading
 import time
-import types
 import unittest.mock as mock
 
 import pytest
@@ -38,8 +37,8 @@ from watchdog.observers.polling import PollingObserver
 import clipsync.clipboard as clipboard_module
 from clipsync import config
 from clipsync.clipboard import (
-    ClipboardSync,
     _STOP_SENTINEL,
+    ClipboardSync,
     _read_image_from_system_clipboard,
 )
 
@@ -320,6 +319,12 @@ def two_sided_linux(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "CLIPBOARD_POLL_INTERVAL", POLL)
     monkeypatch.setattr(clipboard_module, "Observer", PollingObserver)
     monkeypatch.setattr(sys, "platform", "linux")
+    # Force the polling fallback this fixture is meant to simulate. On a
+    # real X11 desktop, start() would otherwise wire up a genuine XFixes
+    # watcher (since sys.platform == "linux" here) and take the event-driven
+    # path instead, defeating the point of this fixture.
+    monkeypatch.setenv("CLIPSYNC_NO_XFIXES", "1")
+    monkeypatch.setenv("CLIPSYNC_NO_XLIB", "1")
 
     sync_folder = tmp_path / "shared_sync"
     sync_folder.mkdir()
@@ -369,6 +374,4 @@ def test_text_syncs_on_linux_polling_fallback(two_sided_linux) -> None:
     """Text sync must work normally alongside image checks on the polling path."""
     _, _, txt_a, _, txt_b, _ = two_sided_linux
     txt_a["value"] = "paste freeze fixed"
-    assert _wait_for(lambda: txt_b["value"] == "paste freeze fixed"), (
-        f"Text did not sync; got {txt_b['value']!r}"
-    )
+    assert _wait_for(lambda: txt_b["value"] == "paste freeze fixed"), f"Text did not sync; got {txt_b['value']!r}"
