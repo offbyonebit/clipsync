@@ -1,43 +1,60 @@
-"""Tests for clipboard encryption helpers (crypto.py)."""
+"""Tests for the Fernet-based clipboard encryption helpers."""
 
 from __future__ import annotations
 
+import base64
+
+import pytest
+from cryptography.fernet import Fernet
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+
 from clipsync import crypto
-from clipsync.crypto import _ENC_MAGIC_V0, _ENC_MAGIC_V1, _LEGACY_SALT, _derive_key
+
 
 # ---------------------------------------------------------------------------
 # Encrypt / decrypt round-trip
 # ---------------------------------------------------------------------------
 
 
-def test_roundtrip_text() -> None:
-    plaintext = b"hello world"
-    assert crypto.decrypt(crypto.encrypt(plaintext, "secret"), "secret") == plaintext
+def test_roundtrip_v1_payload() -> None:
+    payload = b"hello clipboard"
+    token = crypto.encrypt(payload, "correct horse battery staple")
+    assert crypto.is_encrypted(token)
+    assert crypto.decrypt(token, "correct horse battery staple") == payload
 
 
-def test_roundtrip_binary() -> None:
-    data = bytes(range(256))
-    assert crypto.decrypt(crypto.encrypt(data, "pass"), "pass") == data
+def test_roundtrip_empty_payload() -> None:
+    payload = b""
+    token = crypto.encrypt(payload, "pw")
+    assert crypto.decrypt(token, "pw") == payload
 
 
-def test_roundtrip_empty_bytes() -> None:
-    assert crypto.decrypt(crypto.encrypt(b"", "pw"), "pw") == b""
+def test_roundtrip_binary_payload() -> None:
+    payload = bytes(range(256))
+    token = crypto.encrypt(payload, "pw")
+    assert crypto.decrypt(token, "pw") == payload
 
 
-def test_roundtrip_unicode_passphrase() -> None:
-    plaintext = b"data"
-    passphrase = "pässwörd\U0001f511"
-    assert crypto.decrypt(crypto.encrypt(plaintext, passphrase), passphrase) == plaintext
+@pytest.mark.parametrize(
+    "passphrase", ["", " ", "p", "long " * 100, "ünïcödé", "pässwörd\U0001f511"]
+)
+def test_roundtrip_various_passphrases(passphrase: str) -> None:
+    payload = b"x"
+    # An empty passphrase is the "no encryption" path elsewhere; encrypt()
+    # still has to work if asked directly.
+    token = crypto.encrypt(payload, passphrase)
+    assert crypto.decrypt(token, passphrase) == payload
 
 
 # ---------------------------------------------------------------------------
-# Wrong passphrase
+# Wrong / corrupted input
 # ---------------------------------------------------------------------------
 
 
-def test_wrong_passphrase_returns_none() -> None:
-    ciphertext = crypto.encrypt(b"secret data", "correct")
-    assert crypto.decrypt(ciphertext, "wrong") is None
+def test_decrypt_wrong_passphrase_returns_none() -> None:
+    token = crypto.encrypt(b"secret", "right")
+    assert crypto.decrypt(token, "wrong") is None
 
 
 def test_empty_passphrase_wrong_returns_none() -> None:
@@ -45,58 +62,21 @@ def test_empty_passphrase_wrong_returns_none() -> None:
     assert crypto.decrypt(ciphertext, "") is None
 
 
-# ---------------------------------------------------------------------------
-# V1 format properties
-# ---------------------------------------------------------------------------
+def test_decrypt_corrupted_payload_returns_none() -> None:
+    token = crypto.encrypt(b"secret", "pw")
+    # Flip a byte in the body.
+    corrupted = token[:-1] + bytes([token[-1] ^ 0xFF])
+    assert crypto.decrypt(corrupted, "pw") is None
 
 
-def test_encrypt_produces_v1_magic() -> None:
-    ct = crypto.encrypt(b"x", "pw")
-    assert ct.startswith(_ENC_MAGIC_V1)
+def test_decrypt_garbage_returns_none() -> None:
+    assert crypto.decrypt(b"not a csenc payload", "pw") is None
 
 
-def test_v1_uses_random_salt_per_call() -> None:
-    ct1 = crypto.encrypt(b"same", "pw")
-    ct2 = crypto.encrypt(b"same", "pw")
-    assert ct1 != ct2
-
-
-# ---------------------------------------------------------------------------
-# V0 legacy format (backward compatibility)
-# ---------------------------------------------------------------------------
-
-
-def _make_v0_payload(plaintext: bytes, passphrase: str) -> bytes:
-    from cryptography.fernet import Fernet
-
-    key = _derive_key(passphrase, _LEGACY_SALT)
-    token = Fernet(key).encrypt(plaintext)
-    return _ENC_MAGIC_V0 + token
-
-
-def test_v0_legacy_decrypt() -> None:
-    payload = _make_v0_payload(b"legacy data", "oldpass")
-    assert crypto.decrypt(payload, "oldpass") == b"legacy data"
-
-
-def test_v0_wrong_passphrase_returns_none() -> None:
-    payload = _make_v0_payload(b"data", "correct")
-    assert crypto.decrypt(payload, "wrong") is None
-
-
-# ---------------------------------------------------------------------------
-# Truncated / malformed input
-# ---------------------------------------------------------------------------
-
-
-def test_truncated_v1_header_returns_none() -> None:
-    # V1 magic + salt that is too short (no token)
-    short = _ENC_MAGIC_V1 + b"\x00" * 5
-    assert crypto.decrypt(short, "pw") is None
-
-
-def test_garbage_returns_none() -> None:
-    assert crypto.decrypt(b"not encrypted at all", "pw") is None
+def test_decrypt_truncated_v1_payload_returns_none() -> None:
+    # Header + partial salt but no body.
+    truncated = crypto._ENC_MAGIC_V1 + b"\x00\x01"
+    assert crypto.decrypt(truncated, "pw") is None
 
 
 def test_empty_bytes_returns_none() -> None:
@@ -108,21 +88,67 @@ def test_partial_magic_returns_none() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Format properties
+# ---------------------------------------------------------------------------
+
+
+def test_encrypt_produces_v1_magic() -> None:
+    ct = crypto.encrypt(b"x", "pw")
+    assert ct.startswith(crypto._ENC_MAGIC_V1)
+
+
+def test_each_encrypt_uses_random_salt() -> None:
+    """Two encrypt() calls with the same input must produce different ciphertext."""
+    a = crypto.encrypt(b"same", "pw")
+    b = crypto.encrypt(b"same", "pw")
+    assert a != b
+    # Both must still decrypt to the same plaintext.
+    assert crypto.decrypt(a, "pw") == b"same"
+    assert crypto.decrypt(b, "pw") == b"same"
+
+
+# ---------------------------------------------------------------------------
 # is_encrypted
 # ---------------------------------------------------------------------------
 
 
-def test_is_encrypted_v1() -> None:
-    assert crypto.is_encrypted(crypto.encrypt(b"x", "pw")) is True
+def test_is_encrypted_detects_v0_and_v1() -> None:
+    v1 = crypto.encrypt(b"x", "pw")
+    v0 = crypto._ENC_MAGIC_V0 + b"legacy-token-bytes"
+    assert crypto.is_encrypted(v1)
+    assert crypto.is_encrypted(v0)
+    assert not crypto.is_encrypted(b"plain text")
+    assert not crypto.is_encrypted(b"")
 
 
-def test_is_encrypted_v0() -> None:
-    assert crypto.is_encrypted(_make_v0_payload(b"x", "pw")) is True
+# ---------------------------------------------------------------------------
+# V0 legacy format (backward compatibility)
+# ---------------------------------------------------------------------------
 
 
-def test_is_encrypted_plaintext() -> None:
-    assert crypto.is_encrypted(b"plain text clipboard") is False
+def _make_v0_payload(plaintext: bytes, passphrase: str) -> bytes:
+    key = _derive_key(passphrase, crypto._LEGACY_SALT)
+    token = Fernet(key).encrypt(plaintext)
+    return crypto._ENC_MAGIC_V0 + token
 
 
-def test_is_encrypted_empty() -> None:
-    assert crypto.is_encrypted(b"") is False
+def _derive_key(passphrase: str, salt: bytes) -> bytes:
+    kdf = PBKDF2HMAC(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=salt,
+        iterations=120_000,
+    )
+    return base64.urlsafe_b64encode(kdf.derive(passphrase.encode("utf-8")))
+
+
+def test_v0_legacy_payload_decrypts() -> None:
+    """v0 used a hardcoded salt; current code must still read those payloads."""
+    v0_payload = _make_v0_payload(b"legacy data", "pw")
+    assert crypto.is_encrypted(v0_payload)
+    assert crypto.decrypt(v0_payload, "pw") == b"legacy data"
+
+
+def test_v0_wrong_passphrase_returns_none() -> None:
+    payload = _make_v0_payload(b"data", "correct")
+    assert crypto.decrypt(payload, "wrong") is None

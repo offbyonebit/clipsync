@@ -16,6 +16,7 @@ import sys
 import threading
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any, cast
 
 import customtkinter as ctk
 import requests
@@ -27,7 +28,7 @@ from .syncthing import SyncthingClient
 
 log = logging.getLogger(__name__)
 
-_WINDOWS = ("pairing", "devices", "settings", "logs", "incoming", "tabbed", "history")
+_WINDOWS = ("pairing", "devices", "settings", "logs", "incoming", "tabbed", "history", "file_picker")
 
 
 def _center_window(window: ctk.CTkToplevel | ctk.CTk, width: int, height: int) -> None:
@@ -69,14 +70,39 @@ class UIController:
                 cmd = [sys.executable, "ui", window]
             else:
                 cmd = [sys.executable, "-m", "clipsync.ui", window]
-            proc = subprocess.Popen(
-                cmd,
+            # Route child stderr to the log file so crashes are visible instead
+            # of silently swallowed.  Open in binary-append so it doesn't race
+            # with the parent's RotatingFileHandler.
+            try:
+                # Deliberately not a context manager: the handle must outlive
+                # this function for the subprocess's stderr; it's closed
+                # explicitly below once Popen has its own reference.
+                stderr_fh = open(config.LOG_FILE, "ab")  # noqa: SIM115
+            except OSError:
+                stderr_fh = subprocess.DEVNULL  # type: ignore[assignment]
+            kwargs: dict = dict(
                 stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
+                stderr=stderr_fh,
                 stdin=subprocess.DEVNULL,
                 text=True,
                 bufsize=1,
             )
+            if sys.platform == "win32":
+                kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+            proc = subprocess.Popen(cmd, **kwargs)
+            if stderr_fh is not subprocess.DEVNULL:
+                stderr_fh.close()
+            if sys.platform == "win32":
+                # Grant the child permission to bring its window to the
+                # foreground.  Without this, Windows' foreground-activation
+                # lock silently ignores lift()/focus_force() calls from a
+                # process that wasn't directly activated by user input.
+                try:
+                    import ctypes
+
+                    ctypes.windll.user32.AllowSetForegroundWindow(proc.pid)  # type: ignore[attr-defined]
+                except Exception:
+                    pass
             self._procs[key] = proc
         threading.Thread(
             target=self._read_events,
@@ -104,6 +130,8 @@ class UIController:
                     log.exception("UI event handler raised")
         finally:
             proc.wait()
+            if proc.returncode not in (0, None, -15):  # -15 = SIGTERM on Unix
+                log.warning("UI child process exited with code %d (check log file for details)", proc.returncode)
 
     def close_all(self) -> None:
         with self._lock:
@@ -499,7 +527,10 @@ class _PairingContent:
         except ImportError:
             return
         try:
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            # frame is `object` at this boundary (the callback interface
+            # doesn't commit to a cv2/numpy type); narrow it here since this
+            # is the one place that actually knows it came from cv2.VideoCapture.
+            rgb = cv2.cvtColor(cast(Any, frame), cv2.COLOR_BGR2RGB)
             h, w = rgb.shape[:2]
             target_w, target_h = self._preview_size
             scale = min(target_w / w, target_h / h)
@@ -1583,11 +1614,13 @@ def _run_child(window_name: str) -> int:
 
     app = AppContext(settings=settings, client=client, device_id=device_id)
 
-    # Disable ctk's Windows titlebar manipulation. It does a withdraw/
-    # deiconify dance on init and on every resizable() call, and when
-    # cycles overlap (as they do in a tabbed window) the state capture
-    # races and leaves the window hidden. We lose the dark titlebar on
-    # Windows; that's an acceptable trade for a window that actually opens.
+    # Disable ctk's Windows titlebar manipulation on both CTk and CTkToplevel.
+    # Without this, CTk.__init__ triggers a withdraw/update() dance that makes
+    # the hidden root window briefly appear, and CTkToplevel.resizable() queues
+    # further deiconify callbacks that race with our own withdraw() calls and
+    # can leave windows permanently hidden.  We lose the dark titlebar on
+    # Windows; that's an acceptable trade for windows that reliably open.
+    ctk.CTk._deactivate_windows_window_header_manipulation = True
     ctk.CTkToplevel._deactivate_windows_window_header_manipulation = True
     theme = str(settings.get("theme") or "System")
     if theme not in ("Light", "Dark", "System"):
@@ -1623,6 +1656,23 @@ def _run_child(window_name: str) -> int:
         IncomingWindow(root, app, on_close=_quit)
     elif kind == "history":
         HistoryWindow(root, app, on_close=_quit)
+    elif kind == "file_picker":
+        # Lightweight path: open a native file dialog, emit the result, done.
+        # No CTk window needed -- just a hidden Tk root to host the dialog.
+        import tkinter as tk
+        from tkinter import filedialog
+
+        root.destroy()  # discard the CTk root, use a plain Tk one
+        tk_root = tk.Tk()
+        tk_root.withdraw()
+        path = filedialog.askopenfilename(
+            title="Select file to send",
+            parent=tk_root,
+        )
+        tk_root.destroy()
+        if path:
+            _emit("file_selected", path=path)
+        return 0
     else:
         log.error("Unknown window: %s", window_name)
         return 1

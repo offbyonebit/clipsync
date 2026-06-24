@@ -1,3 +1,54 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "offbyonebit-clipsync"
+dynamic = ["version"]
+description = "Peer-to-peer clipboard sync over Syncthing."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.11"
+authors = [{ name = "offbyonebit" }]
+classifiers = [
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: MacOS :: MacOS X",
+    "Operating System :: POSIX :: Linux",
+    "Topic :: Communications :: File Sharing",
+]
+dependencies = [
+    "customtkinter>=5.2.2",
+    "pystray>=0.19.5",
+    "pyperclip>=1.9.0",
+    "qrcode[pil]>=7.4.2",
+    "Pillow>=10.0.0",
+    "watchdog>=4.0.0",
+    "requests>=2.31.0",
+    "opencv-python>=4.9.0.80",
+    "cryptography>=41.0.0",
+    "pyobjc-core>=10.0; sys_platform == 'darwin'",
+    "pyobjc-framework-Cocoa>=10.0; sys_platform == 'darwin'",
+]
+
+[project.scripts]
+clipsync = "clipsync.main:main"
+
+[project.urls]
+Homepage = "https://github.com/offbyonebit/clipsync"
+Source = "https://github.com/offbyonebit/clipsync"
+Issues = "https://github.com/offbyonebit/clipsync/issues"
+
+[tool.setuptools.dynamic]
+version = { attr = "clipsync.__version__" }
+
+[tool.setuptools.packages.find]
+include = ["clipsync*"]
+
 [tool.ruff]
 line-length = 120
 target-version = "py311"
