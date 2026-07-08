@@ -6,6 +6,9 @@ Pillow>=10.0.0
 watchdog>=4.0.0
 requests>=2.31.0
 opencv-python>=4.9.0.80
+# Transitive via opencv-python. Pinned <2.5: 2.5.x ships type-stub syntax
+# (PEP 695 `type` statement) that mypy can't parse under python_version=3.11.
+numpy<2.5
 cryptography>=41.0.0
 pyobjc-core>=10.0; sys_platform == "darwin"
 pyobjc-framework-Cocoa>=10.0; sys_platform == "darwin"
