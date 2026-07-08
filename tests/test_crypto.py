@@ -11,7 +11,6 @@ from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
 from clipsync import crypto
 
-
 # ---------------------------------------------------------------------------
 # Encrypt / decrypt round-trip
 # ---------------------------------------------------------------------------
@@ -36,9 +35,7 @@ def test_roundtrip_binary_payload() -> None:
     assert crypto.decrypt(token, "pw") == payload
 
 
-@pytest.mark.parametrize(
-    "passphrase", ["", " ", "p", "long " * 100, "ünïcödé", "pässwörd\U0001f511"]
-)
+@pytest.mark.parametrize("passphrase", ["", " ", "p", "long " * 100, "ünïcödé", "pässwörd\U0001f511"])
 def test_roundtrip_various_passphrases(passphrase: str) -> None:
     payload = b"x"
     # An empty passphrase is the "no encryption" path elsewhere; encrypt()
