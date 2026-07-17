@@ -20,6 +20,7 @@ import shutil
 import stat
 import subprocess
 import tarfile
+import tempfile
 import threading
 import time
 import uuid
@@ -33,6 +34,7 @@ from urllib.request import Request, urlopen
 import requests
 
 from . import config
+from ._release_key import SYNCTHING_RELEASE_FINGERPRINT, SYNCTHING_RELEASE_KEY
 
 log = logging.getLogger(__name__)
 
@@ -79,22 +81,19 @@ def _release_asset_url(version: str) -> str:
     return f"https://github.com/syncthing/syncthing/releases/download/{v}/{stem}.{ext}"
 
 
-def _fetch_official_sha256sums(version: str) -> dict[str, str]:
-    """Fetch Syncthing's published sha256sum.txt.asc for *version*.
-
-    Returns a dict mapping archive filename (e.g.
-    ``syncthing-linux-amd64-v2.0.16.tar.gz``) to its lowercase hex
-    SHA-256. Returns an empty dict on any failure (network error,
-    unexpected format). The file is a PGP-signed message; we parse
-    only the ``<hash>  <filename>`` lines and skip the armor header.
-    """
+def _asc_url(version: str) -> str:
     v = version if version.startswith("v") else f"v{version}"
-    url = f"https://github.com/syncthing/syncthing/releases/download/{v}/sha256sum.txt.asc"
-    try:
-        data = _download(url)
-    except URLError as exc:
-        log.warning("Failed to fetch Syncthing sha256sum.txt.asc: %s", exc)
-        return {}
+    return f"https://github.com/syncthing/syncthing/releases/download/{v}/sha256sum.txt.asc"
+
+
+def _parse_sha256sums(data: bytes) -> dict[str, str]:
+    """Parse the ``<hash>  <filename>`` lines out of a sha256sum.txt.asc body.
+
+    The file is a PGP-signed cleartext message; we keep only the hash
+    lines and skip the armor header / signature blocks. Returns a dict
+    mapping archive filename (e.g. ``syncthing-linux-amd64-v2.0.16.tar.gz``)
+    to its lowercase hex SHA-256.
+    """
     out: dict[str, str] = {}
     for raw_line in data.decode("ascii", errors="replace").splitlines():
         line = raw_line.strip()
@@ -111,6 +110,122 @@ def _fetch_official_sha256sums(version: str) -> dict[str, str]:
     return out
 
 
+def _gpg_verify(gpg_bin: str, signed_asc: bytes, home: str) -> str:
+    """Run ``gpg --verify`` on *signed_asc* in a throwaway *home* and return
+    the ``--status-fd`` text. Imports the embedded release key first.
+
+    Split out so tests can stub the gpg invocation with canned status-fd
+    output without spawning a process.
+    """
+    with tempfile.NamedTemporaryFile(suffix=".asc", delete=False) as asc_f:
+        asc_f.write(signed_asc)
+        asc_path = asc_f.name
+    try:
+        # Import the embedded trust anchor into the isolated keyring. We never
+        # touch the user's real keyring or fetch anything from a keyserver.
+        subprocess.run(
+            [gpg_bin, "--batch", "--homedir", home, "--import"],
+            input=SYNCTHING_RELEASE_KEY.encode("utf-8"),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=30,
+            check=False,
+        )
+        # We only need stdout, which carries the --status-fd machine-readable
+        # lines (pure ASCII). gpg's human-readable stderr is locale-dependent
+        # and may contain non-UTF-8 bytes, so discard it rather than decode it.
+        result = subprocess.run(
+            [gpg_bin, "--batch", "--homedir", home, "--status-fd", "1", "--verify", asc_path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=30,
+            check=False,
+        )
+        return (result.stdout or b"").decode("ascii", errors="replace")
+    finally:
+        try:
+            Path(asc_path).unlink()
+        except OSError:
+            pass
+
+
+def _verify_release_signature(signed_asc: bytes) -> None:
+    """Verify the PGP signature on Syncthing's ``sha256sum.txt.asc``.
+
+    Acceptance requires a ``VALIDSIG`` status line whose key fingerprint
+    equals the pinned Syncthing release fingerprint. We key off the
+    machine-readable ``--status-fd`` output (locale-independent and stable
+    across gpg versions), never off human-readable text like "Good
+    signature".
+
+    Policy:
+      * gpg present + a VALIDSIG signed by the pinned key -> accept.
+      * gpg present + no such VALIDSIG (bad sig, wrong key, unparseable)
+        -> raise SyncthingError and refuse to extract. We do NOT silently
+        downgrade to hash-only when a verifier is available: an attacker
+        who can forge a malformed .asc to force a fallback is exactly the
+        threat this closes.
+      * gpg absent -> log a prominent warning and return (caller falls
+        back to hash-only). This is no worse than the previous behavior
+        and keeps first-run working on systems without gpg (notably stock
+        Windows). Full coverage there is a tracked follow-up (bundle gpg).
+
+    Note: Syncthing's .asc is double-signed (current key + a legacy key).
+    gpg emits NO_PUBKEY/ERRSIG for the legacy key we don't ship, which
+    makes the process exit non-zero even when the current key's signature
+    is valid. We therefore ignore the exit code entirely and rely solely
+    on the presence of a matching VALIDSIG line.
+    """
+    gpg_bin = shutil.which("gpg") or shutil.which("gpg2")
+    if not gpg_bin:
+        log.warning(
+            "gpg not found on PATH; Syncthing release signature will NOT be "
+            "verified. Install gpg (or Gpg4win on Windows) to enable supply-"
+            "chain verification. Falling back to hash-only check."
+        )
+        return
+    with tempfile.TemporaryDirectory() as home:
+        Path(home).chmod(0o700)
+        status = _gpg_verify(gpg_bin, signed_asc, home)
+    pinned = SYNCTHING_RELEASE_FINGERPRINT.upper()
+    for line in status.splitlines():
+        # Line shape: "[GNUPG:] VALIDSIG <fingerprint> <created> <timestamp> ..."
+        if line.startswith("[GNUPG:] VALIDSIG "):
+            fields = line.split()
+            # fields[0] == "[GNUPG:]", fields[1] == "VALIDSIG", fields[2] == fingerprint
+            if len(fields) >= 3 and fields[2].upper() == pinned:
+                log.info(
+                    "Syncthing sha256sum.txt.asc signature verified (key %s)",
+                    pinned,
+                )
+                return
+    raise SyncthingError(
+        "Syncthing sha256sum.txt.asc signature is invalid or was not signed by "
+        f"the pinned release key ({pinned}). Refusing to extract. This may "
+        "indicate a tampered download or a Syncthing release-key rotation; "
+        "re-run, and if it persists this may need a clipsync update."
+    )
+
+
+def _fetch_official_sha256sums(version: str) -> dict[str, str]:
+    """Fetch Syncthing's published sha256sum.txt.asc for *version* and
+    return its parsed ``<hash>  <filename>`` mapping.
+
+    The signature is verified first (see :func:`_verify_release_signature`);
+    on a signature failure this raises SyncthingError rather than
+    returning hashes, so a tampered sums file can never reach the hash
+    comparison. Returns an empty dict only if the file cannot be fetched
+    (network error), in which case archive verification is skipped.
+    """
+    try:
+        data = _download(_asc_url(version))
+    except URLError as exc:
+        log.warning("Failed to fetch Syncthing sha256sum.txt.asc: %s", exc)
+        return {}
+    _verify_release_signature(data)
+    return _parse_sha256sums(data)
+
+
 def _archive_filename(version: str) -> str:
     """Return the release asset filename for this platform and version."""
     os_name, arch, ext = _platform_archive_info()
@@ -121,8 +236,9 @@ def _archive_filename(version: str) -> str:
 def _verify_archive_hash(data: bytes, version: str) -> None:
     """Raise SyncthingError if *data* (the downloaded archive bytes) does
     not match the official Syncthing sha256sum.txt.asc entry for this
-    platform. Falls back to a logged warning (not an error) if the
-    official sums file cannot be fetched or the platform entry is absent.
+    platform, or if that sums file's PGP signature is invalid. Falls back
+    to a logged warning (not an error) only when the sums file cannot be
+    fetched or the platform entry is absent.
     """
     try:
         archive_name = _archive_filename(version)

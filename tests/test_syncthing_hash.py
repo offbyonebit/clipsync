@@ -27,7 +27,8 @@ _SAMPLE_SHA256_CONTENT = (
 )
 
 
-def test_fetch_official_sha256sums_parses_pgp_wrapped_file() -> None:
+def test_fetch_official_sha256sums_parses_pgp_wrapped_file(monkeypatch) -> None:
+    monkeypatch.setattr(syncthing, "_verify_release_signature", lambda _d: None)
     with patch("clipsync.syncthing._download", return_value=_SAMPLE_SHA256_CONTENT.encode("ascii")):
         sums = syncthing._fetch_official_sha256sums("v2.0.16")
     assert sums == {
@@ -37,8 +38,9 @@ def test_fetch_official_sha256sums_parses_pgp_wrapped_file() -> None:
     }
 
 
-def test_fetch_official_sha256sums_normalizes_v_prefix() -> None:
+def test_fetch_official_sha256sums_normalizes_v_prefix(monkeypatch) -> None:
     """Version may be passed with or without the leading 'v'."""
+    monkeypatch.setattr(syncthing, "_verify_release_signature", lambda _d: None)
     seen_urls = []
 
     def fake_download(url: str) -> bytes:
@@ -58,7 +60,8 @@ def test_fetch_official_sha256sums_returns_empty_on_network_error() -> None:
     assert sums == {}
 
 
-def test_fetch_official_sha256sums_ignores_malformed_lines() -> None:
+def test_fetch_official_sha256sums_ignores_malformed_lines(monkeypatch) -> None:
+    monkeypatch.setattr(syncthing, "_verify_release_signature", lambda _d: None)
     bad_content = (
         "-----BEGIN PGP SIGNED MESSAGE-----\n"
         "Hash: SHA256\n"
@@ -72,6 +75,72 @@ def test_fetch_official_sha256sums_ignores_malformed_lines() -> None:
     assert sums == {
         "syncthing-linux-amd64-v2.0.16.tar.gz": "d5ca379993844b0e6e4fced05e3ac4a6c4513dee916ab65516c6d07d5e53e317",
     }
+
+
+def test_fetch_official_sha256sums_raises_on_bad_signature(monkeypatch) -> None:
+    """A tampered / forged sums file must never reach the hash comparison:
+    _fetch_official_sha256sums raises SyncthingError when the signature
+    check fails, instead of returning hashes."""
+    with patch("clipsync.syncthing._download", return_value=_SAMPLE_SHA256_CONTENT.encode("ascii")):
+        monkeypatch.setattr(
+            syncthing,
+            "_verify_release_signature",
+            lambda _d: (_ for _ in ()).throw(SyncthingError("bad sig")),
+        )
+        with pytest.raises(SyncthingError, match="bad sig"):
+            syncthing._fetch_official_sha256sums("v2.0.16")
+
+
+# ---------------------------------------------------------------------------
+# PGP signature verification
+# ---------------------------------------------------------------------------
+
+from clipsync._release_key import SYNCTHING_RELEASE_FINGERPRINT  # noqa: E402
+
+_FP = SYNCTHING_RELEASE_FINGERPRINT
+
+
+def _validsig_status(fp: str) -> str:
+    # Shape matches gpg --status-fd output (fingerprint is field 3).
+    return f"[GNUPG:] NEWSIG\n[GNUPG:] VALIDSIG {fp} 2026-04-07 1775572971 0 4 0 1 8 01 {fp}\n"
+
+
+def test_verify_release_signature_accepts_pinned_key(monkeypatch) -> None:
+    monkeypatch.setattr(syncthing.shutil, "which", lambda _n: "/usr/bin/gpg")
+    monkeypatch.setattr(syncthing, "_gpg_verify", lambda *_a: _validsig_status(_FP))
+    # Should not raise.
+    syncthing._verify_release_signature(b"-----BEGIN PGP SIGNED MESSAGE-----")
+
+
+def test_verify_release_signature_rejects_wrong_key(monkeypatch) -> None:
+    monkeypatch.setattr(syncthing.shutil, "which", lambda _n: "/usr/bin/gpg")
+    other = "A" * 40
+    monkeypatch.setattr(syncthing, "_gpg_verify", lambda *_a: _validsig_status(other))
+    with pytest.raises(SyncthingError, match="invalid or was not signed"):
+        syncthing._verify_release_signature(b"-----BEGIN PGP SIGNED MESSAGE-----")
+
+
+def test_verify_release_signature_rejects_badsig(monkeypatch) -> None:
+    monkeypatch.setattr(syncthing.shutil, "which", lambda _n: "/usr/bin/gpg")
+    monkeypatch.setattr(
+        syncthing,
+        "_gpg_verify",
+        lambda *_a: "[GNUPG:] BADSIG E5665F9BD5970C47 Syncthing Release Management\n",
+    )
+    with pytest.raises(SyncthingError, match="invalid or was not signed"):
+        syncthing._verify_release_signature(b"-----BEGIN PGP SIGNED MESSAGE-----")
+
+
+def test_verify_release_signature_falls_back_when_gpg_absent(monkeypatch, caplog) -> None:
+    """Without gpg on PATH we must NOT refuse the download -- we log a
+    warning and fall back to hash-only (preserves prior behavior on
+    systems like stock Windows)."""
+    monkeypatch.setattr(syncthing.shutil, "which", lambda _n: None)
+    import logging
+
+    with caplog.at_level(logging.WARNING):
+        syncthing._verify_release_signature(b"-----BEGIN PGP SIGNED MESSAGE-----")
+    assert any("signature will NOT be verified" in r.message for r in caplog.records)
 
 
 def test_verify_archive_hash_succeeds_on_match(monkeypatch) -> None:
