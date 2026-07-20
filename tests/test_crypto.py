@@ -89,9 +89,9 @@ def test_partial_magic_returns_none() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_encrypt_produces_v1_magic() -> None:
+def test_encrypt_produces_v2_magic() -> None:
     ct = crypto.encrypt(b"x", "pw")
-    assert ct.startswith(crypto._ENC_MAGIC_V1)
+    assert ct.startswith(crypto._ENC_MAGIC_V2)
 
 
 def test_each_encrypt_uses_random_salt() -> None:
@@ -109,9 +109,11 @@ def test_each_encrypt_uses_random_salt() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_is_encrypted_detects_v0_and_v1() -> None:
-    v1 = crypto.encrypt(b"x", "pw")
+def test_is_encrypted_detects_all_versions() -> None:
+    v2 = crypto.encrypt(b"x", "pw")
+    v1 = crypto._ENC_MAGIC_V1 + b"\x00" * 16 + b"token"
     v0 = crypto._ENC_MAGIC_V0 + b"legacy-token-bytes"
+    assert crypto.is_encrypted(v2)
     assert crypto.is_encrypted(v1)
     assert crypto.is_encrypted(v0)
     assert not crypto.is_encrypted(b"plain text")
@@ -129,12 +131,12 @@ def _make_v0_payload(plaintext: bytes, passphrase: str) -> bytes:
     return crypto._ENC_MAGIC_V0 + token
 
 
-def _derive_key(passphrase: str, salt: bytes) -> bytes:
+def _derive_key(passphrase: str, salt: bytes, iterations: int = 120_000) -> bytes:
     kdf = PBKDF2HMAC(
         algorithm=hashes.SHA256(),
         length=32,
         salt=salt,
-        iterations=120_000,
+        iterations=iterations,
     )
     return base64.urlsafe_b64encode(kdf.derive(passphrase.encode("utf-8")))
 
@@ -149,3 +151,58 @@ def test_v0_legacy_payload_decrypts() -> None:
 def test_v0_wrong_passphrase_returns_none() -> None:
     payload = _make_v0_payload(b"data", "correct")
     assert crypto.decrypt(payload, "wrong") is None
+
+
+# ---------------------------------------------------------------------------
+# V1 backward compatibility (older releases wrote v1 with 120k iterations)
+# ---------------------------------------------------------------------------
+
+
+def _make_v1_payload(plaintext: bytes, passphrase: str, salt: bytes = b"\x01" * 16) -> bytes:
+    key = _derive_key(passphrase, salt)
+    token = Fernet(key).encrypt(plaintext)
+    return crypto._ENC_MAGIC_V1 + salt + token
+
+
+def test_v1_legacy_payload_still_decrypts() -> None:
+    """A payload written by an older release (v1, 120k iterations, random
+    salt) must still decrypt after the v2 iteration bump."""
+    v1_payload = _make_v1_payload(b"older release data", "pw")
+    assert crypto.is_encrypted(v1_payload)
+    assert crypto.decrypt(v1_payload, "pw") == b"older release data"
+
+
+def test_v1_wrong_passphrase_returns_none() -> None:
+    payload = _make_v1_payload(b"data", "correct")
+    assert crypto.decrypt(payload, "wrong") is None
+
+
+def test_decrypt_truncated_v2_payload_returns_none() -> None:
+    truncated = crypto._ENC_MAGIC_V2 + b"\x00\x01"
+    assert crypto.decrypt(truncated, "pw") is None
+
+
+# ---------------------------------------------------------------------------
+# V2 iteration count (the whole point of the bump)
+# ---------------------------------------------------------------------------
+
+
+def test_v2_actually_uses_600k_iterations() -> None:
+    """Prove v2 derives the Fernet key with 600k iterations, not 120k.
+
+    Re-derives the key at 600k (should decrypt) and at 120k (should NOT),
+    pinning the iteration count rather than just asserting round-trip.
+    """
+    from cryptography.fernet import InvalidToken
+
+    payload = b"secret"
+    ct = crypto.encrypt(payload, "pw")
+    salt = ct[len(crypto._ENC_MAGIC_V2) : len(crypto._ENC_MAGIC_V2) + crypto._SALT_LEN]
+    token = ct[len(crypto._ENC_MAGIC_V2) + crypto._SALT_LEN :]
+
+    key_600k = _derive_key("pw", salt, iterations=600_000)
+    assert Fernet(key_600k).decrypt(token) == payload
+
+    key_120k = _derive_key("pw", salt, iterations=120_000)
+    with pytest.raises(InvalidToken):
+        Fernet(key_120k).decrypt(token)
