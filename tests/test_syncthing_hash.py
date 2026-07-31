@@ -155,11 +155,14 @@ def test_verify_archive_hash_succeeds_on_match(monkeypatch) -> None:
     # Derive the name for the platform the test is running on. Hardcoding the
     # Linux asset made this pass vacuously everywhere else: the lookup missed,
     # verification was skipped, and the test asserted nothing.
-    name = syncthing._archive_filename("v2.0.16")
+    #
+    # Uses a version with no pinned manifest entry, so this still exercises
+    # the fetched-sums path. The pinned path is covered in test_pinned_hashes.
+    name = syncthing._archive_filename("v9.9.9")
 
     monkeypatch.setattr(syncthing, "_fetch_official_sha256sums", lambda _v: {name: expected})
     # Should not raise.
-    syncthing._verify_archive_hash(archive, "v2.0.16")
+    syncthing._verify_archive_hash(archive, "v9.9.9")
 
 
 def test_verify_archive_hash_raises_on_mismatch(monkeypatch) -> None:

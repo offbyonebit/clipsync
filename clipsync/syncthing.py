@@ -35,6 +35,7 @@ import requests
 
 from . import config
 from ._release_key import SYNCTHING_RELEASE_FINGERPRINT, SYNCTHING_RELEASE_KEY
+from ._syncthing_hashes import SYNCTHING_PINNED_SHA256
 
 log = logging.getLogger(__name__)
 
@@ -240,24 +241,52 @@ def _archive_filename(version: str) -> str:
     return f"syncthing-{os_name}-{arch}-{v}.{ext}"
 
 
-def _verify_archive_hash(data: bytes, version: str) -> None:
-    """Raise SyncthingError unless *data* (the downloaded archive bytes)
-    matches the official Syncthing sha256sum.txt.asc entry for this
-    platform.
+def _expected_archive_hash(archive_name: str, version: str) -> str:
+    """Return the trusted SHA-256 for *archive_name*.
 
-    Every failure path is fatal, including "the sums file had no entry for
-    this platform". The archive is about to be extracted and executed, so
-    an unverifiable download must never be trusted; a missing entry is
-    indistinguishable from one an attacker stripped.
+    Prefers the manifest pinned in the source tree. Those hashes come from a
+    sha256sum.txt.asc whose PGP signature was verified against the pinned
+    release key at release-prep time, by
+    ``tools/refresh_syncthing_hashes.py``.
+
+    Pinning matters because the runtime signature check needs gpg on PATH,
+    and stock Windows and macOS do not ship it, so for most users that check
+    degraded to hash-only and the hash arrived from the same origin as the
+    download it was meant to vouch for. A pinned manifest moves the trust
+    anchor into reviewed source and takes the network out of the decision.
+
+    The live fetch remains only as a fallback for a version we have not
+    pinned, which normally means an explicitly requested non-default one.
     """
-    archive_name = _archive_filename(version)
+    v = version if version.startswith("v") else f"v{version}"
+    pinned = SYNCTHING_PINNED_SHA256.get(v, {}).get(archive_name)
+    if pinned is not None:
+        log.debug("Using pinned hash for %s", archive_name)
+        return pinned
 
-    sums = _fetch_official_sha256sums(version)
-    expected = sums.get(archive_name)
+    log.warning(
+        "No pinned hash for %s; falling back to fetching sha256sum.txt.asc. "
+        "Run tools/refresh_syncthing_hashes.py to pin this version.",
+        archive_name,
+    )
+    expected = _fetch_official_sha256sums(version).get(archive_name)
     if expected is None:
         raise SyncthingError(
             f"No hash for {archive_name} in sha256sum.txt.asc. Refusing to extract an unverified Syncthing binary."
         )
+    return expected
+
+
+def _verify_archive_hash(data: bytes, version: str) -> None:
+    """Raise SyncthingError unless *data* (the downloaded archive bytes)
+    matches the trusted SHA-256 for this platform's release archive.
+
+    Every failure path is fatal. The archive is about to be extracted and
+    executed, so an unverifiable download must never be trusted; a missing
+    hash is indistinguishable from one an attacker stripped.
+    """
+    archive_name = _archive_filename(version)
+    expected = _expected_archive_hash(archive_name, version)
 
     import hashlib
 
