@@ -51,6 +51,16 @@ _HOSTNAME = _safe_hostname()
 
 _PNG_HEADER = b"\x89PNG\r\n\x1a\n"
 
+
+class EncryptedPayloadError(RuntimeError):
+    """Refused to overwrite a ciphertext payload we cannot decrypt.
+
+    Raised when the shared file holds a CSENC payload this process cannot
+    read (no passphrase, wrong passphrase, or a payload version written by a
+    newer build). Overwriting it would destroy the peer's data.
+    """
+
+
 # Sentinel pushed onto the XFixes queue by stop() to unblock the OUT loop.
 _STOP_SENTINEL = object()
 
@@ -564,9 +574,27 @@ class ClipboardSync:
             log.warning("Clipboard file is not valid UTF-8 and not encrypted; ignoring")
             return None
 
+    def _refuse_if_unreadable_ciphertext(self, path: Path) -> None:
+        """Raise EncryptedPayloadError if *path* holds a CSENC payload that this
+        process cannot decrypt. Overwriting it would destroy a peer's data."""
+        if not path.exists():
+            return
+        try:
+            data = path.read_bytes()
+        except OSError:
+            return
+        if not is_encrypted(data):
+            return
+        passphrase = self._passphrase()
+        if not passphrase:
+            raise EncryptedPayloadError(path)
+        if decrypt(data, passphrase) is None:
+            raise EncryptedPayloadError(path)
+
     def _write_file(self, text: str) -> None:
         """Atomic write of the shared file, encrypting if a passphrase is set."""
         path = self.clipboard_file
+        self._refuse_if_unreadable_ciphertext(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         passphrase = self._passphrase()
         encoded = text.encode("utf-8")
@@ -620,6 +648,7 @@ class ClipboardSync:
     def _write_image_file(self, png_bytes: bytes) -> None:
         """Atomic write of the shared image file, encrypting if a passphrase is set."""
         path = self.clipboard_image_file
+        self._refuse_if_unreadable_ciphertext(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         passphrase = self._passphrase()
         payload = encrypt(png_bytes, passphrase) if passphrase else png_bytes
@@ -653,12 +682,33 @@ class ClipboardSync:
                     with self._lock:
                         self._last_synced = image
                     return
+                self._warn_if_locked_ciphertext(img_path)
             content = self._read_file()
             if content is not None:
                 with self._lock:
                     self._last_synced = content
+            else:
+                self._warn_if_locked_ciphertext(text_path)
         except Exception:
             log.warning("Could not read existing clipboard file")
+
+    def _warn_if_locked_ciphertext(self, path: Path) -> None:
+        """Log once if *path* holds a CSENC payload we cannot read.
+
+        Outbound sync to this file is refused while that is true (see
+        _refuse_if_unreadable_ciphertext), so say so plainly rather than
+        failing silently.
+        """
+        try:
+            if not path.exists() or not is_encrypted(path.read_bytes()):
+                return
+        except OSError:
+            return
+        log.warning(
+            "%s holds an encrypted payload this build cannot decrypt; outbound sync "
+            "for it is paused until a matching passphrase is configured",
+            path.name,
+        )
 
     def _is_paused(self) -> bool:
         return bool(self._settings.get("sync_paused"))
@@ -792,10 +842,18 @@ class ClipboardSync:
             with self._lock:
                 if image == self._last_synced:
                     return
+                previous_last_synced = self._last_synced
                 self._last_synced = image
             try:
                 self._write_image_file(image)
                 log.info("OUT [%s]: %d bytes image written", _HOSTNAME, len(image))
+            except EncryptedPayloadError:
+                with self._lock:
+                    self._last_synced = previous_last_synced
+                reason = "Refusing to overwrite encrypted clipboard image file (cannot decrypt)"
+                if reason != self._last_decrypt_error:
+                    log.warning("OUT [%s]: %s", _HOSTNAME, reason)
+                    self._last_decrypt_error = reason
             except OSError:
                 log.exception("OUT [%s]: Failed to write image file", _HOSTNAME)
             return
@@ -806,11 +864,19 @@ class ClipboardSync:
         with self._lock:
             if current == self._last_synced:
                 return
+            previous_last_synced = self._last_synced
             self._last_synced = current
         try:
             self._write_file(current)
             log.info("OUT [%s]: %d chars written", _HOSTNAME, len(current))
             self._history.add_entry(current, "local")
+        except EncryptedPayloadError:
+            with self._lock:
+                self._last_synced = previous_last_synced
+            reason = "Refusing to overwrite encrypted clipboard file (cannot decrypt)"
+            if reason != self._last_decrypt_error:
+                log.warning("OUT [%s]: %s", _HOSTNAME, reason)
+                self._last_decrypt_error = reason
         except OSError:
             log.exception("OUT [%s]: Failed to write clipboard file", _HOSTNAME)
 

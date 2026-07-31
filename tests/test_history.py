@@ -190,3 +190,39 @@ def test_history_entry_roundtrip_dict() -> None:
     # Default source is "local" when missing from dict.
     partial = {"text": "y", "timestamp": 2.0}
     assert HistoryEntry.from_dict(partial).source == "local"
+
+
+def test_concurrent_add_entry_persists_every_entry(settings) -> None:
+    """Regression: _persist() used to serialize self._entries outside the lock.
+
+    Concurrent add_entry() calls could interleave a mutation into the middle of
+    another thread's snapshot, so the file on disk lost entries or raised
+    "list changed size during iteration" mid-serialization.
+    """
+    import json
+    import threading
+
+    h = ClipboardHistory(settings)
+    texts = [f"entry-{i:03d}" for i in range(40)]
+    start = threading.Barrier(len(texts))
+    errors: list[BaseException] = []
+
+    def add(text: str) -> None:
+        try:
+            start.wait(timeout=5)
+            h.add_entry(text)
+        except BaseException as exc:  # noqa: BLE001 - the test is what surfaces it
+            errors.append(exc)
+
+    threads = [threading.Thread(target=add, args=(t,)) for t in texts]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10)
+
+    assert not errors, f"add_entry raised under concurrency: {errors!r}"
+    in_memory = {e.text for e in h.get_entries()}
+    assert in_memory == set(texts)
+
+    persisted = json.loads(config.HISTORY_FILE.read_bytes())
+    assert {e["text"] for e in persisted["entries"]} == in_memory

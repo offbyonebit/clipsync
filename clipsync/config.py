@@ -7,6 +7,7 @@ depend on it without cycles.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
@@ -146,10 +147,16 @@ class Settings:
 
     def _persist_locked(self) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self._path.with_suffix(".json.tmp")
-        with tmp.open("w", encoding="utf-8") as fh:
-            json.dump(self._data, fh, indent=2)
-        os.replace(tmp, self._path)
+        tmp = self._path.with_name(f"{self._path.name}.{os.getpid()}.tmp")
+        try:
+            with tmp.open("w", encoding="utf-8") as fh:
+                json.dump(self._data, fh, indent=2)
+            set_file_permissions(tmp)
+            os.replace(tmp, self._path)
+        finally:
+            if tmp.exists():
+                with contextlib.suppress(OSError):
+                    tmp.unlink(missing_ok=True)
         set_file_permissions(self._path)
         try:
             self._mtime_ns = self._path.stat().st_mtime_ns
