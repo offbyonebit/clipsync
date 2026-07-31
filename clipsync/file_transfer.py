@@ -15,6 +15,7 @@ from __future__ import annotations
 import logging
 import os
 import shutil
+import threading
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -84,7 +85,11 @@ class _FileReceiveHandler(FileSystemEventHandler):
         self._on_received = on_received
         # Guard against duplicate events (watchdog can fire multiple times for
         # a single file, e.g. created + modified during Syncthing's atomic write).
+        # watchdog dispatches from a thread pool on Windows, so the
+        # check-then-add below has to be atomic or two events for the same
+        # file can both pass it and deliver the file twice.
         self._seen: set[str] = set()
+        self._seen_lock = threading.Lock()
 
     def _handle(self, path: Path) -> None:
         # Expected layout: files/<sender_hostname>/<filename>
@@ -96,9 +101,10 @@ class _FileReceiveHandler(FileSystemEventHandler):
         if path.name.startswith(".syncthing.") and path.name.endswith(".tmp"):
             return
         key = str(path)
-        if key in self._seen:
-            return
-        self._seen.add(key)
+        with self._seen_lock:
+            if key in self._seen:
+                return
+            self._seen.add(key)
         log.info("FILE IN [%s]: %s from %s", _HOSTNAME, path.name, sender)
         try:
             self._on_received(path, sender)

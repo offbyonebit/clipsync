@@ -214,14 +214,21 @@ def _fetch_official_sha256sums(version: str) -> dict[str, str]:
     The signature is verified first (see :func:`_verify_release_signature`);
     on a signature failure this raises SyncthingError rather than
     returning hashes, so a tampered sums file can never reach the hash
-    comparison. Returns an empty dict only if the file cannot be fetched
-    (network error), in which case archive verification is skipped.
+    comparison.
+
+    A fetch failure also raises. We are about to execute the archive we
+    downloaded, so "could not check" has to be fatal: an attacker able to
+    drop or poison this one request would otherwise get an unverified
+    binary run, which is precisely the threat the hash check exists to
+    close. Availability is the cost, and it is the correct trade here.
     """
     try:
         data = _download(_asc_url(version))
     except URLError as exc:
-        log.warning("Failed to fetch Syncthing sha256sum.txt.asc: %s", exc)
-        return {}
+        raise SyncthingError(
+            f"Failed to fetch Syncthing sha256sum.txt.asc: {exc}. Refusing to "
+            "extract an unverified Syncthing binary. Check your network and retry."
+        ) from exc
     _verify_release_signature(data)
     return _parse_sha256sums(data)
 
@@ -234,26 +241,23 @@ def _archive_filename(version: str) -> str:
 
 
 def _verify_archive_hash(data: bytes, version: str) -> None:
-    """Raise SyncthingError if *data* (the downloaded archive bytes) does
-    not match the official Syncthing sha256sum.txt.asc entry for this
-    platform, or if that sums file's PGP signature is invalid. Falls back
-    to a logged warning (not an error) only when the sums file cannot be
-    fetched or the platform entry is absent.
+    """Raise SyncthingError unless *data* (the downloaded archive bytes)
+    matches the official Syncthing sha256sum.txt.asc entry for this
+    platform.
+
+    Every failure path is fatal, including "the sums file had no entry for
+    this platform". The archive is about to be extracted and executed, so
+    an unverifiable download must never be trusted; a missing entry is
+    indistinguishable from one an attacker stripped.
     """
-    try:
-        archive_name = _archive_filename(version)
-    except SyncthingError:
-        log.warning("Cannot determine platform for archive hash verification; skipping")
-        return
+    archive_name = _archive_filename(version)
 
     sums = _fetch_official_sha256sums(version)
     expected = sums.get(archive_name)
     if expected is None:
-        log.warning(
-            "No hash for %s in sha256sum.txt.asc; skipping archive verification",
-            archive_name,
+        raise SyncthingError(
+            f"No hash for {archive_name} in sha256sum.txt.asc. Refusing to extract an unverified Syncthing binary."
         )
-        return
 
     import hashlib
 
@@ -327,24 +331,87 @@ def _binary_version(binary: Path) -> str:
     return ""
 
 
+def _file_sha256(path: Path) -> str:
+    import hashlib
+
+    digest = hashlib.sha256()
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _binary_digest_path() -> Path:
+    return config.SYNCTHING_BIN_DIR / "syncthing.sha256"
+
+
+def _record_binary_digest(binary: Path, version: str) -> None:
+    """Pin the hash of a binary we just extracted from a verified archive."""
+    want = version if version.startswith("v") else f"v{version}"
+    path = _binary_digest_path()
+    try:
+        path.write_text(f"{want} {_file_sha256(binary)}\n", encoding="utf-8")
+        config.set_file_permissions(path)
+    except OSError:
+        log.warning("Could not record Syncthing binary digest at %s", path)
+
+
+def _binary_digest_matches(binary: Path, version: str) -> bool:
+    """True if *binary* still hashes to what we recorded at install time.
+
+    This is deliberately weaker than it looks, and the limit is worth being
+    explicit about: the digest file lives beside the binary, so anyone who
+    can overwrite one can overwrite the other. What it does buy is detection
+    of the cases that actually happen -- Syncthing self-upgrading over its
+    own binary, a partial or corrupted extraction, and any tampering that
+    does not also know to rewrite the digest. Checking `--version` alone
+    buys none of that, since a replaced binary can simply print the string
+    we want to see.
+    """
+    want = version if version.startswith("v") else f"v{version}"
+    try:
+        recorded = _binary_digest_path().read_text(encoding="utf-8").split()
+    except OSError:
+        return False
+    if len(recorded) != 2 or recorded[0] != want:
+        return False
+    try:
+        return recorded[1] == _file_sha256(binary)
+    except OSError:
+        return False
+
+
 def ensure_binary(version: str = config.SYNCTHING_VERSION) -> Path:
     """Return the path to a working Syncthing binary at exactly *version*.
 
-    Re-downloads if the binary is missing, empty, or was self-upgraded to a
+    Re-downloads if the binary is missing, empty, was self-upgraded to a
     different version (Syncthing replaces its own binary on upgrade, which
-    would otherwise silently drift from the pinned version).
+    would otherwise silently drift from the pinned version), or no longer
+    matches the digest recorded when we installed it.
+
+    An offline start with a good binary stays working: the digest check is
+    local, so no network is touched on the happy path. An offline start with
+    a bad binary fails, which is intended -- running an unverifiable
+    Syncthing is worse than not starting.
     """
     binary = config.syncthing_binary_path()
+    want = version if version.startswith("v") else f"v{version}"
     if binary.exists() and binary.stat().st_size > 0:
         on_disk = _binary_version(binary)
-        want = version if version.startswith("v") else f"v{version}"
         if on_disk == want:
-            return binary
-        log.info(
-            "Syncthing binary is %s but pinned version is %s; re-downloading",
-            on_disk,
-            want,
-        )
+            if _binary_digest_matches(binary, version):
+                return binary
+            log.warning(
+                "Syncthing binary at %s reports %s but does not match the digest recorded at install; re-downloading",
+                binary,
+                on_disk,
+            )
+        else:
+            log.info(
+                "Syncthing binary is %s but pinned version is %s; re-downloading",
+                on_disk,
+                want,
+            )
     _, _, ext = _platform_archive_info()
     url = _release_asset_url(version)
     try:
@@ -353,6 +420,7 @@ def ensure_binary(version: str = config.SYNCTHING_VERSION) -> Path:
         raise SyncthingError(f"Failed to download Syncthing: {exc}") from exc
     _verify_archive_hash(data, version)
     extracted = _extract_binary(data, ext, config.SYNCTHING_BIN_DIR)
+    _record_binary_digest(extracted, version)
     log.info("Installed syncthing binary at %s", extracted)
     return extracted
 

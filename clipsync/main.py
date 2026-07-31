@@ -416,11 +416,43 @@ class ClipSyncApp:
         self._notify("Device connected", f"Now syncing clipboard with {device_id[:7]}")
 
     def _on_folder_changed(self, new_path: str) -> None:
+        """Repoint every consumer of the sync folder, not just the clipboard.
+
+        Syncthing reads the folder path once, when prepare_home() patches
+        config.xml, and FileTransfer's observer is scheduled on the old
+        directory at construction. Restarting only ClipboardSync left both
+        pointing at the previous folder: clipboard.txt was written where no
+        peer was replicating it, so sync silently stopped working.
+        """
         Path(new_path).mkdir(parents=True, exist_ok=True)
+        # The settings UI runs in its own process and persists this before
+        # emitting the event, and Settings reloads on mtime change, so this is
+        # normally a no-op. Set it anyway: prepare_home() below reads the
+        # folder back out of settings, and that read must not depend on
+        # another process having already written it.
+        self.settings.set("sync_folder", new_path)
+
         if self.clipboard is not None:
             self.clipboard.stop()
-            self.clipboard = ClipboardSync(self.settings)
-            self.clipboard.start()
+            self.clipboard = None
+        if self.file_transfer is not None:
+            self.file_transfer.stop()
+            self.file_transfer = None
+
+        # Re-patches config.xml with the new folder path, then restarts the
+        # daemon so it actually picks the change up. prepare_home() is
+        # idempotent: it regenerates nothing when a home already exists.
+        try:
+            self.syncthing.stop()
+            self._start_syncthing_with_retry()
+        except Exception:
+            log.exception("Failed to restart Syncthing for new sync folder %s", new_path)
+
+        self.clipboard = ClipboardSync(self.settings)
+        self.clipboard.start()
+        self.file_transfer = FileTransfer(self.settings, on_received=self._on_file_received)
+        self.file_transfer.start()
+        log.info("Sync folder changed to %s; Syncthing, clipboard and file transfer restarted", new_path)
 
     def _send_file_worker(self, source: Path) -> None:
         if self.file_transfer is None:

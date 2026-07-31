@@ -348,6 +348,19 @@ class _XlibClipboardOwner:
                 pass
 
 
+def _truncate_for_log(value: object, limit: int = 40) -> str:
+    """repr *value* for a log line, truncating long payloads.
+
+    bytes needs this as much as str does: _last_synced holds the whole
+    clipboard, so once an image is synced it is megabytes of PNG. The
+    previous guard only tested str, so every heartbeat repr()'d the full
+    image into the log and churned the rotating handler.
+    """
+    if isinstance(value, str | bytes) and len(value) > limit:
+        return repr(value[:limit]) + "..."
+    return repr(value)
+
+
 def _normalize_newlines(s: str) -> str:
     """Collapse CRLF/CR to LF so Windows's clipboard normalization does not
     look like a real change to the OUT loop after a remote update."""
@@ -844,7 +857,7 @@ class ClipboardSync:
                 log.debug(
                     "HEARTBEAT (host=%s): last_synced=%s, paused=%s",
                     _HOSTNAME,
-                    (repr(last[:40]) + "...") if isinstance(last, str) and len(last) > 40 else repr(last),
+                    _truncate_for_log(last),
                     self._is_paused(),
                 )
 
@@ -868,6 +881,11 @@ class ClipboardSync:
                     log.warning("OUT [%s]: %s", _HOSTNAME, reason)
                     self._last_decrypt_error = reason
             except OSError:
+                # Roll back too: _last_synced is the "already sent" guard, so
+                # leaving it set after a failed write means every later tick
+                # sees this image as synced and it is never retried.
+                with self._lock:
+                    self._last_synced = previous_last_synced
                 log.exception("OUT [%s]: Failed to write image file", _HOSTNAME)
             return
 
@@ -891,6 +909,8 @@ class ClipboardSync:
                 log.warning("OUT [%s]: %s", _HOSTNAME, reason)
                 self._last_decrypt_error = reason
         except OSError:
+            with self._lock:
+                self._last_synced = previous_last_synced
             log.exception("OUT [%s]: Failed to write clipboard file", _HOSTNAME)
 
     def _in_loop(self) -> None:
@@ -980,7 +1000,10 @@ class _ClipboardFileHandler(FileSystemEventHandler):
     def __init__(self, sync: ClipboardSync) -> None:
         super().__init__()
         self._sync = sync
-        self._debounce_until = 0.0
+        # Per-path deadlines. A single shared deadline let a clipboard.txt and
+        # a clipboard.png update arriving within the debounce window suppress
+        # each other, so only one of the two was ever applied.
+        self._debounce_until: dict[str, float] = {}
         # Fast name-based pre-filter to avoid Path.resolve() on every event.
         # Syncthing generates many temp-file events; most are irrelevant.
         self._target_names = {config.CLIPBOARD_FILENAME, config.CLIPBOARD_IMAGE_FILENAME}
@@ -1001,9 +1024,10 @@ class _ClipboardFileHandler(FileSystemEventHandler):
         if not self._matches(path):
             return
         now = time.monotonic()
-        if now < self._debounce_until:
+        key = str(Path(path).name)
+        if now < self._debounce_until.get(key, 0.0):
             return
-        self._debounce_until = now + 0.1
+        self._debounce_until[key] = now + 0.1
         # Non-blocking: hand off to _in_loop so the watchdog thread pool
         # is never held by clipboard I/O (avoids pool exhaustion on Windows).
         self._sync._in_queue.put(path)
