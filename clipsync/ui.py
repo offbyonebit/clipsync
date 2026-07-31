@@ -9,11 +9,14 @@ to stdout; the parent's UIController reads and dispatches them.
 
 from __future__ import annotations
 
+import base64
+import io
 import json
 import logging
 import subprocess
 import sys
 import threading
+import tkinter
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, cast
@@ -29,6 +32,25 @@ from .syncthing import SyncthingClient
 log = logging.getLogger(__name__)
 
 _WINDOWS = ("pairing", "devices", "settings", "logs", "incoming", "tabbed", "history", "file_picker")
+
+
+def _tk_image(img: Image.Image) -> tkinter.PhotoImage:
+    """Build a Tk image from a PIL image without going through PIL.ImageTk.
+
+    ImageTk needs _imagingtk to resolve Tcl/Tk symbols at runtime, which fails
+    on interpreters that compile _tkinter directly into the binary (the
+    python-build-standalone builds uv installs). The failure is a bare
+    "bad argument type for built-in operation" that kills the whole window
+    process. Tk 8.6 decodes PNG natively, so round-trip through PNG bytes and
+    skip Pillow's Tk bridge entirely.
+
+    CTkLabel.configure(image=...) accepts a plain Tk image; it only loses
+    CTkImage's HiDPI rescaling, and every caller here already renders at a
+    fixed pixel size.
+    """
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return tkinter.PhotoImage(data=base64.b64encode(buf.getvalue()).decode("ascii"))
 
 
 def _center_window(window: ctk.CTkToplevel | ctk.CTk, width: int, height: int) -> None:
@@ -376,9 +398,9 @@ class _PairingContent:
     def _render_qr(self, device_id: str) -> None:
         qr_img = pairing.generate_qr(device_id, box_size=4, border=2)
         qr_img = qr_img.resize((110, 110), Image.Resampling.NEAREST)
-        ctk_img = ctk.CTkImage(light_image=qr_img, dark_image=qr_img, size=(110, 110))
-        self._qr_label.configure(image=ctk_img)
-        self._qr_label.image = ctk_img  # keep reference
+        tk_img = _tk_image(qr_img)
+        self._qr_label.configure(image=tk_img)
+        self._qr_label.image = tk_img  # keep reference
 
     def _copy_to_clipboard(self, value: str) -> None:
         try:
@@ -544,9 +566,9 @@ class _PairingContent:
         def update() -> None:
             if self._preview_label is None or not self._exists():
                 return
-            ctk_img = ctk.CTkImage(light_image=img, dark_image=img, size=(nw, nh))
-            self._preview_label.configure(image=ctk_img, text="")
-            self._preview_label.image = ctk_img  # keep reference
+            tk_img = _tk_image(img)
+            self._preview_label.configure(image=tk_img, text="")
+            self._preview_label.image = tk_img  # keep reference
 
         try:
             self._win.after(0, update)
