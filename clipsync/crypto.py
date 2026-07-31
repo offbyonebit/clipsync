@@ -27,9 +27,15 @@ from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
 log = logging.getLogger(__name__)
 
-_ENC_MAGIC_V0: Final = b"CSENC\x00"
-_ENC_MAGIC_V1: Final = b"CSENC\x01"
-_ENC_MAGIC_V2: Final = b"CSENC\x02"
+# Version-agnostic prefix. is_encrypted() matches on this rather than on the
+# known magics so that a payload written by a NEWER build is still recognized
+# as ciphertext by an older one. decrypt() will return None for a version it
+# does not know, and the caller must then refuse to overwrite the file rather
+# than treating it as plaintext and destroying the peer's data.
+_ENC_MAGIC_PREFIX: Final = b"CSENC"
+_ENC_MAGIC_V0: Final = _ENC_MAGIC_PREFIX + b"\x00"
+_ENC_MAGIC_V1: Final = _ENC_MAGIC_PREFIX + b"\x01"
+_ENC_MAGIC_V2: Final = _ENC_MAGIC_PREFIX + b"\x02"
 _SALT_LEN: Final = 16
 _LEGACY_SALT: Final = b"clipsync-v1-salt"
 
@@ -100,5 +106,11 @@ def decrypt(data: bytes, passphrase: str) -> bytes | None:
 
 
 def is_encrypted(data: bytes) -> bool:
-    """Return True if *data* starts with a recognized encryption header."""
-    return data.startswith(_ENC_MAGIC_V0) or data.startswith(_ENC_MAGIC_V1) or data.startswith(_ENC_MAGIC_V2)
+    """Return True if *data* looks like a CSENC payload of ANY version.
+
+    Deliberately matches the version-agnostic prefix, including versions this
+    build cannot decrypt. Callers use this to decide whether a file is safe to
+    overwrite, and an unknown future version is exactly the case where it is
+    not.
+    """
+    return data.startswith(_ENC_MAGIC_PREFIX)

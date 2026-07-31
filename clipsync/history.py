@@ -10,8 +10,10 @@ using the same Fernet-based scheme as the clipboard sync file.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
+import os
 import threading
 import time
 from dataclasses import dataclass
@@ -116,10 +118,11 @@ class ClipboardHistory:
         except (KeyError, ValueError) as exc:
             log.warning("Failed to load clipboard history: %s", exc)
 
-    def _persist(self) -> None:
+    def _persist_locked(self) -> None:
+        """Persist history to disk. Caller MUST already hold ``self._lock``."""
         if not self._enabled and len(self._entries) == 0:
             return
-        tmp = self._path.with_suffix(".json.tmp")
+        tmp = self._path.with_name(f"{self._path.name}.{os.getpid()}.tmp")
         try:
             self._path.parent.mkdir(parents=True, exist_ok=True)
             payload = json.dumps({"entries": [e.to_dict() for e in self._entries]}, indent=2).encode("utf-8")
@@ -131,6 +134,10 @@ class ClipboardHistory:
             config.set_file_permissions(self._path)
         except OSError as exc:
             log.warning("Failed to persist clipboard history: %s", exc)
+        finally:
+            if tmp.exists():
+                with contextlib.suppress(OSError):
+                    tmp.unlink(missing_ok=True)
 
     def add_entry(self, text: str, source: str = "local") -> None:
         if not self._enabled or not text:
@@ -144,7 +151,7 @@ class ClipboardHistory:
             while len(self._entries) > self._max_items:
                 self._entries.pop(0)
             self._prune_old()
-        self._persist()
+            self._persist_locked()
 
     def get_entries(self) -> list[HistoryEntry]:
         with self._lock:
@@ -153,7 +160,7 @@ class ClipboardHistory:
     def clear(self) -> None:
         with self._lock:
             self._entries.clear()
-        self._persist()
+            self._persist_locked()
 
     def get_max_items(self) -> int:
         return self._max_items
@@ -164,7 +171,7 @@ class ClipboardHistory:
                 self._max_items = value
                 while len(self._entries) > self._max_items:
                     self._entries.pop(0)
-            self._persist()
+                self._persist_locked()
 
     def is_enabled(self) -> bool:
         return self._enabled
