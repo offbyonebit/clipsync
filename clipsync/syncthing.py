@@ -283,6 +283,11 @@ def _extract_binary(data: bytes, ext: str, dest_dir: Path) -> Path:
             members = [m for m in zf.namelist() if m.endswith(f"/{target_name}") or m.endswith(target_name)]
             if not members:
                 raise SyncthingError("Syncthing binary not found in archive")
+            # The release archive also ships helper files (e.g.
+            # etc/firewall-ufw/syncthing) that share the binary's basename.
+            # The real binary sits directly under the top-level release dir,
+            # so prefer the shallowest matching path.
+            members.sort(key=lambda m: m.count("/"))
             with zf.open(members[0]) as src, target.open("wb") as dst:
                 shutil.copyfileobj(src, dst)
     else:
@@ -292,6 +297,7 @@ def _extract_binary(data: bytes, ext: str, dest_dir: Path) -> Path:
             ]
             if not tar_members:
                 raise SyncthingError("Syncthing binary not found in archive")
+            tar_members.sort(key=lambda m: m.name.count("/"))
             extracted = tf.extractfile(tar_members[0])
             if extracted is None:
                 raise SyncthingError("Failed to extract syncthing binary")
