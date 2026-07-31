@@ -46,6 +46,15 @@ from .history import ClipboardHistory
 
 log = logging.getLogger(__name__)
 
+# The OUT loop reads the system clipboard while the IN loop writes it, from two
+# different threads. The native clipboard is a single shared object on every
+# platform and is not thread-safe: on macOS, pyperclip's PyObjC backend (chosen
+# over pbcopy/pbpaste whenever AppKit is importable, as it is in the bundled
+# app) drives NSPasteboard directly, and a read racing a write segfaults inside
+# -[_NSPasteboardOwnersCollection handleOwnershipChange]. Serialize every native
+# clipboard touch through this lock.
+_CLIPBOARD_LOCK = threading.RLock()
+
 _HOSTNAME = _safe_hostname()
 
 
@@ -715,7 +724,8 @@ class ClipboardSync:
 
     def _read_clipboard(self) -> str | None:
         try:
-            value = pyperclip.paste()
+            with _CLIPBOARD_LOCK:
+                value = pyperclip.paste()
         except Exception as exc:
             msg = f"{type(exc).__name__}: {exc}"
             if msg != self._last_read_error:
@@ -745,7 +755,8 @@ class ClipboardSync:
                     self._last_write_error = msg
                 # fall through to pyperclip
         try:
-            pyperclip.copy(value)
+            with _CLIPBOARD_LOCK:
+                pyperclip.copy(value)
             log.debug("clipboard write (pyperclip) (%d chars)", len(value))
         except Exception as exc:
             msg = f"{type(exc).__name__}: {exc}"
@@ -760,14 +771,16 @@ class ClipboardSync:
 
     def _read_clipboard_image(self) -> bytes | None:
         try:
-            return _read_image_from_system_clipboard()
+            with _CLIPBOARD_LOCK:
+                return _read_image_from_system_clipboard()
         except Exception as exc:
             log.debug("Image clipboard read failed: %s", exc)
             return None
 
     def _write_clipboard_image(self, png_bytes: bytes) -> bool:
         try:
-            return _write_image_to_system_clipboard(png_bytes)
+            with _CLIPBOARD_LOCK:
+                return _write_image_to_system_clipboard(png_bytes)
         except Exception as exc:
             log.debug("Image clipboard write failed: %s", exc)
             return False
