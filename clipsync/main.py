@@ -30,8 +30,9 @@ from PIL import Image, ImageDraw
 
 from . import config, update
 from .clipboard import ClipboardSync
+from .crypto import StreamDecryptError, decrypt_file, is_encrypted_file
 from .debug import LogMirror
-from .file_transfer import FileTransfer
+from .file_transfer import ENCRYPTED_SUFFIX, FileTransfer
 from .pairing import PendingDeviceWatcher, accept_pending_device
 from .single_instance import AlreadyRunning, SingleInstance
 from .syncthing import SyncthingError, SyncthingService
@@ -467,13 +468,32 @@ class ClipSyncApp:
     def _on_file_received(self, path: Path, sender: str) -> None:
         downloads = Path.home() / "Downloads"
         downloads.mkdir(parents=True, exist_ok=True)
-        stem = path.stem
-        suffix = path.suffix
+
+        # Decryption happens here, on the way OUT of the sync folder, and never
+        # in place: writing plaintext back inside the folder would hand it
+        # straight to Syncthing and undo the encryption for every peer.
+        encrypted = is_encrypted_file(path)
+        display_name = path.name
+        if encrypted and display_name.endswith(ENCRYPTED_SUFFIX):
+            display_name = display_name[: -len(ENCRYPTED_SUFFIX)]
+        passphrase = self.settings.get("encryption_passphrase") or ""
+        if encrypted and not isinstance(passphrase, str):
+            passphrase = ""
+        if encrypted and not passphrase:
+            log.warning("Received encrypted file %s but no passphrase is configured", path.name)
+            self._notify(
+                f"File from {sender}",
+                f"{display_name} is encrypted and no passphrase is set; not saved.",
+            )
+            return
+
+        stem = Path(display_name).stem
+        suffix = Path(display_name).suffix
         # Atomically claim the destination filename with O_EXCL to close
         # the TOCTOU window between two concurrent receives of same-named
         # files from different senders: previously the exists() check +
         # copy2 could race and clobber each other.
-        dest = downloads / path.name
+        dest = downloads / display_name
         fd = -1
         attempt = 0
         while attempt < 1000:
@@ -487,12 +507,30 @@ class ClipSyncApp:
             log.warning("Could not find free filename for received file %s", path.name)
             return
         try:
-            with os.fdopen(fd, "wb") as out, path.open("rb") as src:
-                shutil.copyfileobj(src, out)
-            try:
-                shutil.copystat(path, dest)
-            except OSError:
-                pass
+            if encrypted:
+                # decrypt_file owns the destination, so release the claim we
+                # took with O_EXCL while keeping the name reserved on disk.
+                os.close(fd)
+                fd = -1
+                try:
+                    decrypt_file(path, dest, passphrase)
+                except StreamDecryptError as exc:
+                    log.warning("Could not decrypt received file %s: %s", path.name, exc)
+                    dest.unlink(missing_ok=True)
+                    self._notify(
+                        f"File from {sender}",
+                        f"{display_name} could not be decrypted ({exc}).",
+                    )
+                    return
+                config.set_file_permissions(dest)
+            else:
+                with os.fdopen(fd, "wb") as out, path.open("rb") as src:
+                    shutil.copyfileobj(src, out)
+                fd = -1
+                try:
+                    shutil.copystat(path, dest)
+                except OSError:
+                    pass
         except OSError:
             log.exception("Failed to save received file %s", path)
             try:
