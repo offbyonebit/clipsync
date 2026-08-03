@@ -85,6 +85,13 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "history_max_items": 50,
     "history_auto_clear_minutes": 0,
     "theme": "System",
+    # Mirror this device's log into the shared folder so peers can see it.
+    # Off by default: it is a debugging aid, and the sync folder is replicated
+    # to every paired device, so leaving it on ships your log (hostnames,
+    # device IDs, file names, error traces) to all of them forever. No
+    # clipboard text is ever logged, but none of that is obvious from the
+    # tray, and it was previously always on with no way to turn it off.
+    "debug_log_mirror": False,
 }
 
 HISTORY_FILE = APP_DATA_DIR / "clipsync_history.json"

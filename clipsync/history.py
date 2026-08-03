@@ -56,8 +56,12 @@ class ClipboardHistory:
         self._lock = threading.RLock()
         self._entries: list[HistoryEntry] = []
         self._settings = settings
-        self._max_items: int = 50 if settings is None else int(settings.get("history_max_items", 50) or 50)
-        self._enabled: bool = True if settings is None else bool(settings.get("history_enabled", True))
+        # Parsed defensively: a malformed value in settings.json used to raise
+        # straight out of __init__, and ClipboardHistory is built during
+        # startup, so the whole app died before the tray appeared. A bad value
+        # should cost the default, not the application.
+        self._max_items: int = _coerce_int(None if settings is None else settings.get("history_max_items", 50), 50)
+        self._enabled: bool = _coerce_bool(None if settings is None else settings.get("history_enabled", True), True)
         # Set when the on-disk file holds data we could not read and could not
         # move aside. Persisting would destroy it, so we stay in memory only.
         self._readonly: bool = False
@@ -72,8 +76,10 @@ class ClipboardHistory:
     def _auto_clear_minutes(self) -> int:
         if self._settings is None:
             return 0
-        val = self._settings.get("history_auto_clear_minutes")
-        return int(val) if isinstance(val, int) and val > 0 else 0
+        # 0 means "never auto-clear", so an unparseable value must fall back to
+        # 0 rather than silently keeping sensitive entries forever under the
+        # user's belief that they expire. A stringified "30" is accepted.
+        return _coerce_int(self._settings.get("history_auto_clear_minutes"), 0)
 
     def _prune_old(self) -> None:
         minutes = self._auto_clear_minutes()
@@ -227,6 +233,43 @@ class ClipboardHistory:
     def count(self) -> int:
         with self._lock:
             return len(self._entries)
+
+
+def _coerce_int(value: object, default: int) -> int:
+    """Best-effort int, falling back to *default* rather than raising.
+
+    Accepts the numeric strings a hand-edited settings.json can easily end up
+    holding ("50"), and refuses values that are not positive.
+    """
+    if isinstance(value, bool):  # bool is an int subclass; not a count
+        return default
+    if isinstance(value, int):
+        return value if value > 0 else default
+    if isinstance(value, str):
+        try:
+            parsed = int(value.strip())
+        except ValueError:
+            return default
+        return parsed if parsed > 0 else default
+    return default
+
+
+def _coerce_bool(value: object, default: bool) -> bool:
+    """Best-effort bool. ``bool("false")`` is True, which is exactly the trap
+    a JSON-stringified setting falls into, so strings are matched explicitly.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"true", "1", "yes", "on"}:
+            return True
+        if lowered in {"false", "0", "no", "off", ""}:
+            return False
+        return default
+    if isinstance(value, int):
+        return bool(value)
+    return default
 
 
 def _normalize(s: str) -> str:

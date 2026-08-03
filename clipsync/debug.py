@@ -52,12 +52,23 @@ class LogMirror:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._hostname = _safe_hostname()
+        # Cleared whenever mirroring is on, so switching off retracts what is
+        # published. Starts False so the first disabled tick also cleans up a
+        # file left behind by an older build, where mirroring was always on
+        # and there was no way to turn it off.
+        self._retracted = False
 
     def start(self) -> None:
         self._stop.clear()
         self._thread = threading.Thread(target=self._loop, name="clipsync-logmirror", daemon=True)
         self._thread.start()
-        log.info("LogMirror started (host=%s)", self._hostname)
+        # The thread self-gates on the setting each tick; it stays running so
+        # the toggle applies live.
+        log.info(
+            "LogMirror thread started (host=%s, mirroring=%s)",
+            self._hostname,
+            self._enabled(),
+        )
 
     def stop(self) -> None:
         self._stop.set()
@@ -74,7 +85,33 @@ class LogMirror:
             if self._stop.wait(_MIRROR_INTERVAL_SEC):
                 return
 
+    def _enabled(self) -> bool:
+        return bool(self._settings.get("debug_log_mirror", False))
+
+    def _remove_own_mirror(self) -> None:
+        """Delete this host's mirrored log from the shared folder.
+
+        Turning the mirror off has to retract what is already published:
+        otherwise the last copy sits in the synced folder and keeps being
+        replicated to every peer indefinitely.
+        """
+        dest = _debug_dir(self._settings) / f"{self._hostname}.log"
+        try:
+            if dest.exists():
+                dest.unlink()
+                log.info("Log mirror disabled; removed %s from the shared folder", dest.name)
+        except OSError:
+            log.debug("Could not remove mirrored log", exc_info=True)
+
     def _tick(self) -> None:
+        if not self._enabled():
+            # Checked every tick rather than at start, so toggling the setting
+            # takes effect without a restart.
+            if not self._retracted:
+                self._retracted = True
+                self._remove_own_mirror()
+            return
+        self._retracted = False
         src = config.LOG_FILE
         if not src.exists():
             return

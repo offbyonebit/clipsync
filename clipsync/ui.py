@@ -836,6 +836,23 @@ class _SettingsContent:
             progress_color=config.ACCENT_COLOR,
         ).pack(anchor="w", pady=4)
 
+        self._log_mirror_var = ctk.BooleanVar(value=bool(app.settings.get("debug_log_mirror")))
+        ctk.CTkSwitch(
+            container,
+            text="Share my log with paired devices (for debugging)",
+            variable=self._log_mirror_var,
+            command=self._on_log_mirror_toggle,
+            progress_color=config.ACCENT_COLOR,
+        ).pack(anchor="w", pady=4)
+        ctk.CTkLabel(
+            container,
+            text="Copies this device's log into the synced folder, so every paired\n"
+            "device receives it. No clipboard text is logged. Off by default.",
+            font=ctk.CTkFont(size=10),
+            justify="left",
+            text_color=("gray40", "gray60"),
+        ).pack(anchor="w", padx=(28, 0))
+
         ctk.CTkLabel(container, text="Appearance", font=ctk.CTkFont(size=11)).pack(anchor="w", pady=(14, 2))
         theme_row = ctk.CTkFrame(container, fg_color="transparent")
         theme_row.pack(fill="x", pady=(2, 0))
@@ -990,6 +1007,18 @@ class _SettingsContent:
         self._app.settings.set("sync_paused", paused)
         self._app.on_pause_changed(paused)
         self._status.configure(text=f"Sync {'enabled' if enabled else 'paused'}.")
+
+    def _on_log_mirror_toggle(self) -> None:
+        enabled = bool(self._log_mirror_var.get())
+        self._app.settings.set("debug_log_mirror", enabled)
+        self._app.on_settings_changed()
+        self._status.configure(
+            text=(
+                "Log sharing on. Paired devices will receive this device's log."
+                if enabled
+                else "Log sharing off. Your published log will be removed shortly."
+            )
+        )
 
     def _on_auto_accept_toggle(self) -> None:
         enabled = bool(self._auto_accept_var.get())
