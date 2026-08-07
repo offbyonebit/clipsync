@@ -46,6 +46,15 @@ from .history import ClipboardHistory
 
 log = logging.getLogger(__name__)
 
+# The OUT loop reads the system clipboard while the IN loop writes it, from two
+# different threads. The native clipboard is a single shared object on every
+# platform and is not thread-safe: on macOS, pyperclip's PyObjC backend (chosen
+# over pbcopy/pbpaste whenever AppKit is importable, as it is in the bundled
+# app) drives NSPasteboard directly, and a read racing a write segfaults inside
+# -[_NSPasteboardOwnersCollection handleOwnershipChange]. Serialize every native
+# clipboard touch through this lock.
+_CLIPBOARD_LOCK = threading.RLock()
+
 _HOSTNAME = _safe_hostname()
 
 
@@ -337,6 +346,19 @@ class _XlibClipboardOwner:
                 reply(X.NONE)
             except Exception:
                 pass
+
+
+def _truncate_for_log(value: object, limit: int = 40) -> str:
+    """repr *value* for a log line, truncating long payloads.
+
+    bytes needs this as much as str does: _last_synced holds the whole
+    clipboard, so once an image is synced it is megabytes of PNG. The
+    previous guard only tested str, so every heartbeat repr()'d the full
+    image into the log and churned the rotating handler.
+    """
+    if isinstance(value, str | bytes) and len(value) > limit:
+        return repr(value[:limit]) + "..."
+    return repr(value)
 
 
 def _normalize_newlines(s: str) -> str:
@@ -715,7 +737,8 @@ class ClipboardSync:
 
     def _read_clipboard(self) -> str | None:
         try:
-            value = pyperclip.paste()
+            with _CLIPBOARD_LOCK:
+                value = pyperclip.paste()
         except Exception as exc:
             msg = f"{type(exc).__name__}: {exc}"
             if msg != self._last_read_error:
@@ -745,7 +768,8 @@ class ClipboardSync:
                     self._last_write_error = msg
                 # fall through to pyperclip
         try:
-            pyperclip.copy(value)
+            with _CLIPBOARD_LOCK:
+                pyperclip.copy(value)
             log.debug("clipboard write (pyperclip) (%d chars)", len(value))
         except Exception as exc:
             msg = f"{type(exc).__name__}: {exc}"
@@ -760,14 +784,16 @@ class ClipboardSync:
 
     def _read_clipboard_image(self) -> bytes | None:
         try:
-            return _read_image_from_system_clipboard()
+            with _CLIPBOARD_LOCK:
+                return _read_image_from_system_clipboard()
         except Exception as exc:
             log.debug("Image clipboard read failed: %s", exc)
             return None
 
     def _write_clipboard_image(self, png_bytes: bytes) -> bool:
         try:
-            return _write_image_to_system_clipboard(png_bytes)
+            with _CLIPBOARD_LOCK:
+                return _write_image_to_system_clipboard(png_bytes)
         except Exception as exc:
             log.debug("Image clipboard write failed: %s", exc)
             return False
@@ -831,7 +857,7 @@ class ClipboardSync:
                 log.debug(
                     "HEARTBEAT (host=%s): last_synced=%s, paused=%s",
                     _HOSTNAME,
-                    (repr(last[:40]) + "...") if isinstance(last, str) and len(last) > 40 else repr(last),
+                    _truncate_for_log(last),
                     self._is_paused(),
                 )
 
@@ -855,6 +881,11 @@ class ClipboardSync:
                     log.warning("OUT [%s]: %s", _HOSTNAME, reason)
                     self._last_decrypt_error = reason
             except OSError:
+                # Roll back too: _last_synced is the "already sent" guard, so
+                # leaving it set after a failed write means every later tick
+                # sees this image as synced and it is never retried.
+                with self._lock:
+                    self._last_synced = previous_last_synced
                 log.exception("OUT [%s]: Failed to write image file", _HOSTNAME)
             return
 
@@ -878,6 +909,8 @@ class ClipboardSync:
                 log.warning("OUT [%s]: %s", _HOSTNAME, reason)
                 self._last_decrypt_error = reason
         except OSError:
+            with self._lock:
+                self._last_synced = previous_last_synced
             log.exception("OUT [%s]: Failed to write clipboard file", _HOSTNAME)
 
     def _in_loop(self) -> None:
@@ -967,7 +1000,10 @@ class _ClipboardFileHandler(FileSystemEventHandler):
     def __init__(self, sync: ClipboardSync) -> None:
         super().__init__()
         self._sync = sync
-        self._debounce_until = 0.0
+        # Per-path deadlines. A single shared deadline let a clipboard.txt and
+        # a clipboard.png update arriving within the debounce window suppress
+        # each other, so only one of the two was ever applied.
+        self._debounce_until: dict[str, float] = {}
         # Fast name-based pre-filter to avoid Path.resolve() on every event.
         # Syncthing generates many temp-file events; most are irrelevant.
         self._target_names = {config.CLIPBOARD_FILENAME, config.CLIPBOARD_IMAGE_FILENAME}
@@ -988,9 +1024,10 @@ class _ClipboardFileHandler(FileSystemEventHandler):
         if not self._matches(path):
             return
         now = time.monotonic()
-        if now < self._debounce_until:
+        key = str(Path(path).name)
+        if now < self._debounce_until.get(key, 0.0):
             return
-        self._debounce_until = now + 0.1
+        self._debounce_until[key] = now + 0.1
         # Non-blocking: hand off to _in_loop so the watchdog thread pool
         # is never held by clipboard I/O (avoids pool exhaustion on Windows).
         self._sync._in_queue.put(path)

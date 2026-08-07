@@ -15,6 +15,7 @@ from __future__ import annotations
 import logging
 import os
 import shutil
+import threading
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -24,10 +25,15 @@ from watchdog.observers import Observer
 from watchdog.observers.api import BaseObserver
 
 from . import config
+from .crypto import encrypt_file
 from .debug import _safe_hostname
 
 log = logging.getLogger(__name__)
 _HOSTNAME = _safe_hostname()
+
+# Marks a file in the shared folder as encrypted. Stripped when writing the
+# plaintext out to the receiver's Downloads folder.
+ENCRYPTED_SUFFIX = ".csenc"
 
 
 class FileTransfer:
@@ -47,17 +53,46 @@ class FileTransfer:
         folder = Path(self._settings.get("sync_folder") or config.SYNC_FOLDER)
         return folder / "files"
 
+    def _passphrase(self) -> str:
+        val = self._settings.get("encryption_passphrase") or ""
+        return val if isinstance(val, str) else ""
+
     def send(self, source: Path) -> Path:
         """Copy *source* into the shared folder under this host's subdirectory.
 
-        Returns the destination path.  Raises OSError on failure.
+        When a passphrase is configured the file is encrypted on the way in and
+        gains a ``.csenc`` suffix. Previously it was copied verbatim, so
+        enabling at-rest encryption protected the clipboard but left every sent
+        file sitting in the synced folder as plaintext -- readable by anything
+        with access to that directory, and replicated that way to each peer.
+
+        Returns the destination path. Raises OSError on failure.
         """
         dest_dir = self.files_dir / _HOSTNAME
         dest_dir.mkdir(parents=True, exist_ok=True)
         timestamp = time.strftime("%Y%m%d_%H%M%S")
+        passphrase = self._passphrase()
+        size = source.stat().st_size
+
+        if passphrase:
+            dest = dest_dir / f"{timestamp}_{source.name}{ENCRYPTED_SUFFIX}"
+            tmp = dest.with_name(dest.name + ".part")
+            try:
+                encrypt_file(source, tmp, passphrase)
+                config.set_file_permissions(tmp)
+                tmp.replace(dest)
+            except BaseException:
+                tmp.unlink(missing_ok=True)
+                raise
+            log.info("FILE OUT [%s]: %s (%d bytes, encrypted)", _HOSTNAME, source.name, size)
+            return dest
+
         dest = dest_dir / f"{timestamp}_{source.name}"
         shutil.copy2(source, dest)
-        log.info("FILE OUT [%s]: %s (%d bytes)", _HOSTNAME, source.name, source.stat().st_size)
+        # copy2 preserves the source mode, so a world-readable original stayed
+        # world-readable inside the shared folder.
+        config.set_file_permissions(dest)
+        log.info("FILE OUT [%s]: %s (%d bytes)", _HOSTNAME, source.name, size)
         return dest
 
     def start(self) -> None:
@@ -84,7 +119,11 @@ class _FileReceiveHandler(FileSystemEventHandler):
         self._on_received = on_received
         # Guard against duplicate events (watchdog can fire multiple times for
         # a single file, e.g. created + modified during Syncthing's atomic write).
+        # watchdog dispatches from a thread pool on Windows, so the
+        # check-then-add below has to be atomic or two events for the same
+        # file can both pass it and deliver the file twice.
         self._seen: set[str] = set()
+        self._seen_lock = threading.Lock()
 
     def _handle(self, path: Path) -> None:
         # Expected layout: files/<sender_hostname>/<filename>
@@ -96,9 +135,10 @@ class _FileReceiveHandler(FileSystemEventHandler):
         if path.name.startswith(".syncthing.") and path.name.endswith(".tmp"):
             return
         key = str(path)
-        if key in self._seen:
-            return
-        self._seen.add(key)
+        with self._seen_lock:
+            if key in self._seen:
+                return
+            self._seen.add(key)
         log.info("FILE IN [%s]: %s from %s", _HOSTNAME, path.name, sender)
         try:
             self._on_received(path, sender)

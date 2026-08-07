@@ -52,12 +52,18 @@ def test_fetch_official_sha256sums_normalizes_v_prefix(monkeypatch) -> None:
     assert seen_urls == ["https://github.com/syncthing/syncthing/releases/download/v2.0.16/sha256sum.txt.asc"]
 
 
-def test_fetch_official_sha256sums_returns_empty_on_network_error() -> None:
+def test_fetch_official_sha256sums_raises_on_network_error() -> None:
+    """Fail closed. The archive is executed after extraction, so a fetch we
+    could not complete must abort rather than silently skip verification:
+    an attacker able to drop this one request would otherwise downgrade us
+    to running an unverified binary."""
     from urllib.error import URLError
 
-    with patch("clipsync.syncthing._download", side_effect=URLError("offline")):
-        sums = syncthing._fetch_official_sha256sums("v2.0.16")
-    assert sums == {}
+    with (
+        patch("clipsync.syncthing._download", side_effect=URLError("offline")),
+        pytest.raises(SyncthingError, match="Refusing to extract"),
+    ):
+        syncthing._fetch_official_sha256sums("v2.0.16")
 
 
 def test_fetch_official_sha256sums_ignores_malformed_lines(monkeypatch) -> None:
@@ -146,36 +152,48 @@ def test_verify_release_signature_falls_back_when_gpg_absent(monkeypatch, caplog
 def test_verify_archive_hash_succeeds_on_match(monkeypatch) -> None:
     archive = b"the bytes of a syncthing archive"
     expected = hashlib.sha256(archive).hexdigest()
-    name = "syncthing-linux-amd64-v2.0.16.tar.gz"
+    # Derive the name for the platform the test is running on. Hardcoding the
+    # Linux asset made this pass vacuously everywhere else: the lookup missed,
+    # verification was skipped, and the test asserted nothing.
+    #
+    # Uses a version with no pinned manifest entry, so this still exercises
+    # the fetched-sums path. The pinned path is covered in test_pinned_hashes.
+    name = syncthing._archive_filename("v9.9.9")
 
     monkeypatch.setattr(syncthing, "_fetch_official_sha256sums", lambda _v: {name: expected})
     # Should not raise.
-    syncthing._verify_archive_hash(archive, "v2.0.16")
+    syncthing._verify_archive_hash(archive, "v9.9.9")
 
 
 def test_verify_archive_hash_raises_on_mismatch(monkeypatch) -> None:
     archive = b"the bytes of a syncthing archive"
-    name = "syncthing-linux-amd64-v2.0.16.tar.gz"
+    name = syncthing._archive_filename("v2.0.16")
 
     monkeypatch.setattr(syncthing, "_fetch_official_sha256sums", lambda _v: {name: "0" * 64})
     with pytest.raises(SyncthingError, match="hash mismatch"):
         syncthing._verify_archive_hash(archive, "v2.0.16")
 
 
-def test_verify_archive_hash_skips_when_platform_absent(monkeypatch) -> None:
-    """If sha256sum.txt has no entry for our platform, verification must
-    be skipped (logged) rather than fail. Otherwise an unusual platform
-    would be unable to install even when Syncthing ships a binary for it."""
+def test_verify_archive_hash_raises_when_platform_absent(monkeypatch) -> None:
+    """A missing entry for our platform is indistinguishable from one an
+    attacker stripped, so it must abort rather than skip verification."""
     archive = b"some bytes"
     monkeypatch.setattr(syncthing, "_fetch_official_sha256sums", lambda _v: {})
-    # Should not raise.
-    syncthing._verify_archive_hash(archive, "v2.0.16")
+    with pytest.raises(SyncthingError, match="Refusing to extract"):
+        syncthing._verify_archive_hash(archive, "v2.0.16")
 
 
-def test_verify_archive_hash_skips_when_fetch_fails(monkeypatch) -> None:
+def test_verify_archive_hash_propagates_fetch_failure(monkeypatch) -> None:
+    """A fetch failure inside _fetch_official_sha256sums must reach the
+    caller, not be swallowed into a skipped check."""
     archive = b"some bytes"
-    monkeypatch.setattr(syncthing, "_fetch_official_sha256sums", lambda _v: {})
-    syncthing._verify_archive_hash(archive, "v2.0.16")
+
+    def _boom(_v):
+        raise SyncthingError("Refusing to extract an unverified Syncthing binary")
+
+    monkeypatch.setattr(syncthing, "_fetch_official_sha256sums", _boom)
+    with pytest.raises(SyncthingError, match="Refusing to extract"):
+        syncthing._verify_archive_hash(archive, "v2.0.16")
 
 
 def test_archive_filename_matches_release_naming() -> None:

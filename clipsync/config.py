@@ -21,8 +21,40 @@ from typing import Any
 APP_NAME = "ClipSync"
 APP_ID = "clipsync"
 
-ACCENT_COLOR = "#1A6B8A"
-ACCENT_HOVER = "#145670"
+# Legacy accent aliases kept for backwards compatibility.
+ACCENT_COLOR = "#5A6BFF"
+ACCENT_HOVER = "#4654CC"
+
+# ---------------------------------------------------------------------------
+# Pro theme palette (slate + indigo).  These values are used directly by the
+# UI module so changes stay centralized here instead of scattered through UI
+# constructors.
+# ---------------------------------------------------------------------------
+
+COLOR_PRIMARY = "#5A6BFF"  # indigo action accent
+COLOR_PRIMARY_HOVER = "#4654CC"
+COLOR_PRIMARY_MUTED = (228, 231, 255)  # light-mode card tint, RGB tuple
+
+COLOR_SUCCESS = "#2DD36F"
+COLOR_DANGER = "#FF4D4D"
+COLOR_DANGER_HOVER = "#CC3D3D"
+COLOR_WARNING = "#FFB020"
+
+# Light mode
+COLOR_BG_LIGHT = "#F5F6F8"
+COLOR_CARD_LIGHT = "#FFFFFF"
+COLOR_TEXT_LIGHT = "#11131A"
+COLOR_TEXT_MUTED_LIGHT = "#6B7280"
+COLOR_BORDER_LIGHT = "#E2E4E9"
+COLOR_ROW_BG_LIGHT = "#F0F1F5"
+
+# Dark mode
+COLOR_BG_DARK = "#0F1117"
+COLOR_CARD_DARK = "#181A21"
+COLOR_TEXT_DARK = "#F0F1F5"
+COLOR_TEXT_MUTED_DARK = "#8B92A5"
+COLOR_BORDER_DARK = "#2A2D38"
+COLOR_ROW_BG_DARK = "#1E212B"
 
 SYNCTHING_VERSION = "v2.0.16"
 SYNCTHING_API_HOST = "127.0.0.1"
@@ -85,6 +117,13 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "history_max_items": 50,
     "history_auto_clear_minutes": 0,
     "theme": "System",
+    # Mirror this device's log into the shared folder so peers can see it.
+    # Off by default: it is a debugging aid, and the sync folder is replicated
+    # to every paired device, so leaving it on ships your log (hostnames,
+    # device IDs, file names, error traces) to all of them forever. No
+    # clipboard text is ever logged, but none of that is obvious from the
+    # tray, and it was previously always on with no way to turn it off.
+    "debug_log_mirror": False,
 }
 
 HISTORY_FILE = APP_DATA_DIR / "clipsync_history.json"

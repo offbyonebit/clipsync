@@ -56,8 +56,15 @@ class ClipboardHistory:
         self._lock = threading.RLock()
         self._entries: list[HistoryEntry] = []
         self._settings = settings
-        self._max_items: int = 50 if settings is None else int(settings.get("history_max_items", 50) or 50)
-        self._enabled: bool = True if settings is None else bool(settings.get("history_enabled", True))
+        # Parsed defensively: a malformed value in settings.json used to raise
+        # straight out of __init__, and ClipboardHistory is built during
+        # startup, so the whole app died before the tray appeared. A bad value
+        # should cost the default, not the application.
+        self._max_items: int = _coerce_int(None if settings is None else settings.get("history_max_items", 50), 50)
+        self._enabled: bool = _coerce_bool(None if settings is None else settings.get("history_enabled", True), True)
+        # Set when the on-disk file holds data we could not read and could not
+        # move aside. Persisting would destroy it, so we stay in memory only.
+        self._readonly: bool = False
         self._load()
 
     def _passphrase(self) -> str:
@@ -69,8 +76,10 @@ class ClipboardHistory:
     def _auto_clear_minutes(self) -> int:
         if self._settings is None:
             return 0
-        val = self._settings.get("history_auto_clear_minutes")
-        return int(val) if isinstance(val, int) and val > 0 else 0
+        # 0 means "never auto-clear", so an unparseable value must fall back to
+        # 0 rather than silently keeping sensitive entries forever under the
+        # user's belief that they expire. A stringified "30" is accepted.
+        return _coerce_int(self._settings.get("history_auto_clear_minutes"), 0)
 
     def _prune_old(self) -> None:
         minutes = self._auto_clear_minutes()
@@ -79,23 +88,58 @@ class ClipboardHistory:
         cutoff = time.time() - (minutes * 60)
         self._entries = [e for e in self._entries if e.timestamp > cutoff]
 
+    def _quarantine_unreadable(self, reason: str) -> None:
+        """Move an undecryptable history file aside instead of overwriting it.
+
+        Without this, an unreadable file was simply left in place with an
+        empty in-memory list, and the very next add_entry() persisted that
+        list straight over it — silently destroying every stored entry. The
+        sync file is protected from exactly this by
+        ClipboardSync._refuse_if_unreadable_ciphertext; the history file was
+        not. Renaming keeps the ciphertext recoverable if the passphrase
+        turns up, while letting history keep working from now on.
+        """
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        backup = self._path.with_name(f"{self._path.stem}.unreadable-{stamp}{self._path.suffix}")
+        try:
+            self._path.replace(backup)
+        except OSError as exc:
+            # Could not move it aside, so we must not overwrite it either.
+            self._readonly = True
+            log.error(
+                "Clipboard history is unreadable (%s) and could not be moved aside (%s); "
+                "history will not be written this session so the existing file is preserved",
+                reason,
+                exc,
+            )
+            return
+        log.warning(
+            "Clipboard history could not be read (%s). The old file was kept as %s "
+            "and a fresh history started. If you recover the passphrase, that file "
+            "can still be decrypted.",
+            reason,
+            backup.name,
+        )
+
     def _load(self) -> None:
         if not self._path.exists():
             return
         try:
             raw = self._path.read_bytes()
         except OSError as exc:
+            # Unread, so its contents are unknown: refuse to overwrite it.
+            self._readonly = True
             log.warning("Failed to read clipboard history: %s", exc)
             return
 
         if is_encrypted(raw):
             passphrase = self._passphrase()
             if not passphrase:
-                log.warning("History file is encrypted but no passphrase is configured")
+                self._quarantine_unreadable("encrypted but no passphrase is configured")
                 return
             decrypted = decrypt(raw, passphrase)
             if decrypted is None:
-                log.warning("Failed to decrypt clipboard history (passphrase mismatch?)")
+                self._quarantine_unreadable("passphrase mismatch, or written by a newer build")
                 return
             try:
                 data = json.loads(decrypted.decode("utf-8"))
@@ -122,6 +166,10 @@ class ClipboardHistory:
         """Persist history to disk. Caller MUST already hold ``self._lock``."""
         if not self._enabled and len(self._entries) == 0:
             return
+        if self._readonly:
+            # The file holds data we could not read; overwriting it would
+            # destroy it. Keep this session's entries in memory only.
+            return
         tmp = self._path.with_name(f"{self._path.name}.{os.getpid()}.tmp")
         try:
             self._path.parent.mkdir(parents=True, exist_ok=True)
@@ -130,8 +178,11 @@ class ClipboardHistory:
             if passphrase:
                 payload = encrypt(payload, passphrase)
             tmp.write_bytes(payload)
+            # Tighten before the rename, not after: this file holds clipboard
+            # text. Chmod'ing the final name afterwards leaves a window where
+            # it is readable by other local users under its real name.
+            config.set_file_permissions(tmp)
             tmp.replace(self._path)
-            config.set_file_permissions(self._path)
         except OSError as exc:
             log.warning("Failed to persist clipboard history: %s", exc)
         finally:
@@ -182,6 +233,43 @@ class ClipboardHistory:
     def count(self) -> int:
         with self._lock:
             return len(self._entries)
+
+
+def _coerce_int(value: object, default: int) -> int:
+    """Best-effort int, falling back to *default* rather than raising.
+
+    Accepts the numeric strings a hand-edited settings.json can easily end up
+    holding ("50"), and refuses values that are not positive.
+    """
+    if isinstance(value, bool):  # bool is an int subclass; not a count
+        return default
+    if isinstance(value, int):
+        return value if value > 0 else default
+    if isinstance(value, str):
+        try:
+            parsed = int(value.strip())
+        except ValueError:
+            return default
+        return parsed if parsed > 0 else default
+    return default
+
+
+def _coerce_bool(value: object, default: bool) -> bool:
+    """Best-effort bool. ``bool("false")`` is True, which is exactly the trap
+    a JSON-stringified setting falls into, so strings are matched explicitly.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"true", "1", "yes", "on"}:
+            return True
+        if lowered in {"false", "0", "no", "off", ""}:
+            return False
+        return default
+    if isinstance(value, int):
+        return bool(value)
+    return default
 
 
 def _normalize(s: str) -> str:
