@@ -34,6 +34,39 @@ log = logging.getLogger(__name__)
 _WINDOWS = ("pairing", "devices", "settings", "logs", "incoming", "tabbed", "history", "file_picker")
 
 
+# ---------------------------------------------------------------------------
+# Theme helpers
+# ---------------------------------------------------------------------------
+
+
+class Theme:
+    """Resolved light/dark color values for the pro theme."""
+
+    def __init__(self, mode: str) -> None:
+        self.set_mode(mode)
+
+    def set_mode(self, mode: str) -> None:
+        self.mode = mode
+        is_dark = mode == "Dark"
+        self.bg = config.COLOR_BG_DARK if is_dark else config.COLOR_BG_LIGHT
+        self.card = config.COLOR_CARD_DARK if is_dark else config.COLOR_CARD_LIGHT
+        self.text = config.COLOR_TEXT_DARK if is_dark else config.COLOR_TEXT_LIGHT
+        self.muted = config.COLOR_TEXT_MUTED_DARK if is_dark else config.COLOR_TEXT_MUTED_LIGHT
+        self.border = config.COLOR_BORDER_DARK if is_dark else config.COLOR_BORDER_LIGHT
+        self.row_bg = config.COLOR_ROW_BG_DARK if is_dark else config.COLOR_ROW_BG_LIGHT
+
+    def card_fg(self) -> tuple[str, str] | str:
+        # CustomTkinter tuple format: (light, dark)
+        return (config.COLOR_CARD_LIGHT, config.COLOR_CARD_DARK)
+
+    def transparent(self) -> str:
+        return "transparent"
+
+
+# Global resolved theme; set by _run_child() before any windows are built.
+THEME = Theme("System")
+
+
 def _tk_image(img: Image.Image) -> tkinter.PhotoImage:
     """Build a Tk image from a PIL image without going through PIL.ImageTk.
 
@@ -60,6 +93,124 @@ def _center_window(window: ctk.CTkToplevel | ctk.CTk, width: int, height: int) -
     x = max(0, (sw - width) // 2)
     y = max(0, (sh - height) // 2)
     window.geometry(f"{width}x{height}+{x}+{y}")
+
+
+def _fonts() -> dict[str, ctk.CTkFont]:
+    """Typography scale used across all windows."""
+    return {
+        "headline": ctk.CTkFont(size=22, weight="bold"),
+        "title": ctk.CTkFont(size=16, weight="bold"),
+        "subtitle": ctk.CTkFont(size=12, weight="bold"),
+        "body": ctk.CTkFont(size=12),
+        "small": ctk.CTkFont(size=11),
+        "tiny": ctk.CTkFont(size=10),
+        "mono": ctk.CTkFont(family="Menlo", size=11),
+    }
+
+
+def _section_header(parent: ctk.CTkBaseClass, text: str) -> ctk.CTkLabel:
+    """Bold subsection title with consistent top spacing."""
+    return ctk.CTkLabel(
+        parent,
+        text=text,
+        font=_fonts()["subtitle"],
+        text_color=THEME.text,
+        anchor="w",
+    )
+
+
+def _card_frame(parent: ctk.CTkBaseClass, **kwargs: Any) -> ctk.CTkFrame:
+    """Rounded card container with the current theme background."""
+    defaults: dict[str, Any] = dict(
+        master=parent,
+        fg_color=THEME.card_fg(),
+        border_width=1,
+        border_color=(config.COLOR_BORDER_LIGHT, config.COLOR_BORDER_DARK),
+        corner_radius=12,
+    )
+    defaults.update(kwargs)
+    return ctk.CTkFrame(**defaults)
+
+
+def _primary_button(parent: ctk.CTkBaseClass, text: str, command: Callable[[], None], **kwargs: Any) -> ctk.CTkButton:
+    """Main call-to-action button (filled indigo)."""
+    defaults: dict[str, Any] = dict(
+        master=parent,
+        text=text,
+        command=command,
+        fg_color=config.COLOR_PRIMARY,
+        hover_color=config.COLOR_PRIMARY_HOVER,
+        text_color="white",
+        height=32,
+        corner_radius=8,
+        font=_fonts()["body"],
+    )
+    defaults.update(kwargs)
+    return ctk.CTkButton(**defaults)
+
+
+def _secondary_button(parent: ctk.CTkBaseClass, text: str, command: Callable[[], None], **kwargs: Any) -> ctk.CTkButton:
+    """Secondary outline button on the card background."""
+    defaults: dict[str, Any] = dict(
+        master=parent,
+        text=text,
+        command=command,
+        fg_color="transparent",
+        hover_color=(config.COLOR_ROW_BG_LIGHT, config.COLOR_ROW_BG_DARK),
+        text_color=THEME.text,
+        border_width=1,
+        border_color=(config.COLOR_BORDER_LIGHT, config.COLOR_BORDER_DARK),
+        height=32,
+        corner_radius=8,
+        font=_fonts()["body"],
+    )
+    defaults.update(kwargs)
+    return ctk.CTkButton(**defaults)
+
+
+def _ghost_button(parent: ctk.CTkBaseClass, text: str, command: Callable[[], None], **kwargs: Any) -> ctk.CTkButton:
+    """Low-emphasis text-like button colored with the primary accent."""
+    defaults: dict[str, Any] = dict(
+        master=parent,
+        text=text,
+        command=command,
+        fg_color="transparent",
+        hover_color=(config.COLOR_ROW_BG_LIGHT, config.COLOR_ROW_BG_DARK),
+        text_color=config.COLOR_PRIMARY,
+        border_width=0,
+        height=28,
+        corner_radius=8,
+        font=_fonts()["small"],
+    )
+    defaults.update(kwargs)
+    return ctk.CTkButton(**defaults)
+
+
+def _entry(parent: ctk.CTkBaseClass, **kwargs: Any) -> ctk.CTkEntry:
+    """Standard input with themed border and rounded corners."""
+    defaults: dict[str, Any] = dict(
+        master=parent,
+        border_width=1,
+        border_color=(config.COLOR_BORDER_LIGHT, config.COLOR_BORDER_DARK),
+        corner_radius=8,
+        font=_fonts()["body"],
+    )
+    defaults.update(kwargs)
+    return ctk.CTkEntry(**defaults)
+
+
+def _switch(parent: ctk.CTkBaseClass, text: str, variable: ctk.Variable, command: Callable[[], None]) -> ctk.CTkSwitch:
+    return ctk.CTkSwitch(
+        parent,
+        text=text,
+        variable=variable,
+        command=command,
+        progress_color=config.COLOR_PRIMARY,
+        button_color=config.COLOR_PRIMARY,
+        button_hover_color=config.COLOR_PRIMARY_HOVER,
+        text_color=THEME.text,
+        font=_fonts()["body"],
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -243,6 +394,7 @@ class _BaseWindow:
         self.window.resizable(False, False)
         self.window.protocol("WM_DELETE_WINDOW", self.close)
         _center_window(self.window, *size)
+        self.window.configure(fg_color=THEME.bg)
         self.window.lift()
         self.window.focus_force()
         self.window.bind("<Escape>", lambda _e: self.close())
@@ -298,86 +450,60 @@ class _PairingContent:
         self._preview_size = (300, 225)
         self._scan_container = container
 
-        ctk.CTkLabel(container, text="Pair a device", font=ctk.CTkFont(size=18, weight="bold")).pack(pady=(0, 8))
+        ctk.CTkLabel(container, text="Pair a device", font=_fonts()["headline"], text_color=THEME.text).pack(
+            pady=(0, 18)
+        )
 
-        ctk.CTkLabel(
+        _section_header(container, "Nearby devices").pack(fill="x")
+        self._nearby_frame = ctk.CTkScrollableFrame(
             container,
-            text="Nearby devices on your network",
-            font=ctk.CTkFont(size=12, weight="bold"),
-            anchor="w",
-        ).pack(fill="x")
-        self._nearby_frame = ctk.CTkScrollableFrame(container, fg_color=("gray90", "gray17"), height=100)
-        self._nearby_frame.pack(fill="x", pady=(2, 10))
+            fg_color=THEME.card_fg(),
+            border_width=1,
+            border_color=(config.COLOR_BORDER_LIGHT, config.COLOR_BORDER_DARK),
+            corner_radius=12,
+            height=100,
+        )
+        self._nearby_frame.pack(fill="x", pady=(6, 14))
         self._nearby_seen: set[str] = set()
         self._render_nearby([])
         self._schedule_nearby_refresh()
 
-        ctk.CTkLabel(container, text="Or paste a device ID", font=ctk.CTkFont(size=12, weight="bold"), anchor="w").pack(
-            fill="x"
-        )
-        entry_row = ctk.CTkFrame(container, fg_color="transparent")
-        entry_row.pack(fill="x", pady=(2, 8))
-        self._entry = ctk.CTkEntry(entry_row, placeholder_text="XXXXXXX-XXXXXXX-…")
-        self._entry.pack(side="left", fill="x", expand=True, padx=(0, 6))
+        _section_header(container, "Or paste a device ID").pack(fill="x", pady=(0, 6))
+        entry_row = _card_frame(container)
+        entry_row.pack(fill="x", pady=(0, 14))
+        self._entry = _entry(entry_row, placeholder_text="XXXXXXX-XXXXXXX-…")
+        self._entry.pack(side="left", fill="x", expand=True, padx=(12, 6), pady=10)
         self._entry.bind("<Return>", lambda _e: self._on_add_clicked())
-        ctk.CTkButton(
-            entry_row,
-            text="Paste",
-            width=60,
-            height=28,
-            fg_color="transparent",
-            border_width=1,
-            border_color=config.ACCENT_COLOR,
-            text_color=config.ACCENT_COLOR,
-            hover_color=config.ACCENT_HOVER,
-            command=self._on_paste_clicked,
-        ).pack(side="left", padx=(0, 6))
-        self._add_btn = ctk.CTkButton(
-            entry_row,
-            text="Add",
-            width=60,
-            height=28,
-            fg_color=config.ACCENT_COLOR,
-            hover_color=config.ACCENT_HOVER,
-            command=self._on_add_clicked,
-        )
-        self._add_btn.pack(side="left")
+        _ghost_button(entry_row, text="Paste", command=self._on_paste_clicked, width=60).pack(side="left", padx=(0, 6))
+        self._add_btn = _primary_button(entry_row, text="Add", command=self._on_add_clicked, width=60)
+        self._add_btn.pack(side="left", padx=(0, 12))
 
-        ctk.CTkLabel(
-            container, text="Your device ID (for the other side)", font=ctk.CTkFont(size=12, weight="bold"), anchor="w"
-        ).pack(fill="x", pady=(4, 2))
-        own_row = ctk.CTkFrame(container, fg_color=("gray90", "gray17"))
-        own_row.pack(fill="x", pady=(0, 8))
+        _section_header(container, "Your device ID").pack(fill="x", pady=(0, 6))
+        own_row = _card_frame(container)
+        own_row.pack(fill="x", pady=(0, 14))
         self._qr_label = ctk.CTkLabel(own_row, text="")
-        self._qr_label.pack(side="left", padx=8, pady=8)
+        self._qr_label.pack(side="left", padx=14, pady=14)
         self._render_qr(app.device_id)
         own_right = ctk.CTkFrame(own_row, fg_color="transparent")
-        own_right.pack(side="left", fill="both", expand=True, padx=(0, 8), pady=8)
+        own_right.pack(side="left", fill="both", expand=True, padx=(0, 14), pady=14)
         ctk.CTkLabel(
             own_right,
             text=app.device_id,
-            font=ctk.CTkFont(size=9),
+            font=_fonts()["small"],
             wraplength=180,
             justify="left",
             anchor="w",
+            text_color=THEME.text,
         ).pack(fill="x")
-        ctk.CTkButton(
+        _primary_button(
             own_right,
-            text="Copy",
-            height=28,
-            fg_color=config.ACCENT_COLOR,
-            hover_color=config.ACCENT_HOVER,
+            text="Copy ID",
             command=lambda: self._copy_to_clipboard(app.device_id),
-        ).pack(fill="x", pady=(6, 0))
+        ).pack(fill="x", pady=(10, 0))
 
-        ctk.CTkButton(
+        _secondary_button(
             container,
-            text="Scan QR with webcam (slower)",
-            height=28,
-            fg_color="transparent",
-            border_width=1,
-            border_color=("gray70", "gray40"),
-            text_color=("gray30", "gray80"),
+            text="Scan QR with webcam",
             command=self._on_scan_clicked,
         ).pack(fill="x")
 
@@ -386,8 +512,9 @@ class _PairingContent:
             textvariable=self._status_var,
             wraplength=360,
             justify="center",
-            font=ctk.CTkFont(size=11),
-        ).pack(pady=(10, 0))
+            font=_fonts()["small"],
+            text_color=THEME.muted,
+        ).pack(pady=(14, 0))
 
     def _exists(self) -> bool:
         try:
@@ -448,30 +575,39 @@ class _PairingContent:
         for child in self._nearby_frame.winfo_children():
             child.destroy()
         if not device_ids:
+            empty = ctk.CTkFrame(self._nearby_frame, fg_color="transparent")
+            empty.pack(pady=20)
             ctk.CTkLabel(
-                self._nearby_frame,
-                text="Searching… make sure the other device is running ClipSync on the same network.",
-                font=ctk.CTkFont(size=11),
-                wraplength=320,
+                empty,
+                text="No nearby devices found",
+                font=_fonts()["body"],
+                text_color=THEME.muted,
+            ).pack()
+            ctk.CTkLabel(
+                empty,
+                text="Make sure the other device is running ClipSync on the same network.",
+                font=_fonts()["small"],
+                wraplength=300,
                 justify="center",
-            ).pack(pady=16)
+                text_color=THEME.muted,
+            ).pack(pady=(4, 0))
             return
         for did in device_ids:
-            row = ctk.CTkFrame(self._nearby_frame, fg_color=("gray85", "gray22"))
-            row.pack(fill="x", padx=4, pady=3)
+            row = ctk.CTkFrame(self._nearby_frame, fg_color=(config.COLOR_ROW_BG_LIGHT, config.COLOR_ROW_BG_DARK), corner_radius=8)
+            row.pack(fill="x", padx=8, pady=4)
             row.grid_columnconfigure(0, weight=1)
-            ctk.CTkLabel(row, text=did[:24] + "…", font=ctk.CTkFont(size=11), anchor="w").grid(
-                row=0, column=0, sticky="we", padx=10, pady=6
+            ctk.CTkLabel(row, text=did[:24] + "…", font=_fonts()["small"], anchor="w", text_color=THEME.text).grid(
+                row=0, column=0, sticky="we", padx=12, pady=10
             )
-            ctk.CTkButton(
+            def _pair_handler(d: str = did) -> None:
+                self._pair_from_nearby(d)
+
+            _primary_button(
                 row,
                 text="Pair",
                 width=60,
-                height=28,
-                fg_color=config.ACCENT_COLOR,
-                hover_color=config.ACCENT_HOVER,
-                command=lambda d=did: self._pair_from_nearby(d),
-            ).grid(row=0, column=1, padx=(0, 8), pady=4)
+                command=_pair_handler,
+            ).grid(row=0, column=1, padx=(0, 10), pady=6)
 
     def _pair_from_nearby(self, device_id: str) -> None:
         self._set_pending(device_id)
@@ -608,18 +744,20 @@ class _DevicesContent:
         self._app = app
         self._refreshing = False
 
-        ctk.CTkLabel(container, text="Connected devices", font=ctk.CTkFont(size=18, weight="bold")).pack(pady=(0, 10))
+        ctk.CTkLabel(container, text="Connected devices", font=_fonts()["headline"], text_color=THEME.text).pack(
+            pady=(0, 18)
+        )
 
-        self._list_frame = ctk.CTkScrollableFrame(container, fg_color=("gray90", "gray17"))
+        self._list_frame = ctk.CTkScrollableFrame(
+            container,
+            fg_color=THEME.card_fg(),
+            border_width=1,
+            border_color=(config.COLOR_BORDER_LIGHT, config.COLOR_BORDER_DARK),
+            corner_radius=12,
+        )
         self._list_frame.pack(fill="both", expand=True)
 
-        ctk.CTkButton(
-            container,
-            text="Refresh",
-            fg_color=config.ACCENT_COLOR,
-            hover_color=config.ACCENT_HOVER,
-            command=self._refresh,
-        ).pack(fill="x", pady=(12, 0))
+        _primary_button(container, text="Refresh", command=self._refresh).pack(fill="x", pady=(16, 0))
 
         self._refresh()
         self._schedule_refresh()
@@ -670,70 +808,68 @@ class _DevicesContent:
         for child in self._list_frame.winfo_children():
             child.destroy()
         if error:
-            ctk.CTkLabel(self._list_frame, text=error, text_color="red").pack(pady=10)
+            ctk.CTkLabel(self._list_frame, text=error, text_color=config.COLOR_DANGER, font=_fonts()["body"]).pack(pady=14)
             return
         if not devices:
             empty = ctk.CTkFrame(self._list_frame, fg_color="transparent")
-            empty.pack(pady=30)
+            empty.pack(pady=40)
             ctk.CTkLabel(
                 empty,
                 text="No devices paired yet.",
-                font=ctk.CTkFont(size=14, weight="bold"),
-                text_color=("gray30", "gray70"),
+                font=_fonts()["title"],
+                text_color=THEME.muted,
             ).pack()
             ctk.CTkLabel(
                 empty,
                 text="Go to the Pair tab to connect a device.",
-                font=ctk.CTkFont(size=11),
-                text_color=("gray30", "gray70"),
+                font=_fonts()["small"],
+                text_color=THEME.muted,
             ).pack(pady=(4, 0))
             return
         for d in devices:
             self._build_row(d)
 
     def _build_row(self, device: dict) -> None:
-        row = ctk.CTkFrame(self._list_frame, fg_color=("gray85", "gray22"))
-        row.pack(fill="x", padx=4, pady=4)
+        row = ctk.CTkFrame(self._list_frame, fg_color=(config.COLOR_ROW_BG_LIGHT, config.COLOR_ROW_BG_DARK), corner_radius=10)
+        row.pack(fill="x", padx=8, pady=5)
         row.grid_columnconfigure(0, weight=1)
 
         name_text = device.get("name") or device["deviceID"][:7]
-        ctk.CTkLabel(row, text=name_text, font=ctk.CTkFont(size=13, weight="bold"), anchor="w").grid(
-            row=0, column=0, sticky="we", padx=10, pady=(8, 0)
+        ctk.CTkLabel(row, text=name_text, font=_fonts()["subtitle"], text_color=THEME.text, anchor="w").grid(
+            row=0, column=0, sticky="we", padx=12, pady=(10, 0)
         )
-        ctk.CTkLabel(row, text=device["deviceID"][:24] + "…", font=ctk.CTkFont(size=10), anchor="w").grid(
-            row=1, column=0, sticky="we", padx=10, pady=(0, 8)
+        ctk.CTkLabel(row, text=device["deviceID"][:24] + "…", font=_fonts()["tiny"], text_color=THEME.muted, anchor="w").grid(
+            row=1, column=0, sticky="we", padx=12, pady=(0, 10)
         )
 
-        status_color = "#2E8B57" if device["connected"] else ("gray50", "gray60")
+        status_color = config.COLOR_SUCCESS if device["connected"] else THEME.muted
         status_text = "● Connected" if device["connected"] else "○ Offline"
-        ctk.CTkLabel(row, text=status_text, text_color=status_color, font=ctk.CTkFont(size=11)).grid(
-            row=0, column=1, rowspan=2, padx=10
+        ctk.CTkLabel(row, text=status_text, text_color=status_color, font=_fonts()["small"]).grid(
+            row=0, column=1, rowspan=2, padx=12
         )
 
-        ctk.CTkButton(
+        def _rename_handler(
+            did: str = device["deviceID"],
+            nm: str = name_text,
+        ) -> None:
+            self._rename_device(did, nm)
+
+        def _remove_handler(did: str = device["deviceID"]) -> None:
+            self._remove_device(did)
+
+        _ghost_button(
             row,
             text="Rename",
             width=70,
-            height=28,
-            fg_color="transparent",
-            border_width=1,
-            text_color=config.ACCENT_COLOR,
-            border_color=config.ACCENT_COLOR,
-            hover_color=config.ACCENT_HOVER,
-            command=lambda did=device["deviceID"], nm=name_text: self._rename_device(did, nm),
-        ).grid(row=0, column=2, rowspan=2, padx=(0, 6))
+            command=_rename_handler,
+        ).grid(row=0, column=2, rowspan=2, padx=(0, 4))
 
-        ctk.CTkButton(
+        _secondary_button(
             row,
             text="Remove",
             width=70,
-            height=28,
-            fg_color="transparent",
-            border_width=1,
-            text_color=("gray30", "gray80"),
-            hover_color=("gray75", "gray30"),
-            command=lambda did=device["deviceID"]: self._remove_device(did),
-        ).grid(row=0, column=3, rowspan=2, padx=(0, 10))
+            command=_remove_handler,
+        ).grid(row=0, column=3, rowspan=2, padx=(0, 12))
 
     def _remove_device(self, device_id: str) -> None:
         try:
@@ -750,17 +886,31 @@ class _DevicesContent:
         dialog.transient(self._win)
         dialog.grab_set()
 
-        ctk.CTkLabel(dialog, text=f"New name for {device_id[:7]}:", font=ctk.CTkFont(size=12)).pack(
-            padx=20, pady=(18, 6)
-        )
-        entry = ctk.CTkEntry(dialog)
+        dialog.configure(fg_color=THEME.bg)
+        container = ctk.CTkFrame(dialog, fg_color="transparent")
+        container.pack(fill="both", expand=True, padx=20, pady=20)
+
+        ctk.CTkLabel(
+            container,
+            text="Rename device",
+            font=_fonts()["title"],
+            text_color=THEME.text,
+        ).pack(anchor="w")
+        ctk.CTkLabel(
+            container,
+            text=f"Choose a new name for {device_id[:7]}.",
+            font=_fonts()["small"],
+            text_color=THEME.muted,
+        ).pack(anchor="w", pady=(4, 12))
+
+        entry = _entry(container)
         entry.insert(0, current_name)
-        entry.pack(fill="x", padx=20)
+        entry.pack(fill="x")
         entry.select_range(0, "end")
         entry.focus_set()
 
-        btns = ctk.CTkFrame(dialog, fg_color="transparent")
-        btns.pack(fill="x", padx=20, pady=(12, 16))
+        btns = ctk.CTkFrame(container, fg_color="transparent")
+        btns.pack(fill="x", pady=(16, 0))
 
         def do_save() -> None:
             new_name = entry.get().strip()
@@ -773,12 +923,10 @@ class _DevicesContent:
             dialog.destroy()
             self._refresh()
 
-        ctk.CTkButton(btns, text="Cancel", fg_color="transparent", border_width=1, command=dialog.destroy).pack(
-            side="left", expand=True, fill="x", padx=(0, 4)
+        _secondary_button(btns, text="Cancel", command=dialog.destroy).pack(
+            side="left", expand=True, fill="x", padx=(0, 6)
         )
-        ctk.CTkButton(
-            btns, text="Save", fg_color=config.ACCENT_COLOR, hover_color=config.ACCENT_HOVER, command=do_save
-        ).pack(side="left", expand=True, fill="x", padx=(4, 0))
+        _primary_button(btns, text="Save", command=do_save).pack(side="left", expand=True, fill="x", padx=(6, 0))
         entry.bind("<Return>", lambda _e: do_save())
         dialog.bind("<Escape>", lambda _e: dialog.destroy())
 
@@ -796,77 +944,88 @@ class _SettingsContent:
         self._app = app
         self._logs_window: LogsWindow | None = None
 
-        ctk.CTkLabel(container, text="Settings", font=ctk.CTkFont(size=18, weight="bold")).pack(
-            anchor="w", pady=(0, 12)
+        ctk.CTkLabel(container, text="Settings", font=_fonts()["headline"], text_color=THEME.text).pack(
+            anchor="w", pady=(0, 18)
         )
 
+        general_card = _card_frame(container)
+        general_card.pack(fill="x", pady=(0, 16))
+        _section_header(general_card, "General").pack(anchor="w", padx=16, pady=(14, 8))
+
         self._autostart_var = ctk.BooleanVar(value=is_autostart_enabled())
-        ctk.CTkSwitch(
-            container,
-            text="Start on login",
-            variable=self._autostart_var,
-            command=self._on_autostart_toggle,
-            progress_color=config.ACCENT_COLOR,
-        ).pack(anchor="w", pady=4)
+        _switch(general_card, "Start on login", self._autostart_var, self._on_autostart_toggle).pack(
+            anchor="w", padx=16, pady=4
+        )
 
         self._notify_var = ctk.BooleanVar(value=bool(app.settings.get("show_notifications")))
-        ctk.CTkSwitch(
-            container,
-            text="Show notifications on sync",
-            variable=self._notify_var,
-            command=self._on_notify_toggle,
-            progress_color=config.ACCENT_COLOR,
-        ).pack(anchor="w", pady=4)
+        _switch(general_card, "Show notifications on sync", self._notify_var, self._on_notify_toggle).pack(
+            anchor="w", padx=16, pady=4
+        )
 
         self._sync_enabled_var = ctk.BooleanVar(value=not bool(app.settings.get("sync_paused")))
-        ctk.CTkSwitch(
-            container,
-            text="Sync enabled",
-            variable=self._sync_enabled_var,
-            command=self._on_sync_enabled_toggle,
-            progress_color=config.ACCENT_COLOR,
-        ).pack(anchor="w", pady=4)
+        _switch(general_card, "Sync enabled", self._sync_enabled_var, self._on_sync_enabled_toggle).pack(
+            anchor="w", padx=16, pady=4
+        )
 
         self._auto_accept_var = ctk.BooleanVar(value=bool(app.settings.get("auto_accept_incoming")))
-        ctk.CTkSwitch(
-            container,
-            text="Auto-accept incoming requests (no prompt)",
-            variable=self._auto_accept_var,
-            command=self._on_auto_accept_toggle,
-            progress_color=config.ACCENT_COLOR,
-        ).pack(anchor="w", pady=4)
+        _switch(
+            general_card,
+            "Auto-accept incoming requests (no prompt)",
+            self._auto_accept_var,
+            self._on_auto_accept_toggle,
+        ).pack(anchor="w", padx=16, pady=(4, 14))
+
+        privacy_card = _card_frame(container)
+        privacy_card.pack(fill="x", pady=(0, 16))
+        _section_header(privacy_card, "Privacy & security").pack(anchor="w", padx=16, pady=(14, 8))
 
         self._log_mirror_var = ctk.BooleanVar(value=bool(app.settings.get("debug_log_mirror")))
-        ctk.CTkSwitch(
-            container,
-            text="Share my log with paired devices (for debugging)",
-            variable=self._log_mirror_var,
-            command=self._on_log_mirror_toggle,
-            progress_color=config.ACCENT_COLOR,
-        ).pack(anchor="w", pady=4)
+        _switch(
+            privacy_card,
+            "Share my log with paired devices (for debugging)",
+            self._log_mirror_var,
+            self._on_log_mirror_toggle,
+        ).pack(anchor="w", padx=16, pady=(4, 2))
         ctk.CTkLabel(
-            container,
-            text="Copies this device's log into the synced folder, so every paired\n"
-            "device receives it. No clipboard text is logged. Off by default.",
-            font=ctk.CTkFont(size=10),
+            privacy_card,
+            text="Copies this device's log into the synced folder. No clipboard text is logged.",
+            font=_fonts()["tiny"],
             justify="left",
-            text_color=("gray40", "gray60"),
-        ).pack(anchor="w", padx=(28, 0))
+            text_color=THEME.muted,
+        ).pack(anchor="w", padx=(52, 16), pady=(0, 14))
 
-        ctk.CTkLabel(container, text="Appearance", font=ctk.CTkFont(size=11)).pack(anchor="w", pady=(14, 2))
-        theme_row = ctk.CTkFrame(container, fg_color="transparent")
-        theme_row.pack(fill="x", pady=(2, 0))
+        _section_header(privacy_card, "Encryption passphrase (optional)").pack(
+            anchor="w", padx=16, pady=(4, 2)
+        )
+        ctk.CTkLabel(
+            privacy_card,
+            text="Same passphrase on every device. Empty = no encryption.",
+            font=_fonts()["tiny"],
+            text_color=THEME.muted,
+        ).pack(anchor="w", padx=16)
+        passphrase_row = ctk.CTkFrame(privacy_card, fg_color="transparent")
+        passphrase_row.pack(fill="x", padx=16, pady=(6, 16))
+        self._passphrase_entry = _entry(passphrase_row, show="•")
+        self._passphrase_entry.insert(0, str(app.settings.get("encryption_passphrase") or ""))
+        self._passphrase_entry.pack(side="left", fill="x", expand=True, padx=(0, 8))
+        _primary_button(passphrase_row, text="Save", command=self._on_save_passphrase, width=70).pack(side="left")
+
+        appearance_card = _card_frame(container)
+        appearance_card.pack(fill="x", pady=(0, 16))
+        _section_header(appearance_card, "Appearance").pack(anchor="w", padx=16, pady=(14, 8))
+        theme_row = ctk.CTkFrame(appearance_card, fg_color="transparent")
+        theme_row.pack(fill="x", padx=16, pady=(0, 14))
         self._theme_seg = ctk.CTkSegmentedButton(
             theme_row,
             values=["Light", "Dark", "System"],
             command=self._on_theme_changed,
-            fg_color=("gray85", "gray25"),
-            selected_color=config.ACCENT_COLOR,
-            selected_hover_color=config.ACCENT_HOVER,
-            unselected_color=("gray90", "gray20"),
-            unselected_hover_color=("gray80", "gray30"),
-            text_color="white",
-            text_color_disabled=("gray50", "gray60"),
+            fg_color=(config.COLOR_BORDER_LIGHT, config.COLOR_BORDER_DARK),
+            selected_color=config.COLOR_PRIMARY,
+            selected_hover_color=config.COLOR_PRIMARY_HOVER,
+            unselected_color=(config.COLOR_CARD_LIGHT, config.COLOR_CARD_DARK),
+            unselected_hover_color=(config.COLOR_ROW_BG_LIGHT, config.COLOR_ROW_BG_DARK),
+            text_color=THEME.text,
+            text_color_disabled=THEME.muted,
         )
         self._theme_seg.pack(side="left")
         current_theme = str(app.settings.get("theme") or "System")
@@ -875,9 +1034,9 @@ class _SettingsContent:
         else:
             self._theme_seg.set("System")
 
-        ctk.CTkLabel(container, text="Clipboard history auto-clear", font=ctk.CTkFont(size=11)).pack(
-            anchor="w", pady=(14, 2)
-        )
+        history_card = _card_frame(container)
+        history_card.pack(fill="x", pady=(0, 16))
+        _section_header(history_card, "Clipboard history auto-clear").pack(anchor="w", padx=16, pady=(14, 8))
         self._auto_clear_options: dict[str, int] = {
             "Never": 0,
             "5 minutes": 5,
@@ -887,103 +1046,76 @@ class _SettingsContent:
             "4 hours": 240,
             "24 hours": 1440,
         }
-        auto_clear_row = ctk.CTkFrame(container, fg_color="transparent")
-        auto_clear_row.pack(fill="x", pady=(2, 0))
+        auto_clear_row = ctk.CTkFrame(history_card, fg_color="transparent")
+        auto_clear_row.pack(fill="x", padx=16, pady=(0, 14))
         current_auto_clear = int(app.settings.get("history_auto_clear_minutes") or 0)
         auto_clear_label = {v: k for k, v in self._auto_clear_options.items()}.get(current_auto_clear, "Never")
         self._auto_clear_menu = ctk.CTkOptionMenu(
             auto_clear_row,
             values=list(self._auto_clear_options.keys()),
             command=self._on_auto_clear_changed,
-            fg_color=("gray85", "gray25"),
-            button_color=config.ACCENT_COLOR,
-            button_hover_color=config.ACCENT_HOVER,
-            text_color="white",
-            dropdown_fg_color=("gray90", "gray20"),
-            dropdown_hover_color=("gray80", "gray30"),
-            dropdown_text_color="white",
+            fg_color=(config.COLOR_ROW_BG_LIGHT, config.COLOR_ROW_BG_DARK),
+            button_color=config.COLOR_PRIMARY,
+            button_hover_color=config.COLOR_PRIMARY_HOVER,
+            text_color=THEME.text,
+            dropdown_fg_color=(config.COLOR_CARD_LIGHT, config.COLOR_CARD_DARK),
+            dropdown_hover_color=(config.COLOR_ROW_BG_LIGHT, config.COLOR_ROW_BG_DARK),
+            dropdown_text_color=THEME.text,
+            corner_radius=8,
         )
         self._auto_clear_menu.pack(side="left")
         self._auto_clear_menu.set(auto_clear_label)
 
-        ctk.CTkLabel(container, text="Encryption passphrase (optional)", font=ctk.CTkFont(size=11)).pack(
-            anchor="w", pady=(14, 2)
-        )
+        advanced_card = _card_frame(container)
+        advanced_card.pack(fill="x", pady=(0, 16))
+        _section_header(advanced_card, "Advanced").pack(anchor="w", padx=16, pady=(14, 8))
+
+        _section_header(advanced_card, "Sync folder path").pack(anchor="w", padx=16)
         ctk.CTkLabel(
-            container,
-            text="Same passphrase on every device. Empty = no encryption.",
-            font=ctk.CTkFont(size=10),
-            text_color=("gray30", "gray70"),
-        ).pack(anchor="w")
-        passphrase_row = ctk.CTkFrame(container, fg_color="transparent")
-        passphrase_row.pack(fill="x", pady=(2, 0))
-        self._passphrase_entry = ctk.CTkEntry(
-            passphrase_row, show="•", border_width=1, border_color=("gray70", "gray40")
-        )
-        self._passphrase_entry.insert(0, str(app.settings.get("encryption_passphrase") or ""))
-        self._passphrase_entry.pack(side="left", fill="x", expand=True, padx=(0, 6))
-        ctk.CTkButton(
-            passphrase_row,
-            text="Save",
-            width=70,
-            fg_color=config.ACCENT_COLOR,
-            hover_color=config.ACCENT_HOVER,
-            command=self._on_save_passphrase,
-        ).pack(side="left")
-
-        ctk.CTkLabel(container, text="Sync folder path (advanced)", font=ctk.CTkFont(size=11)).pack(
-            anchor="w", pady=(14, 2)
-        )
-        folder_row = ctk.CTkFrame(container, fg_color="transparent")
-        folder_row.pack(fill="x")
-        self._folder_entry = ctk.CTkEntry(folder_row, border_width=1, border_color=("gray70", "gray40"))
+            advanced_card,
+            text="Changing this requires a restart to take effect.",
+            font=_fonts()["tiny"],
+            text_color=THEME.muted,
+        ).pack(anchor="w", padx=16)
+        folder_row = ctk.CTkFrame(advanced_card, fg_color="transparent")
+        folder_row.pack(fill="x", padx=16, pady=(6, 14))
+        self._folder_entry = _entry(folder_row)
         self._folder_entry.insert(0, str(app.settings.get("sync_folder") or config.SYNC_FOLDER))
-        self._folder_entry.pack(side="left", fill="x", expand=True, padx=(0, 6))
-        ctk.CTkButton(
-            folder_row,
-            text="Save",
-            width=70,
-            fg_color=config.ACCENT_COLOR,
-            hover_color=config.ACCENT_HOVER,
-            command=self._on_save_folder,
-        ).pack(side="left")
+        self._folder_entry.pack(side="left", fill="x", expand=True, padx=(0, 8))
+        _primary_button(folder_row, text="Save", command=self._on_save_folder, width=70).pack(side="left")
 
-        ctk.CTkButton(
-            container,
+        _secondary_button(
+            advanced_card,
             text="View Syncthing logs",
-            fg_color="transparent",
-            border_width=1,
-            text_color=config.ACCENT_COLOR,
-            border_color=config.ACCENT_COLOR,
-            hover_color=config.ACCENT_HOVER,
             command=self._on_view_logs,
-        ).pack(fill="x", pady=(18, 6))
+        ).pack(fill="x", padx=16, pady=(0, 14))
 
-        ctk.CTkButton(
-            container,
+        danger_card = _card_frame(container)
+        danger_card.pack(fill="x", pady=(0, 16))
+        _section_header(danger_card, "Danger zone").pack(anchor="w", padx=16, pady=(14, 8))
+        _primary_button(
+            danger_card,
             text="Reset / unpair all devices",
-            fg_color="#9b2c2c",
-            hover_color="#7a2222",
+            fg_color=config.COLOR_DANGER,
+            hover_color=config.COLOR_DANGER_HOVER,
             command=self._on_reset,
-        ).pack(fill="x", pady=(0, 6))
+        ).pack(fill="x", padx=16, pady=(0, 14))
 
-        update_row = ctk.CTkFrame(container, fg_color="transparent")
-        update_row.pack(fill="x", pady=(8, 0))
-        self._update_btn = ctk.CTkButton(
+        update_card = _card_frame(container)
+        update_card.pack(fill="x", pady=(0, 16))
+        _section_header(update_card, "Updates").pack(anchor="w", padx=16, pady=(14, 8))
+        update_row = ctk.CTkFrame(update_card, fg_color="transparent")
+        update_row.pack(fill="x", padx=16, pady=(0, 14))
+        self._update_btn = _secondary_button(
             update_row,
             text=f"Check for updates (v{__version__})",
-            fg_color="transparent",
-            border_width=1,
-            text_color=config.ACCENT_COLOR,
-            border_color=config.ACCENT_COLOR,
-            hover_color=config.ACCENT_HOVER,
             command=self._on_check_update,
         )
         self._update_btn.pack(fill="x")
         self._download_btn: ctk.CTkButton | None = None
         self._update_url = update.RELEASES_HTML_URL
 
-        self._status = ctk.CTkLabel(container, text="", font=ctk.CTkFont(size=11))
+        self._status = ctk.CTkLabel(container, text="", font=_fonts()["small"], text_color=THEME.muted)
         self._status.pack(pady=(8, 0))
 
     def _exists(self) -> bool:
@@ -1111,14 +1243,12 @@ class _SettingsContent:
         self._update_url = info.release_url
         self._status.configure(text=f"Update available: v{info.latest_version} (you have v{info.current_version}).")
         if self._download_btn is None:
-            self._download_btn = ctk.CTkButton(
+            self._download_btn = _primary_button(
                 self._update_btn.master,
                 text="Download update",
-                fg_color=config.ACCENT_COLOR,
-                hover_color=config.ACCENT_HOVER,
                 command=self._on_download_clicked,
             )
-            self._download_btn.pack(fill="x", pady=(6, 0))
+            self._download_btn.pack(fill="x", pady=(10, 0))
 
     def _on_download_clicked(self) -> None:
         if update.open_download_page(self._update_url):
@@ -1129,38 +1259,46 @@ class _SettingsContent:
     def _on_reset(self) -> None:
         confirm = ctk.CTkToplevel(self._win)
         confirm.title("Confirm reset")
+        confirm.configure(fg_color=THEME.bg)
         confirm.resizable(False, False)
-        _center_window(confirm, 320, 140)
+        _center_window(confirm, 340, 170)
         confirm.bind("<Escape>", lambda _e: confirm.destroy())
+        container = ctk.CTkFrame(confirm, fg_color="transparent")
+        container.pack(fill="both", expand=True, padx=24, pady=24)
+
         ctk.CTkLabel(
-            confirm,
-            text="Remove all paired devices?\nYou will need to re-pair them.",
-            justify="center",
-        ).pack(padx=20, pady=(20, 10))
-        btns = ctk.CTkFrame(confirm, fg_color="transparent")
-        btns.pack(fill="x", padx=20, pady=(0, 16))
+            container,
+            text="Reset everything?",
+            font=_fonts()["title"],
+            text_color=THEME.text,
+        ).pack(anchor="w")
+        ctk.CTkLabel(
+            container,
+            text="This removes all paired devices. You will need to re-pair them.",
+            font=_fonts()["small"],
+            text_color=THEME.muted,
+            justify="left",
+            wraplength=280,
+        ).pack(anchor="w", pady=(6, 18))
+
+        btns = ctk.CTkFrame(container, fg_color="transparent")
+        btns.pack(fill="x")
 
         def do_reset() -> None:
             confirm.destroy()
             self._app.on_reset()
             self._status.configure(text="All devices removed.")
 
-        ctk.CTkButton(
-            btns,
-            text="Cancel",
-            height=28,
-            fg_color="transparent",
-            border_width=1,
-            command=confirm.destroy,
-        ).pack(side="left", expand=True, fill="x", padx=(0, 4))
-        ctk.CTkButton(
+        _secondary_button(btns, text="Cancel", command=confirm.destroy).pack(
+            side="left", expand=True, fill="x", padx=(0, 6)
+        )
+        _primary_button(
             btns,
             text="Reset",
-            height=28,
-            fg_color="#9b2c2c",
-            hover_color="#7a2222",
+            fg_color=config.COLOR_DANGER,
+            hover_color=config.COLOR_DANGER_HOVER,
             command=do_reset,
-        ).pack(side="left", expand=True, fill="x", padx=(4, 0))
+        ).pack(side="left", expand=True, fill="x", padx=(6, 0))
 
 
 # ---------------------------------------------------------------------------
@@ -1196,9 +1334,13 @@ class SettingsWindow(_BaseWindow):
     """Toggles for autostart, notifications, pause, sync folder, reset."""
 
     def __init__(self, parent: ctk.CTk, app: AppContext, on_close: Callable[[], None]) -> None:
-        super().__init__(parent, f"{config.APP_NAME} — Settings", config.SETTINGS_WINDOW_SIZE, on_close)
-        container = ctk.CTkScrollableFrame(self.window, fg_color=("gray95", "gray13"))
-        container.pack(fill="both", expand=True, padx=20, pady=20)
+        super().__init__(parent, f"{config.APP_NAME} — Settings", (440, 560), on_close)
+        container = ctk.CTkScrollableFrame(
+            self.window,
+            fg_color=THEME.bg,
+            scrollbar_button_color=(config.COLOR_BORDER_LIGHT, config.COLOR_BORDER_DARK),
+        )
+        container.pack(fill="both", expand=True, padx=16, pady=16)
         _SettingsContent(self.window, container, app)
 
 
@@ -1215,24 +1357,37 @@ class TabbedWindow(_BaseWindow):
         on_close: Callable[[], None],
         initial_tab: str = "Devices",
     ) -> None:
-        super().__init__(parent, config.APP_NAME, (520, 580), on_close)
+        super().__init__(parent, config.APP_NAME, (560, 620), on_close)
         self.window.resizable(True, True)
 
-        tabs = ctk.CTkTabview(self.window)
-        tabs.pack(fill="both", expand=True, padx=8, pady=8)
+        tabs = ctk.CTkTabview(
+            self.window,
+            fg_color=THEME.bg,
+            segmented_button_fg_color=(config.COLOR_BORDER_LIGHT, config.COLOR_BORDER_DARK),
+            segmented_button_selected_color=config.COLOR_PRIMARY,
+            segmented_button_selected_hover_color=config.COLOR_PRIMARY_HOVER,
+            segmented_button_unselected_color=THEME.card_fg(),
+            segmented_button_unselected_hover_color=(config.COLOR_ROW_BG_LIGHT, config.COLOR_ROW_BG_DARK),
+            text_color=THEME.text,
+        )
+        tabs.pack(fill="both", expand=True, padx=12, pady=12)
         for name in self._TAB_NAMES:
             tabs.add(name)
 
         dev_frame = ctk.CTkFrame(tabs.tab("Devices"), fg_color="transparent")
-        dev_frame.pack(fill="both", expand=True, padx=16, pady=12)
+        dev_frame.pack(fill="both", expand=True, padx=14, pady=10)
         _DevicesContent(self.window, dev_frame, app)
 
         pair_frame = ctk.CTkFrame(tabs.tab("Pair"), fg_color="transparent")
-        pair_frame.pack(fill="both", expand=True, padx=16, pady=12)
+        pair_frame.pack(fill="both", expand=True, padx=14, pady=10)
         self._pairing = _PairingContent(self.window, pair_frame, app)
 
-        settings_frame = ctk.CTkScrollableFrame(tabs.tab("Settings"), fg_color=("gray95", "gray13"))
-        settings_frame.pack(fill="both", expand=True, padx=16, pady=12)
+        settings_frame = ctk.CTkScrollableFrame(
+            tabs.tab("Settings"),
+            fg_color=THEME.bg,
+            scrollbar_button_color=(config.COLOR_BORDER_LIGHT, config.COLOR_BORDER_DARK),
+        )
+        settings_frame.pack(fill="both", expand=True, padx=14, pady=10)
         _SettingsContent(self.window, settings_frame, app)
 
         if initial_tab in self._TAB_NAMES:
@@ -1247,19 +1402,22 @@ class LogsWindow(_BaseWindow):
     """Read-only tail of the ClipSync log file."""
 
     def __init__(self, parent: ctk.CTk, on_close: Callable[[], None]) -> None:
-        super().__init__(parent, f"{config.APP_NAME} — Logs", (600, 400), on_close)
+        super().__init__(parent, f"{config.APP_NAME} — Logs", (640, 440), on_close)
         container = ctk.CTkFrame(self.window, fg_color="transparent")
-        container.pack(fill="both", expand=True, padx=16, pady=16)
-        self._textbox = ctk.CTkTextbox(container, wrap="none", font=ctk.CTkFont(family="Menlo", size=11))
+        container.pack(fill="both", expand=True, padx=20, pady=20)
+        ctk.CTkLabel(container, text="Logs", font=_fonts()["headline"], text_color=THEME.text).pack(anchor="w", pady=(0, 12))
+        self._textbox = ctk.CTkTextbox(
+            container,
+            wrap="none",
+            font=_fonts()["mono"],
+            fg_color=(config.COLOR_CARD_LIGHT, config.COLOR_CARD_DARK),
+            border_color=(config.COLOR_BORDER_LIGHT, config.COLOR_BORDER_DARK),
+            border_width=1,
+            corner_radius=10,
+        )
         self._textbox.pack(fill="both", expand=True)
         self._refresh()
-        ctk.CTkButton(
-            container,
-            text="Refresh",
-            fg_color=config.ACCENT_COLOR,
-            hover_color=config.ACCENT_HOVER,
-            command=self._refresh,
-        ).pack(fill="x", pady=(10, 0))
+        _primary_button(container, text="Refresh", command=self._refresh).pack(fill="x", pady=(12, 0))
 
     def _refresh(self) -> None:
         try:
@@ -1291,21 +1449,27 @@ class IncomingWindow(_BaseWindow):
         container = ctk.CTkFrame(self.window, fg_color="transparent")
         container.pack(fill="both", expand=True, padx=20, pady=20)
 
-        ctk.CTkLabel(container, text="Incoming device requests", font=ctk.CTkFont(size=18, weight="bold")).pack(
-            pady=(0, 8)
-        )
+        ctk.CTkLabel(
+            container, text="Incoming device requests", font=_fonts()["headline"], text_color=THEME.text
+        ).pack(pady=(0, 6))
         ctk.CTkLabel(
             container,
             text="Accept a device to start syncing clipboard with it.",
-            font=ctk.CTkFont(size=11),
-            text_color=("gray30", "gray70"),
-        ).pack(pady=(0, 10))
+            font=_fonts()["small"],
+            text_color=THEME.muted,
+        ).pack(pady=(0, 16))
 
-        self._list_frame = ctk.CTkScrollableFrame(container, fg_color=("gray90", "gray17"))
+        self._list_frame = ctk.CTkScrollableFrame(
+            container,
+            fg_color=THEME.card_fg(),
+            border_width=1,
+            border_color=(config.COLOR_BORDER_LIGHT, config.COLOR_BORDER_DARK),
+            corner_radius=12,
+        )
         self._list_frame.pack(fill="both", expand=True)
 
-        self._status = ctk.CTkLabel(container, text="", font=ctk.CTkFont(size=11))
-        self._status.pack(pady=(8, 0))
+        self._status = ctk.CTkLabel(container, text="", font=_fonts()["small"], text_color=THEME.muted)
+        self._status.pack(pady=(10, 0))
 
         self._refresh()
         self._schedule_refresh()
@@ -1350,7 +1514,7 @@ class IncomingWindow(_BaseWindow):
         for child in self._list_frame.winfo_children():
             child.destroy()
         if error:
-            ctk.CTkLabel(self._list_frame, text=error, text_color="red").pack(pady=10)
+            ctk.CTkLabel(self._list_frame, text=error, text_color=config.COLOR_DANGER, font=_fonts()["body"]).pack(pady=14)
             return
         rejected = set(self._app.settings.get("rejected_device_ids") or [])
         visible = [
@@ -1360,57 +1524,55 @@ class IncomingWindow(_BaseWindow):
         ]
         if not visible:
             empty = ctk.CTkFrame(self._list_frame, fg_color="transparent")
-            empty.pack(pady=30)
+            empty.pack(pady=40)
             ctk.CTkLabel(
                 empty,
                 text="No pending requests.",
-                font=ctk.CTkFont(size=14, weight="bold"),
-                text_color=("gray30", "gray70"),
+                font=_fonts()["title"],
+                text_color=THEME.muted,
             ).pack()
             ctk.CTkLabel(
                 empty,
                 text="Ask the other device to pair with this one.",
-                font=ctk.CTkFont(size=11),
-                text_color=("gray30", "gray70"),
+                font=_fonts()["small"],
+                text_color=THEME.muted,
             ).pack(pady=(4, 0))
             return
         for device_id, info in visible:
             self._build_row(device_id, info)
 
     def _build_row(self, device_id: str, info: dict) -> None:
-        row = ctk.CTkFrame(self._list_frame, fg_color=("gray85", "gray22"))
-        row.pack(fill="x", padx=4, pady=4)
+        row = ctk.CTkFrame(self._list_frame, fg_color=(config.COLOR_ROW_BG_LIGHT, config.COLOR_ROW_BG_DARK), corner_radius=10)
+        row.pack(fill="x", padx=8, pady=5)
         row.grid_columnconfigure(0, weight=1)
 
         name = info.get("name") or device_id[:7]
-        ctk.CTkLabel(row, text=str(name), font=ctk.CTkFont(size=13, weight="bold"), anchor="w").grid(
-            row=0, column=0, sticky="we", padx=10, pady=(8, 0)
+        ctk.CTkLabel(row, text=str(name), font=_fonts()["subtitle"], text_color=THEME.text, anchor="w").grid(
+            row=0, column=0, sticky="we", padx=12, pady=(10, 0)
         )
-        ctk.CTkLabel(row, text=device_id[:24] + "…", font=ctk.CTkFont(size=10), anchor="w").grid(
-            row=1, column=0, sticky="we", padx=10, pady=(0, 8)
+        ctk.CTkLabel(row, text=device_id[:24] + "…", font=_fonts()["tiny"], text_color=THEME.muted, anchor="w").grid(
+            row=1, column=0, sticky="we", padx=12, pady=(0, 10)
         )
 
-        ctk.CTkButton(
+        def _accept_handler(did: str = device_id) -> None:
+            self._accept(did)
+
+        def _reject_handler(did: str = device_id) -> None:
+            self._reject(did)
+
+        _primary_button(
             row,
             text="Accept",
             width=70,
-            height=28,
-            fg_color=config.ACCENT_COLOR,
-            hover_color=config.ACCENT_HOVER,
-            command=lambda did=device_id: self._accept(did),
-        ).grid(row=0, column=1, rowspan=2, padx=(0, 6))
+            command=_accept_handler,
+        ).grid(row=0, column=1, rowspan=2, padx=(0, 4))
 
-        ctk.CTkButton(
+        _secondary_button(
             row,
             text="Reject",
             width=70,
-            height=28,
-            fg_color="transparent",
-            border_width=1,
-            text_color=("gray30", "gray80"),
-            hover_color=("gray75", "gray30"),
-            command=lambda did=device_id: self._reject(did),
-        ).grid(row=0, column=2, rowspan=2, padx=(0, 10))
+            command=_reject_handler,
+        ).grid(row=0, column=2, rowspan=2, padx=(0, 12))
 
     def _accept(self, device_id: str) -> None:
         self._handled.add(device_id)
@@ -1441,45 +1603,35 @@ class HistoryWindow(_BaseWindow):
 
         header = ctk.CTkFrame(container, fg_color="transparent")
         header.pack(fill="x", pady=(0, 10))
-        ctk.CTkLabel(header, text="Clipboard History", font=ctk.CTkFont(size=18, weight="bold")).pack(side="left")
-        self._status = ctk.CTkLabel(header, text="", font=ctk.CTkFont(size=11), text_color=("gray30", "gray70"))
+        ctk.CTkLabel(header, text="Clipboard History", font=_fonts()["headline"], text_color=THEME.text).pack(side="left")
+        self._status = ctk.CTkLabel(header, text="", font=_fonts()["small"], text_color=THEME.muted)
         self._status.pack(side="right")
 
-        search_row = ctk.CTkFrame(container, fg_color="transparent")
-        search_row.pack(fill="x", pady=(0, 8))
+        search_row = _card_frame(container)
+        search_row.pack(fill="x", pady=(0, 12))
         self._search_var = ctk.StringVar()
         self._search_var.trace_add("write", lambda *_: self._refresh())
-        self._search_entry = ctk.CTkEntry(
+        self._search_entry = _entry(
             search_row,
             placeholder_text="Search history…",
             textvariable=self._search_var,
         )
-        self._search_entry.pack(side="left", fill="x", expand=True)
+        self._search_entry.pack(side="left", fill="x", expand=True, padx=10, pady=10)
         self._search_entry.bind("<Escape>", lambda _e: (self._search_var.set(""), self._search_entry.focus_set()))
 
-        self._list_frame = ctk.CTkScrollableFrame(container, fg_color=("gray90", "gray17"))
+        self._list_frame = ctk.CTkScrollableFrame(
+            container,
+            fg_color=THEME.card_fg(),
+            border_width=1,
+            border_color=(config.COLOR_BORDER_LIGHT, config.COLOR_BORDER_DARK),
+            corner_radius=12,
+        )
         self._list_frame.pack(fill="both", expand=True)
 
         btn_row = ctk.CTkFrame(container, fg_color="transparent")
-        btn_row.pack(fill="x", pady=(10, 0))
-        ctk.CTkButton(
-            btn_row,
-            text="Refresh",
-            height=28,
-            fg_color=config.ACCENT_COLOR,
-            hover_color=config.ACCENT_HOVER,
-            width=100,
-            command=self._refresh,
-        ).pack(side="left")
-        ctk.CTkButton(
-            btn_row,
-            text="Clear All",
-            height=28,
-            fg_color=("gray75", "gray30"),
-            hover_color=("gray65", "gray40"),
-            width=100,
-            command=self._confirm_clear,
-        ).pack(side="right")
+        btn_row.pack(fill="x", pady=(14, 0))
+        _primary_button(btn_row, text="Refresh", command=self._refresh, width=100).pack(side="left")
+        _secondary_button(btn_row, text="Clear All", command=self._confirm_clear, width=100).pack(side="right")
 
         self._all_entries: list[object] = []
         self._refresh()
@@ -1554,40 +1706,47 @@ class HistoryWindow(_BaseWindow):
         if len(preview) > 72:
             preview = preview[:72] + "..."
 
-        row = ctk.CTkFrame(self._list_frame, fg_color=("white", "gray20"), corner_radius=6)
-        row.pack(fill="x", padx=4, pady=3)
+        row = ctk.CTkFrame(
+            self._list_frame,
+            fg_color=(config.COLOR_CARD_LIGHT, config.COLOR_CARD_DARK),
+            border_width=1,
+            border_color=(config.COLOR_BORDER_LIGHT, config.COLOR_BORDER_DARK),
+            corner_radius=10,
+        )
+        row.pack(fill="x", padx=6, pady=4)
         row.grid_columnconfigure(1, weight=1)
 
-        source_label = "[Remote]" if source == "remote" else "[Local]"
+        source_label = "Remote" if source == "remote" else "Local"
+        source_color = config.COLOR_PRIMARY if source == "remote" else THEME.muted
         meta = ctk.CTkLabel(
             row,
-            text=f"{time_str}  {source_label}",
-            font=ctk.CTkFont(size=10),
-            text_color=("gray30", "gray70"),
+            text=f"{time_str}  •  {source_label}",
+            font=_fonts()["tiny"],
+            text_color=source_color,
             anchor="w",
         )
-        meta.grid(row=0, column=0, columnspan=2, sticky="ew", padx=10, pady=(6, 0))
+        meta.grid(row=0, column=0, columnspan=2, sticky="ew", padx=12, pady=(8, 0))
 
         preview_label = ctk.CTkLabel(
             row,
             text=preview or "(empty)",
-            font=ctk.CTkFont(size=12),
+            font=_fonts()["small"],
+            text_color=THEME.text,
             anchor="w",
             justify="left",
         )
-        preview_label.grid(row=1, column=0, columnspan=2, sticky="ew", padx=10, pady=(2, 6))
+        preview_label.grid(row=1, column=0, columnspan=2, sticky="ew", padx=12, pady=(2, 8))
 
-        copy_btn = ctk.CTkButton(
+        def _copy_handler(t: str = text) -> None:
+            self._copy_entry(t)
+
+        copy_btn = _primary_button(
             row,
             text="Copy",
             width=56,
-            height=28,
-            font=ctk.CTkFont(size=11),
-            fg_color=config.ACCENT_COLOR,
-            hover_color=config.ACCENT_HOVER,
-            command=lambda t=text, b=None: self._copy_entry(t),
+            command=_copy_handler,
         )
-        copy_btn.grid(row=0, column=2, rowspan=2, padx=(0, 8), pady=6)
+        copy_btn.grid(row=0, column=2, rowspan=2, padx=(0, 10), pady=6)
 
     def _copy_entry(self, text: str) -> None:
         try:
@@ -1602,23 +1761,31 @@ class HistoryWindow(_BaseWindow):
     def _confirm_clear(self) -> None:
         dialog = ctk.CTkToplevel(self.window)
         dialog.title("Clear History")
+        dialog.configure(fg_color=THEME.bg)
         dialog.resizable(False, False)
-        _center_window(dialog, 320, 140)
+        _center_window(dialog, 340, 170)
         dialog.lift()
         dialog.focus_force()
         dialog.grab_set()
         dialog.bind("<Escape>", lambda _e: dialog.destroy())
 
-        ctk.CTkLabel(dialog, text="Clear all clipboard history?", font=ctk.CTkFont(size=13)).pack(pady=(24, 4))
+        container = ctk.CTkFrame(dialog, fg_color="transparent")
+        container.pack(fill="both", expand=True, padx=24, pady=24)
         ctk.CTkLabel(
-            dialog,
+            container,
+            text="Clear all clipboard history?",
+            font=_fonts()["title"],
+            text_color=THEME.text,
+        ).pack(anchor="w")
+        ctk.CTkLabel(
+            container,
             text="This cannot be undone.",
-            font=ctk.CTkFont(size=11),
-            text_color=("gray30", "gray70"),
-        ).pack()
+            font=_fonts()["small"],
+            text_color=THEME.muted,
+        ).pack(anchor="w", pady=(6, 18))
 
-        btn_row = ctk.CTkFrame(dialog, fg_color="transparent")
-        btn_row.pack(pady=14)
+        btn_row = ctk.CTkFrame(container, fg_color="transparent")
+        btn_row.pack(fill="x")
 
         def do_clear() -> None:
             _emit("clear_history")
@@ -1628,24 +1795,16 @@ class HistoryWindow(_BaseWindow):
             dialog.destroy()
             self._refresh()
 
-        ctk.CTkButton(
-            btn_row,
-            text="Cancel",
-            width=90,
-            height=28,
-            fg_color=("gray75", "gray30"),
-            hover_color=("gray65", "gray40"),
-            command=dialog.destroy,
-        ).pack(side="left", padx=6)
-        ctk.CTkButton(
+        _secondary_button(btn_row, text="Cancel", command=dialog.destroy).pack(
+            side="left", expand=True, fill="x", padx=(0, 6)
+        )
+        _primary_button(
             btn_row,
             text="Clear All",
-            width=90,
-            height=28,
-            fg_color=config.ACCENT_COLOR,
-            hover_color=config.ACCENT_HOVER,
+            fg_color=config.COLOR_DANGER,
+            hover_color=config.COLOR_DANGER_HOVER,
             command=do_clear,
-        ).pack(side="left", padx=6)
+        ).pack(side="left", expand=True, fill="x", padx=(6, 0))
 
 
 def _run_child(window_name: str) -> int:
@@ -1678,8 +1837,10 @@ def _run_child(window_name: str) -> int:
         theme = "System"
     ctk.set_appearance_mode(theme)
     ctk.set_default_color_theme("dark-blue")
+    THEME.set_mode(theme)
     root = ctk.CTk()
     root.withdraw()
+    root.configure(fg_color=THEME.bg)
 
     def _quit() -> None:
         try:
