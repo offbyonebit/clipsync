@@ -1840,7 +1840,16 @@ def _run_child(window_name: str) -> int:
     THEME.set_mode(theme)
     root = ctk.CTk()
     root.withdraw()
-    root.configure(fg_color=THEME.bg)
+    # The root is intentionally hidden on every platform. Configuring its
+    # background color on Windows, especially with CTk's titlebar
+    # manipulation disabled, can trigger internal state updates that leave the
+    # real Toplevel window hidden or unresponsive. Keep the cosmetics off the
+    # root and apply them to the actual windows instead.
+    if sys.platform != "win32":
+        try:
+            root.configure(fg_color=THEME.bg)
+        except Exception:
+            pass
 
     def _quit() -> None:
         try:
