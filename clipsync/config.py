@@ -206,7 +206,7 @@ class Settings:
     def _secure_namespace(self) -> str:
         """Stable namespace isolating secure storage per settings file."""
         try:
-            return str(self._path.parent.resolve())
+            return str(self._path.resolve())
         except OSError:
             return str(self._path)
 

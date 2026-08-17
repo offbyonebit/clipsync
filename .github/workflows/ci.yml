@@ -30,6 +30,15 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements-dev.txt
 
+      - name: Start xvfb (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb
+          export DISPLAY=:99
+          Xvfb :99 -screen 0 1024x768x24 &
+          echo "DISPLAY=:99" >> "$GITHUB_ENV"
+
       - name: Lint
         run: ruff check clipsync/ tests/
 
