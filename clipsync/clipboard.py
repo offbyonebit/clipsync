@@ -1039,10 +1039,10 @@ class _ClipboardFileHandler(FileSystemEventHandler):
         self._sync._in_queue.put(path)
 
     def _path_str(self, path: str | bytes) -> str:
-        """Decode watchdog paths safely; fsdecode handles non-UTF-8 bytes."""
+        """Decode watchdog paths safely; surrogateescape preserves non-UTF-8 bytes."""
         if isinstance(path, str):
             return path
-        return os.fsdecode(path)
+        return path.decode("utf-8", errors="surrogateescape")
 
     def on_modified(self, event: FileSystemEvent) -> None:
         if event.is_directory:

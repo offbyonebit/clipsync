@@ -88,7 +88,13 @@ def _read_machine_secret() -> bytes:
 
     # Last-resort fallback: hostname + username + home path. Not unique across
     # identical user accounts, but still better than a hardcoded key.
-    candidates.append(f"{os.getlogin()}@{platform.node()}:{Path.home()}".encode())
+    try:
+        import getpass
+
+        user = getpass.getuser()
+    except Exception:
+        user = str(os.getuid()) if hasattr(os, "getuid") else "unknown"
+    candidates.append(f"{user}@{platform.node()}:{Path.home()}".encode())
 
     return b"\0".join(candidates)
 

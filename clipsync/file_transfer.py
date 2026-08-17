@@ -13,7 +13,6 @@ Receiving:
 from __future__ import annotations
 
 import logging
-import os
 import shutil
 import threading
 import time
@@ -154,10 +153,10 @@ class _FileReceiveHandler(FileSystemEventHandler):
             log.exception("Error in file receive handler")
 
     def _path_str(self, path: str | bytes) -> str:
-        """Decode watchdog paths safely; fsdecode handles non-UTF-8 bytes."""
+        """Decode watchdog paths safely; surrogateescape preserves non-UTF-8 bytes."""
         if isinstance(path, str):
             return path
-        return os.fsdecode(path)
+        return path.decode("utf-8", errors="surrogateescape")
 
     def on_created(self, event: FileSystemEvent) -> None:
         if not event.is_directory:
