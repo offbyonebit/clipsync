@@ -727,7 +727,7 @@ def _kill_pid(pid: int) -> None:
             return
         time.sleep(0.1)
     try:
-        os.kill(pid, _signal.SIGKILL)
+        os.kill(pid, _signal.SIGKILL)  # type: ignore[attr-defined]
     except (ProcessLookupError, PermissionError):
         pass
 

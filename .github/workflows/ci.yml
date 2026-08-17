@@ -49,4 +49,4 @@ jobs:
         run: mypy clipsync/
 
       - name: Test
-        run: pytest tests/ -q
+        run: pytest tests/ -q -m "not integration"

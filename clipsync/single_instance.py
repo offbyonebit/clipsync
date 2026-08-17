@@ -44,7 +44,7 @@ class SingleInstance:
                 import fcntl
 
                 try:
-                    fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)  # type: ignore[attr-defined]
                 except OSError as exc:
                     raise AlreadyRunning(str(self._path)) from exc
         except BaseException:
@@ -70,7 +70,7 @@ class SingleInstance:
                 import fcntl
 
                 try:
-                    fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_UN)  # type: ignore[attr-defined]
                 except OSError:
                     pass
         finally:
