@@ -169,13 +169,20 @@ class Settings:
         if not merged.get("api_key"):
             merged["api_key"] = uuid.uuid4().hex
         self._data = merged
+        # Migrate any plaintext passphrase into secure storage.
+        self._maybe_migrate_passphrase()
         # Only persist if the on-disk file is incomplete (missing a default
-        # key) or has an empty api_key that we just generated. Otherwise
-        # leave the file alone: rewriting it on every startup is needless
-        # churn and could race with a concurrent writer (e.g. a UI
-        # subprocess that just wrote a new value).
+        # key), has an empty api_key that we just generated, or still holds a
+        # plaintext passphrase that was just migrated. Otherwise leave the file
+        # alone: rewriting it on every startup is needless churn and could race
+        # with a concurrent writer (e.g. a UI subprocess that just wrote a new
+        # value).
         loaded_keys = set(loaded.keys())
-        needs_persist = not loaded.get("api_key") or any(k not in loaded_keys for k in DEFAULT_SETTINGS)
+        needs_persist = (
+            not loaded.get("api_key")
+            or any(k not in loaded_keys for k in DEFAULT_SETTINGS)
+            or loaded.get("encryption_passphrase", "") != ""
+        )
         if needs_persist:
             self._persist_locked()
         else:
@@ -183,6 +190,25 @@ class Settings:
                 self._mtime_ns = self._path.stat().st_mtime_ns
             except OSError:
                 pass
+
+    def _maybe_migrate_passphrase(self) -> None:
+        """Move plaintext passphrases from settings.json into secure storage."""
+        plaintext = self._data.get("encryption_passphrase", "")
+        if not plaintext or not isinstance(plaintext, str):
+            return
+        try:
+            from .secure_settings import migrate_plaintext_passphrase
+
+            migrate_plaintext_passphrase(self, self._secure_namespace())
+        except Exception:
+            logging.warning("Could not migrate plaintext passphrase", exc_info=True)
+
+    def _secure_namespace(self) -> str:
+        """Stable namespace isolating secure storage per settings file."""
+        try:
+            return str(self._path.parent.resolve())
+        except OSError:
+            return str(self._path)
 
     def _persist_locked(self) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)
@@ -216,10 +242,32 @@ class Settings:
     def get(self, key: str, default: Any = None) -> Any:
         with self._lock:
             self._refresh_if_changed()
+            if key == "encryption_passphrase":
+                in_memory = self._data.get(key, default)
+                if in_memory:
+                    return in_memory
+                try:
+                    from .secure_settings import get_passphrase
+
+                    stored = get_passphrase(self._secure_namespace())
+                    if stored is not None:
+                        return stored
+                except Exception:
+                    logging.warning("Could not read passphrase from secure storage", exc_info=True)
             return self._data.get(key, default)
 
     def set(self, key: str, value: Any) -> None:
         with self._lock:
+            if key == "encryption_passphrase":
+                try:
+                    from .secure_settings import set_passphrase
+
+                    set_passphrase(value if value else None, self._secure_namespace())
+                except Exception:
+                    logging.warning("Could not write passphrase to secure storage", exc_info=True)
+                # Keep the plaintext field empty; the passphrase lives in the
+                # OS keychain or the encrypted fallback file.
+                value = ""
             self._data[key] = value
             self._persist_locked()
 

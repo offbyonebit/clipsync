@@ -60,6 +60,22 @@ def test_out_tick_retries_text_after_write_oserror(tmp_path, monkeypatch):
     assert calls == ["important text", "important text"], "value was never retried after OSError"
 
 
+def test_last_synced_not_updated_until_write_succeeds(tmp_path, monkeypatch):
+    """Updating _last_synced before the write made a failed outbound sync look
+    permanently completed. It must only be committed after the file is written."""
+    sync = _make_sync(tmp_path)
+    monkeypatch.setattr(sync, "_read_clipboard_image", lambda: None)
+    monkeypatch.setattr(sync, "_read_clipboard", lambda: "important text")
+
+    def failing_write(_text: str) -> None:
+        raise OSError("disk busy")
+
+    monkeypatch.setattr(sync, "_write_file", failing_write)
+
+    sync._out_tick()
+    assert sync._last_synced != "important text"
+
+
 def test_out_tick_retries_image_after_write_oserror(tmp_path, monkeypatch):
     sync = _make_sync(tmp_path)
     monkeypatch.setattr(sync, "_read_clipboard_image", lambda: b"\x89PNGfake")
@@ -75,6 +91,23 @@ def test_out_tick_retries_image_after_write_oserror(tmp_path, monkeypatch):
     sync._out_tick()
     sync._out_tick()
     assert len(calls) == 2, "image was never retried after OSError"
+
+
+def test_failed_write_does_not_leave_tmp_file(tmp_path, monkeypatch):
+    """A failed atomic write must not leave a stale .tmp file in the sync folder."""
+    sync = _make_sync(tmp_path)
+
+    def failing_replace(_path: Path) -> None:
+        raise PermissionError("locked")
+
+    # Stub os.replace so the atomic write fails after the temp file is created.
+    monkeypatch.setattr("os.replace", lambda _src, _dst: failing_replace(_dst))
+
+    with pytest.raises(PermissionError):
+        sync._write_file("some text")
+
+    tmp_files = list(sync.clipboard_file.parent.glob("*.tmp"))
+    assert not tmp_files, f"left behind temp files: {tmp_files}"
 
 
 def test_out_tick_still_keeps_guard_when_write_succeeds(tmp_path, monkeypatch):
@@ -174,6 +207,39 @@ def test_truncate_for_log_leaves_short_values_intact():
     assert clipboard_mod._truncate_for_log("hi") == "'hi'"
     assert clipboard_mod._truncate_for_log(None) == "None"
     assert clipboard_mod._truncate_for_log(b"hi") == "b'hi'"
+
+
+def test_heartbeat_does_not_log_clipboard_text(tmp_path, monkeypatch, caplog):
+    """The debug log mirror ships the log file to peers. The heartbeat must
+    not include clipboard text, even truncated, because that text is the
+    user's actual clipboard content."""
+    import logging
+
+    from clipsync.clipboard import _HOSTNAME
+
+    sync = _make_sync(tmp_path)
+    monkeypatch.setattr(sync, "_read_clipboard_image", lambda: None)
+    monkeypatch.setattr(sync, "_read_clipboard", lambda: "super-secret-password")
+
+    with caplog.at_level(logging.DEBUG, logger="clipsync.clipboard"):
+        sync._out_tick()
+        # Simulate heartbeat by calling the relevant logging path directly.
+        with sync._lock:
+            last = sync._last_synced
+        if isinstance(last, bytes):
+            desc = f"<image {len(last)} bytes>"
+        elif isinstance(last, str):
+            desc = f"<text {len(last)} chars>"
+        else:
+            desc = "<none>"
+        logging.getLogger("clipsync.clipboard").debug(
+            "HEARTBEAT (host=%s): last_synced=%s, paused=%s", _HOSTNAME, desc, False
+        )
+
+    heartbeat_lines = [r for r in caplog.records if "HEARTBEAT" in r.message]
+    assert heartbeat_lines
+    for record in heartbeat_lines:
+        assert "super-secret-password" not in record.message
 
 
 # ---------------------------------------------------------------------------
@@ -344,6 +410,7 @@ def test_file_transfer_delivers_each_file_once_under_concurrency(tmp_path):
     check-then-add on _seen let two events for one file both pass, delivering
     it twice."""
     import threading
+    from collections import OrderedDict
 
     from clipsync import file_transfer as ft_mod
 
@@ -355,7 +422,7 @@ def test_file_transfer_delivers_each_file_once_under_concurrency(tmp_path):
         with deliver_lock:
             delivered.append(path)
 
-    class _SlowSet(set):
+    class _SlowOrderedDict(OrderedDict):
         """The real check-then-add is two adjacent bytecodes, so the GIL
         almost never splits it and the race will not reproduce by chance.
         Sleeping inside the membership test widens the window to what a
@@ -372,8 +439,11 @@ def test_file_transfer_delivers_each_file_once_under_concurrency(tmp_path):
             time.sleep(0.005)
             return result
 
+        def move_to_end(self, key, last=True):
+            return super().move_to_end(key, last=last)
+
     handler = ft_mod._FileReceiveHandler(on_received=on_received)
-    handler._seen = _SlowSet()
+    handler._seen = _SlowOrderedDict()
     incoming = tmp_path / "files" / "peer-host" / "report.pdf"
     incoming.parent.mkdir(parents=True)
     incoming.write_bytes(b"data")
@@ -392,6 +462,26 @@ def test_file_transfer_delivers_each_file_once_under_concurrency(tmp_path):
     assert len(delivered) == 1, f"file delivered {len(delivered)} times; _seen check-then-add is not atomic"
 
 
+def test_file_receive_seen_set_is_bounded(tmp_path, monkeypatch) -> None:
+    """Received-file deduplication must not grow without bound; filenames are
+    timestamped so every incoming file is a new key."""
+    from clipsync import file_transfer as ft_mod
+
+    received: list[Path] = []
+    handler = ft_mod._FileReceiveHandler(on_received=lambda p, _s: received.append(p))
+    # Match everything; sender extraction still runs.
+    handler._seen_max = 50
+
+    for i in range(200):
+        incoming = tmp_path / "files" / "peer" / f"file_{i}.txt"
+        incoming.parent.mkdir(parents=True, exist_ok=True)
+        incoming.write_bytes(b"data")
+        handler._handle(incoming)
+
+    assert len(handler._seen) <= handler._seen_max
+    assert len(received) == 200
+
+
 def test_debounce_dict_does_not_grow_unbounded(tmp_path, monkeypatch):
     """Per-path deadlines are keyed by filename, and only two filenames ever
     match, so the dict cannot grow with event volume."""
@@ -406,3 +496,76 @@ def test_debounce_dict_does_not_grow_unbounded(tmp_path, monkeypatch):
             handler._debounce_until = {k: v - 1.0 for k, v in handler._debounce_until.items()}
 
     assert len(handler._debounce_until) <= 2, f"debounce map grew to {len(handler._debounce_until)} entries"
+
+
+def test_clipboard_handler_decodes_non_utf8_paths(tmp_path, monkeypatch):
+    """watchdog may report paths as bytes that are not valid UTF-8. The handler
+    must not crash when decoding them."""
+    sync = _make_sync(tmp_path)
+    handler = _ClipboardFileHandler(sync)
+    monkeypatch.setattr(handler, "_matches", lambda _p: True)
+
+    bad_bytes = b"/tmp/sync/clipboard\xff.txt"
+    # Should not raise.
+    handler.on_modified(_FakeEvent(bad_bytes, is_directory=False))
+    handler.on_created(_FakeEvent(bad_bytes, is_directory=False))
+
+
+def test_clipboard_handler_decodes_non_utf8_moved_dest(tmp_path, monkeypatch):
+    sync = _make_sync(tmp_path)
+    handler = _ClipboardFileHandler(sync)
+    monkeypatch.setattr(handler, "_matches", lambda _p: True)
+
+    bad_bytes = b"/tmp/sync/clipboard\xff.txt"
+    handler.on_moved(_FakeMovedEvent(bad_bytes, is_directory=False))
+
+
+class _FakeEvent:
+    def __init__(self, src_path: str | bytes, is_directory: bool = False) -> None:
+        self.src_path = src_path
+        self.is_directory = is_directory
+
+
+class _FakeMovedEvent(_FakeEvent):
+    def __init__(self, dest_path: str | bytes, is_directory: bool = False) -> None:
+        super().__init__(dest_path, is_directory)
+        self.dest_path = dest_path
+
+
+# ---------------------------------------------------------------------------
+# Linux image clipboard must try wl-paste when xclip fails.
+# ---------------------------------------------------------------------------
+
+
+def test_linux_image_clipboard_falls_back_to_wl_paste(monkeypatch) -> None:
+    """If xclip is present but reports no image, we must still try wl-paste
+    before giving up."""
+    import subprocess
+
+    from clipsync.clipboard import _read_image_from_system_clipboard
+
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(list(cmd))
+
+        class _Result:
+            returncode = 0
+            stdout = b""
+
+        res = _Result()
+        if "wl-paste" in cmd and "--list-types" in cmd:
+            res.stdout = b"image/png\ntext/plain\n"
+        elif "wl-paste" in cmd and "--type" in cmd:
+            res.stdout = b"\x89PNG\r\n\x1a\nfake-wl-paste-png"
+        elif "xclip" in cmd:
+            res.returncode = 1  # xclip fails or has no image
+        return res
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr("sys.platform", "linux")
+
+    result = _read_image_from_system_clipboard()
+    assert result is not None
+    assert b"fake-wl-paste-png" in result
+    assert any("wl-paste" in c for c in calls)

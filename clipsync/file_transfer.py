@@ -17,6 +17,7 @@ import os
 import shutil
 import threading
 import time
+from collections import OrderedDict
 from collections.abc import Callable
 from pathlib import Path
 
@@ -122,8 +123,11 @@ class _FileReceiveHandler(FileSystemEventHandler):
         # watchdog dispatches from a thread pool on Windows, so the
         # check-then-add below has to be atomic or two events for the same
         # file can both pass it and deliver the file twice.
-        self._seen: set[str] = set()
+        # An OrderedDict used as an LRU cache keeps the set bounded: filenames
+        # are timestamped, so without eviction the set would grow forever.
+        self._seen: OrderedDict[str, bool] = OrderedDict()
         self._seen_lock = threading.Lock()
+        self._seen_max = 1000
 
     def _handle(self, path: Path) -> None:
         # Expected layout: files/<sender_hostname>/<filename>
@@ -137,20 +141,30 @@ class _FileReceiveHandler(FileSystemEventHandler):
         key = str(path)
         with self._seen_lock:
             if key in self._seen:
+                # Mark as recently used.
+                self._seen.move_to_end(key)
                 return
-            self._seen.add(key)
+            self._seen[key] = True
+            while len(self._seen) > self._seen_max:
+                self._seen.popitem(last=False)
         log.info("FILE IN [%s]: %s from %s", _HOSTNAME, path.name, sender)
         try:
             self._on_received(path, sender)
         except Exception:
             log.exception("Error in file receive handler")
 
+    def _path_str(self, path: str | bytes) -> str:
+        """Decode watchdog paths safely; fsdecode handles non-UTF-8 bytes."""
+        if isinstance(path, str):
+            return path
+        return os.fsdecode(path)
+
     def on_created(self, event: FileSystemEvent) -> None:
         if not event.is_directory:
-            self._handle(Path(os.fsdecode(event.src_path)))
+            self._handle(Path(self._path_str(event.src_path)))
 
     def on_moved(self, event: FileSystemEvent) -> None:
         # Syncthing uses atomic rename: .syncthing.*.tmp → final name.
         dest = getattr(event, "dest_path", "")
         if dest and not event.is_directory:
-            self._handle(Path(dest))
+            self._handle(Path(self._path_str(dest)))

@@ -10,5 +10,6 @@ opencv-python>=4.9.0.80
 # (PEP 695 `type` statement) that mypy can't parse under python_version=3.11.
 numpy<2.5
 cryptography>=41.0.0
+keyring>=25.0
 pyobjc-core>=10.0; sys_platform == "darwin"
 pyobjc-framework-Cocoa>=10.0; sys_platform == "darwin"

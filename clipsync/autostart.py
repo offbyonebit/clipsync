@@ -54,26 +54,17 @@ def _macos_set(enabled: bool) -> None:
         if path.exists():
             path.unlink()
         return
-    argv = _launch_command()
-    args_xml = "\n".join(f"        <string>{a}</string>" for a in argv)
-    plist = (
-        '<?xml version="1.0" encoding="UTF-8"?>\n'
-        '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" '
-        '"http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
-        '<plist version="1.0">\n'
-        "<dict>\n"
-        f"    <key>Label</key><string>{_BUNDLE_ID}</string>\n"
-        "    <key>ProgramArguments</key>\n"
-        "    <array>\n"
-        f"{args_xml}\n"
-        "    </array>\n"
-        "    <key>RunAtLoad</key><true/>\n"
-        "    <key>KeepAlive</key><false/>\n"
-        "</dict>\n"
-        "</plist>\n"
-    )
+    import plistlib
+
+    plist = {
+        "Label": _BUNDLE_ID,
+        "ProgramArguments": _launch_command(),
+        "RunAtLoad": True,
+        "KeepAlive": False,
+    }
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(plist, encoding="utf-8")
+    with path.open("wb") as fh:
+        plistlib.dump(plist, fh)
 
 
 def _linux_desktop_path() -> Path:

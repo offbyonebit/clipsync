@@ -166,10 +166,12 @@ def _verify_release_signature(signed_asc: bytes) -> None:
         downgrade to hash-only when a verifier is available: an attacker
         who can forge a malformed .asc to force a fallback is exactly the
         threat this closes.
-      * gpg absent -> log a prominent warning and return (caller falls
-        back to hash-only). This is no worse than the previous behavior
-        and keeps first-run working on systems without gpg (notably stock
-        Windows). Full coverage there is a tracked follow-up (bundle gpg).
+      * gpg absent -> raise SyncthingError. A network-fetched hash cannot
+        vouch for itself; falling back to hash-only when gpg is missing
+        would make the signature check cosmetic. Stock Windows and macOS
+        users stay safe because the default version uses hashes pinned in
+        source (no network fetch, no gpg needed). Only explicitly requested
+        non-pinned versions require a live signature verification.
 
     Note: Syncthing's .asc is double-signed (current key + a legacy key).
     gpg emits NO_PUBKEY/ERRSIG for the legacy key we don't ship, which
@@ -179,12 +181,12 @@ def _verify_release_signature(signed_asc: bytes) -> None:
     """
     gpg_bin = shutil.which("gpg") or shutil.which("gpg2")
     if not gpg_bin:
-        log.warning(
-            "gpg not found on PATH; Syncthing release signature will NOT be "
-            "verified. Install gpg (or Gpg4win on Windows) to enable supply-"
-            "chain verification. Falling back to hash-only check."
+        raise SyncthingError(
+            "gpg is not available on PATH, so the Syncthing release signature "
+            "cannot be verified. Install gpg (GnuPG) to use a non-pinned "
+            "Syncthing version, or use the default pinned version which does "
+            "not require a runtime signature check."
         )
-        return
     with tempfile.TemporaryDirectory() as home:
         Path(home).chmod(0o700)
         status = _gpg_verify(gpg_bin, signed_asc, home)

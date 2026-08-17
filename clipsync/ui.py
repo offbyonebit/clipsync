@@ -593,12 +593,15 @@ class _PairingContent:
             ).pack(pady=(4, 0))
             return
         for did in device_ids:
-            row = ctk.CTkFrame(self._nearby_frame, fg_color=(config.COLOR_ROW_BG_LIGHT, config.COLOR_ROW_BG_DARK), corner_radius=8)
+            row = ctk.CTkFrame(
+                self._nearby_frame, fg_color=(config.COLOR_ROW_BG_LIGHT, config.COLOR_ROW_BG_DARK), corner_radius=8
+            )
             row.pack(fill="x", padx=8, pady=4)
             row.grid_columnconfigure(0, weight=1)
             ctk.CTkLabel(row, text=did[:24] + "…", font=_fonts()["small"], anchor="w", text_color=THEME.text).grid(
                 row=0, column=0, sticky="we", padx=12, pady=10
             )
+
             def _pair_handler(d: str = did) -> None:
                 self._pair_from_nearby(d)
 
@@ -808,7 +811,9 @@ class _DevicesContent:
         for child in self._list_frame.winfo_children():
             child.destroy()
         if error:
-            ctk.CTkLabel(self._list_frame, text=error, text_color=config.COLOR_DANGER, font=_fonts()["body"]).pack(pady=14)
+            ctk.CTkLabel(self._list_frame, text=error, text_color=config.COLOR_DANGER, font=_fonts()["body"]).pack(
+                pady=14
+            )
             return
         if not devices:
             empty = ctk.CTkFrame(self._list_frame, fg_color="transparent")
@@ -830,7 +835,9 @@ class _DevicesContent:
             self._build_row(d)
 
     def _build_row(self, device: dict) -> None:
-        row = ctk.CTkFrame(self._list_frame, fg_color=(config.COLOR_ROW_BG_LIGHT, config.COLOR_ROW_BG_DARK), corner_radius=10)
+        row = ctk.CTkFrame(
+            self._list_frame, fg_color=(config.COLOR_ROW_BG_LIGHT, config.COLOR_ROW_BG_DARK), corner_radius=10
+        )
         row.pack(fill="x", padx=8, pady=5)
         row.grid_columnconfigure(0, weight=1)
 
@@ -838,9 +845,9 @@ class _DevicesContent:
         ctk.CTkLabel(row, text=name_text, font=_fonts()["subtitle"], text_color=THEME.text, anchor="w").grid(
             row=0, column=0, sticky="we", padx=12, pady=(10, 0)
         )
-        ctk.CTkLabel(row, text=device["deviceID"][:24] + "…", font=_fonts()["tiny"], text_color=THEME.muted, anchor="w").grid(
-            row=1, column=0, sticky="we", padx=12, pady=(0, 10)
-        )
+        ctk.CTkLabel(
+            row, text=device["deviceID"][:24] + "…", font=_fonts()["tiny"], text_color=THEME.muted, anchor="w"
+        ).grid(row=1, column=0, sticky="we", padx=12, pady=(0, 10))
 
         status_color = config.COLOR_SUCCESS if device["connected"] else THEME.muted
         status_text = "● Connected" if device["connected"] else "○ Offline"
@@ -994,9 +1001,7 @@ class _SettingsContent:
             text_color=THEME.muted,
         ).pack(anchor="w", padx=(52, 16), pady=(0, 14))
 
-        _section_header(privacy_card, "Encryption passphrase (optional)").pack(
-            anchor="w", padx=16, pady=(4, 2)
-        )
+        _section_header(privacy_card, "Encryption passphrase (optional)").pack(anchor="w", padx=16, pady=(4, 2))
         ctk.CTkLabel(
             privacy_card,
             text="Same passphrase on every device. Empty = no encryption.",
@@ -1405,7 +1410,9 @@ class LogsWindow(_BaseWindow):
         super().__init__(parent, f"{config.APP_NAME} — Logs", (640, 440), on_close)
         container = ctk.CTkFrame(self.window, fg_color="transparent")
         container.pack(fill="both", expand=True, padx=20, pady=20)
-        ctk.CTkLabel(container, text="Logs", font=_fonts()["headline"], text_color=THEME.text).pack(anchor="w", pady=(0, 12))
+        ctk.CTkLabel(container, text="Logs", font=_fonts()["headline"], text_color=THEME.text).pack(
+            anchor="w", pady=(0, 12)
+        )
         self._textbox = ctk.CTkTextbox(
             container,
             wrap="none",
@@ -1449,9 +1456,9 @@ class IncomingWindow(_BaseWindow):
         container = ctk.CTkFrame(self.window, fg_color="transparent")
         container.pack(fill="both", expand=True, padx=20, pady=20)
 
-        ctk.CTkLabel(
-            container, text="Incoming device requests", font=_fonts()["headline"], text_color=THEME.text
-        ).pack(pady=(0, 6))
+        ctk.CTkLabel(container, text="Incoming device requests", font=_fonts()["headline"], text_color=THEME.text).pack(
+            pady=(0, 6)
+        )
         ctk.CTkLabel(
             container,
             text="Accept a device to start syncing clipboard with it.",
@@ -1514,7 +1521,9 @@ class IncomingWindow(_BaseWindow):
         for child in self._list_frame.winfo_children():
             child.destroy()
         if error:
-            ctk.CTkLabel(self._list_frame, text=error, text_color=config.COLOR_DANGER, font=_fonts()["body"]).pack(pady=14)
+            ctk.CTkLabel(self._list_frame, text=error, text_color=config.COLOR_DANGER, font=_fonts()["body"]).pack(
+                pady=14
+            )
             return
         rejected = set(self._app.settings.get("rejected_device_ids") or [])
         visible = [
@@ -1542,7 +1551,9 @@ class IncomingWindow(_BaseWindow):
             self._build_row(device_id, info)
 
     def _build_row(self, device_id: str, info: dict) -> None:
-        row = ctk.CTkFrame(self._list_frame, fg_color=(config.COLOR_ROW_BG_LIGHT, config.COLOR_ROW_BG_DARK), corner_radius=10)
+        row = ctk.CTkFrame(
+            self._list_frame, fg_color=(config.COLOR_ROW_BG_LIGHT, config.COLOR_ROW_BG_DARK), corner_radius=10
+        )
         row.pack(fill="x", padx=8, pady=5)
         row.grid_columnconfigure(0, weight=1)
 
@@ -1603,7 +1614,9 @@ class HistoryWindow(_BaseWindow):
 
         header = ctk.CTkFrame(container, fg_color="transparent")
         header.pack(fill="x", pady=(0, 10))
-        ctk.CTkLabel(header, text="Clipboard History", font=_fonts()["headline"], text_color=THEME.text).pack(side="left")
+        ctk.CTkLabel(header, text="Clipboard History", font=_fonts()["headline"], text_color=THEME.text).pack(
+            side="left"
+        )
         self._status = ctk.CTkLabel(header, text="", font=_fonts()["small"], text_color=THEME.muted)
         self._status.pack(side="right")
 
