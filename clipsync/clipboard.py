@@ -384,6 +384,8 @@ def _read_image_from_system_clipboard() -> bytes | None:
     # Linux: check TARGETS first so we never send an image/png SelectionRequest
     # to the clipboard owner when only text is present.  Without this guard,
     # xclip would request image data even when the clipboard holds text.
+    # Try each available command in turn; xclip failing (e.g. on a text-only
+    # Wayland clipboard) must not prevent wl-paste from running.
     for targets_cmd in (
         ["xclip", "-selection", "clipboard", "-t", "TARGETS", "-o"],
         ["wl-paste", "--list-types"],
@@ -392,9 +394,10 @@ def _read_image_from_system_clipboard() -> bytes | None:
             res = subprocess.run(targets_cmd, capture_output=True, timeout=1)
         except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
             continue
-        if res.returncode != 0 or b"image/png" not in res.stdout:
-            return None
-        break
+        if res.returncode == 0 and b"image/png" in res.stdout:
+            break
+    else:
+        return None
     # Some xclip versions return text content with exit 0 even when asked for
     # image/png and no image is on the clipboard.  Guard with a PNG magic-byte
     # check so we never mistake text bytes for image data.
@@ -415,8 +418,8 @@ def _write_image_to_system_clipboard(png_bytes: bytes) -> bool:
     """Write PNG bytes to the system clipboard. Returns True on success."""
     if sys.platform == "darwin":
         try:
-            from AppKit import NSImage, NSPasteboard  # type: ignore[import]
-            from Foundation import NSData  # type: ignore[import]
+            from AppKit import NSImage, NSPasteboard
+            from Foundation import NSData
 
             ns_data = NSData.dataWithBytes_length_(png_bytes, len(png_bytes))
             ns_image = NSImage.alloc().initWithData_(ns_data)
@@ -613,6 +616,30 @@ class ClipboardSync:
         if decrypt(data, passphrase) is None:
             raise EncryptedPayloadError(path)
 
+    def _atomic_write(self, path: Path, payload: bytes) -> None:
+        """Write *payload* to *path* atomically and clean up any temp file.
+
+        Uses a uniquely-named temp file so concurrent writers cannot collide,
+        and unlinks the temp file on failure so partial writes do not litter
+        the sync folder.
+        """
+        import secrets
+
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.{secrets.token_hex(4)}.tmp")
+        try:
+            tmp.write_bytes(payload)
+            for attempt in range(10):
+                try:
+                    tmp.replace(path)
+                    config.set_file_permissions(path)
+                    return
+                except PermissionError:
+                    if attempt == 9:
+                        raise
+                    time.sleep(0.1)
+        finally:
+            tmp.unlink(missing_ok=True)
+
     def _write_file(self, text: str) -> None:
         """Atomic write of the shared file, encrypting if a passphrase is set."""
         path = self.clipboard_file
@@ -621,17 +648,7 @@ class ClipboardSync:
         passphrase = self._passphrase()
         encoded = text.encode("utf-8")
         payload = encrypt(encoded, passphrase) if passphrase else encoded
-        tmp = path.with_name(path.name + ".tmp")
-        tmp.write_bytes(payload)
-        for attempt in range(10):
-            try:
-                tmp.replace(path)
-                config.set_file_permissions(path)
-                return
-            except PermissionError:
-                if attempt == 9:
-                    raise
-                time.sleep(0.1)
+        self._atomic_write(path, payload)
 
     def _read_image_file(self) -> bytes | None:
         """Return PNG bytes from the shared image file, decrypting if needed."""
@@ -674,17 +691,7 @@ class ClipboardSync:
         path.parent.mkdir(parents=True, exist_ok=True)
         passphrase = self._passphrase()
         payload = encrypt(png_bytes, passphrase) if passphrase else png_bytes
-        tmp = path.with_name(path.name + ".tmp")
-        tmp.write_bytes(payload)
-        for attempt in range(10):
-            try:
-                tmp.replace(path)
-                config.set_file_permissions(path)
-                return
-            except PermissionError:
-                if attempt == 9:
-                    raise
-                time.sleep(0.1)
+        self._atomic_write(path, payload)
 
     def _seed_from_file(self) -> None:
         """Prime _last_synced from disk so we don't re-emit stale content on startup.
@@ -854,10 +861,16 @@ class ClipboardSync:
                 _last_heartbeat = now
                 with self._lock:
                     last = self._last_synced
+                if isinstance(last, bytes):
+                    desc = f"<image {len(last)} bytes>"
+                elif isinstance(last, str):
+                    desc = f"<text {len(last)} chars>"
+                else:
+                    desc = "<none>"
                 log.debug(
                     "HEARTBEAT (host=%s): last_synced=%s, paused=%s",
                     _HOSTNAME,
-                    _truncate_for_log(last),
+                    desc,
                     self._is_paused(),
                 )
 
@@ -868,25 +881,20 @@ class ClipboardSync:
             with self._lock:
                 if image == self._last_synced:
                     return
-                previous_last_synced = self._last_synced
-                self._last_synced = image
             try:
                 self._write_image_file(image)
-                log.info("OUT [%s]: %d bytes image written", _HOSTNAME, len(image))
             except EncryptedPayloadError:
-                with self._lock:
-                    self._last_synced = previous_last_synced
                 reason = "Refusing to overwrite encrypted clipboard image file (cannot decrypt)"
                 if reason != self._last_decrypt_error:
                     log.warning("OUT [%s]: %s", _HOSTNAME, reason)
                     self._last_decrypt_error = reason
+                return
             except OSError:
-                # Roll back too: _last_synced is the "already sent" guard, so
-                # leaving it set after a failed write means every later tick
-                # sees this image as synced and it is never retried.
-                with self._lock:
-                    self._last_synced = previous_last_synced
                 log.exception("OUT [%s]: Failed to write image file", _HOSTNAME)
+                return
+            with self._lock:
+                self._last_synced = image
+            log.info("OUT [%s]: %d bytes image written", _HOSTNAME, len(image))
             return
 
         current = self._read_clipboard()
@@ -895,23 +903,21 @@ class ClipboardSync:
         with self._lock:
             if current == self._last_synced:
                 return
-            previous_last_synced = self._last_synced
-            self._last_synced = current
         try:
             self._write_file(current)
-            log.info("OUT [%s]: %d chars written", _HOSTNAME, len(current))
-            self._history.add_entry(current, "local")
         except EncryptedPayloadError:
-            with self._lock:
-                self._last_synced = previous_last_synced
             reason = "Refusing to overwrite encrypted clipboard file (cannot decrypt)"
             if reason != self._last_decrypt_error:
                 log.warning("OUT [%s]: %s", _HOSTNAME, reason)
                 self._last_decrypt_error = reason
+            return
         except OSError:
-            with self._lock:
-                self._last_synced = previous_last_synced
             log.exception("OUT [%s]: Failed to write clipboard file", _HOSTNAME)
+            return
+        with self._lock:
+            self._last_synced = current
+        log.info("OUT [%s]: %d chars written", _HOSTNAME, len(current))
+        self._history.add_entry(current, "local")
 
     def _in_loop(self) -> None:
         """Drain _in_queue and apply remote file changes to the local clipboard.
@@ -1032,19 +1038,25 @@ class _ClipboardFileHandler(FileSystemEventHandler):
         # is never held by clipboard I/O (avoids pool exhaustion on Windows).
         self._sync._in_queue.put(path)
 
+    def _path_str(self, path: str | bytes) -> str:
+        """Decode watchdog paths safely; surrogateescape preserves non-UTF-8 bytes."""
+        if isinstance(path, str):
+            return path
+        return path.decode("utf-8", errors="surrogateescape")
+
     def on_modified(self, event: FileSystemEvent) -> None:
         if event.is_directory:
             return
-        self._dispatch(event.src_path if isinstance(event.src_path, str) else event.src_path.decode())
+        self._dispatch(self._path_str(event.src_path))
 
     def on_created(self, event: FileSystemEvent) -> None:
         if event.is_directory:
             return
-        self._dispatch(event.src_path if isinstance(event.src_path, str) else event.src_path.decode())
+        self._dispatch(self._path_str(event.src_path))
 
     def on_moved(self, event: FileSystemEvent) -> None:
         if event.is_directory:
             return
         dest = getattr(event, "dest_path", "")
         if dest:
-            self._dispatch(dest)
+            self._dispatch(self._path_str(dest))
