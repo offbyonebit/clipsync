@@ -40,6 +40,8 @@ from .ui import UIController
 
 log = logging.getLogger(__name__)
 
+_STATUS_REFRESH_INTERVAL = 10.0
+
 
 def _load_or_create_icon(size: int = 64) -> Image.Image:
     """Return the tray icon image, generating a default if assets are missing."""
@@ -149,6 +151,8 @@ class ClipSyncApp:
         self._quitting = threading.Event()
         self._pending_lock = threading.Lock()
         self._pending: dict[str, dict[str, object]] = {}
+        self._status_lock = threading.Lock()
+        self._sync_status = "Starting…"
 
     def start(self) -> None:
         config.configure_logging()
@@ -208,6 +212,8 @@ class ClipSyncApp:
     def _run_tray(self) -> None:
         image = _load_or_create_icon()
         menu = pystray.Menu(
+            pystray.MenuItem(self._sync_status_menu_title, lambda _i, _it: None, enabled=False),
+            pystray.Menu.SEPARATOR,
             pystray.MenuItem(
                 "Open ClipSync",
                 lambda _i, _it: self.ui.open("tabbed:devices"),
@@ -248,9 +254,64 @@ class ClipSyncApp:
         if platform.system() == "Windows":
             _patch_tray_for_windows(icon)
         icon.visible = True
+        self._refresh_sync_status()
+        threading.Thread(target=self._sync_status_loop, name="clipsync-status", daemon=True).start()
         if self._pending_first_run_notice:
             self._pending_first_run_notice = False
             self._notify(f"{config.APP_NAME} is running", "Click the tray icon to add a device.")
+
+    def _sync_status_menu_title(self, _item: pystray.MenuItem) -> str:
+        """Return the current health summary shown at the top of the tray menu."""
+        with self._status_lock:
+            return self._sync_status
+
+    def _sync_status_loop(self) -> None:
+        """Keep the tray's health summary current without blocking its UI loop."""
+        while not self._quitting.wait(_STATUS_REFRESH_INTERVAL):
+            self._refresh_sync_status()
+
+    def _refresh_sync_status(self) -> None:
+        """Query Syncthing and publish a concise, user-facing sync state.
+
+        Syncthing's REST API can be temporarily unavailable while it restarts,
+        so a failed probe must be represented as a state, never crash the tray
+        thread or make the app appear to have silently stopped syncing.
+        """
+        if self.settings.get("sync_paused"):
+            self._set_sync_status("Sync paused")
+            return
+        client = self.syncthing.client
+        if client is None:
+            self._set_sync_status("Connecting to Syncthing…")
+            return
+        try:
+            devices = client.connected_devices()
+            count = sum(bool(device.get("connected")) for device in devices)
+        except Exception:
+            log.debug("Could not refresh sync status", exc_info=True)
+            self._set_sync_status("Sync status unavailable")
+            return
+        if count:
+            label = "device" if count == 1 else "devices"
+            self._set_sync_status(f"Synced · {count} {label} connected")
+        else:
+            self._set_sync_status("Waiting for a connected device")
+
+    def _set_sync_status(self, status: str) -> None:
+        with self._status_lock:
+            changed = status != self._sync_status
+            self._sync_status = status
+        icon = self.tray
+        if icon is None:
+            return
+        # pystray exposes the title as the platform's hover text; retaining
+        # the app name makes the status understandable outside the menu too.
+        icon.title = f"{config.APP_NAME} — {status}"
+        if changed:
+            try:
+                icon.update_menu()
+            except Exception:
+                log.debug("Tray menu status update failed", exc_info=True)
 
     def _notify(self, title: str, message: str) -> None:
         if not self.settings.get("show_notifications", True) and title != f"{config.APP_NAME} is running":
