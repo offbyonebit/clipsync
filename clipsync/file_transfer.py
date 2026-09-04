@@ -16,6 +16,7 @@ import logging
 import shutil
 import threading
 import time
+import uuid
 from collections import OrderedDict
 from collections.abc import Callable
 from pathlib import Path
@@ -34,6 +35,8 @@ _HOSTNAME = _safe_hostname()
 # Marks a file in the shared folder as encrypted. Stripped when writing the
 # plaintext out to the receiver's Downloads folder.
 ENCRYPTED_SUFFIX = ".csenc"
+FILE_RETENTION_SECONDS = 30 * 24 * 60 * 60
+MAX_FILE_SIZE = 2 * 1024 * 1024 * 1024
 
 
 class FileTransfer:
@@ -43,10 +46,12 @@ class FileTransfer:
         self,
         settings: config.Settings,
         on_received: Callable[[Path, str], None],
+        device_id: str = "",
     ) -> None:
         self._settings = settings
         self._on_received = on_received
         self._observer: BaseObserver | None = None
+        self._sender_dir = f"{_HOSTNAME}-{device_id[:7]}" if device_id else _HOSTNAME
 
     @property
     def files_dir(self) -> Path:
@@ -68,14 +73,17 @@ class FileTransfer:
 
         Returns the destination path. Raises OSError on failure.
         """
-        dest_dir = self.files_dir / _HOSTNAME
+        dest_dir = self.files_dir / self._sender_dir
         dest_dir.mkdir(parents=True, exist_ok=True)
         timestamp = time.strftime("%Y%m%d_%H%M%S")
-        passphrase = self._passphrase()
+        unique = uuid.uuid4().hex[:12]
         size = source.stat().st_size
+        if size > MAX_FILE_SIZE:
+            raise ValueError(f"file is too large (maximum is {MAX_FILE_SIZE // (1024 * 1024 * 1024)} GiB)")
+        passphrase = self._passphrase()
 
         if passphrase:
-            dest = dest_dir / f"{timestamp}_{source.name}{ENCRYPTED_SUFFIX}"
+            dest = dest_dir / f"{timestamp}_{unique}_{source.name}{ENCRYPTED_SUFFIX}"
             tmp = dest.with_name(dest.name + ".part")
             try:
                 encrypt_file(source, tmp, passphrase)
@@ -84,25 +92,43 @@ class FileTransfer:
             except BaseException:
                 tmp.unlink(missing_ok=True)
                 raise
+            self.cleanup_old_files()
             log.info("FILE OUT [%s]: %s (%d bytes, encrypted)", _HOSTNAME, source.name, size)
             return dest
 
-        dest = dest_dir / f"{timestamp}_{source.name}"
+        dest = dest_dir / f"{timestamp}_{unique}_{source.name}"
         shutil.copy2(source, dest)
         # copy2 preserves the source mode, so a world-readable original stayed
         # world-readable inside the shared folder.
         config.set_file_permissions(dest)
+        self.cleanup_old_files()
         log.info("FILE OUT [%s]: %s (%d bytes)", _HOSTNAME, source.name, size)
         return dest
 
     def start(self) -> None:
         self.files_dir.mkdir(parents=True, exist_ok=True)
-        handler = _FileReceiveHandler(on_received=self._on_received)
+        self.cleanup_old_files()
+        handler = _FileReceiveHandler(on_received=self._on_received, local_sender_dir=self._sender_dir)
         observer = Observer()
         observer.schedule(handler, str(self.files_dir), recursive=True)
         observer.start()
         self._observer = observer
         log.debug("File transfer watcher started (watching %s)", self.files_dir)
+
+    def cleanup_old_files(self) -> None:
+        """Remove expired files created by this device only.
+
+        File deletion is replicated by Syncthing, so each sender owns cleanup
+        of its own directory and never deletes another peer's transfers.
+        """
+        cutoff = time.time() - FILE_RETENTION_SECONDS
+        sender_dir = self.files_dir / self._sender_dir
+        try:
+            for path in sender_dir.iterdir():
+                if path.is_file() and path.stat().st_mtime < cutoff:
+                    path.unlink()
+        except OSError:
+            log.debug("Could not clean old file transfers", exc_info=True)
 
     def stop(self) -> None:
         if self._observer is not None:
@@ -114,9 +140,10 @@ class FileTransfer:
 class _FileReceiveHandler(FileSystemEventHandler):
     """Watch the files/ tree and fire on_received for files from remote hosts."""
 
-    def __init__(self, on_received: Callable[[Path, str], None]) -> None:
+    def __init__(self, on_received: Callable[[Path, str], None], local_sender_dir: str = _HOSTNAME) -> None:
         super().__init__()
         self._on_received = on_received
+        self._local_sender_dir = local_sender_dir
         # Guard against duplicate events (watchdog can fire multiple times for
         # a single file, e.g. created + modified during Syncthing's atomic write).
         # watchdog dispatches from a thread pool on Windows, so the
@@ -132,7 +159,7 @@ class _FileReceiveHandler(FileSystemEventHandler):
         # Expected layout: files/<sender_hostname>/<filename>
         # Ignore files directly under files/ (no host subdirectory) and our own.
         sender = path.parent.name
-        if not sender or sender == _HOSTNAME:
+        if not sender or sender in {_HOSTNAME, self._local_sender_dir}:
             return
         # Ignore Syncthing temp files (.syncthing.*.tmp pattern).
         if path.name.startswith(".syncthing.") and path.name.endswith(".tmp"):

@@ -56,6 +56,10 @@ pip install offbyonebit-clipsync
 clipsync
 ```
 
+Webcam QR scanning is optional because OpenCV is large. Install
+`offbyonebit-clipsync[camera]` if you want to scan device IDs with a webcam;
+manual device-ID entry and phone-camera QR scanning work without it.
+
 > **Note:** the PyPI package name is `offbyonebit-clipsync` (the name `clipsync` was already taken).
 
 **Or run from source:**
@@ -119,6 +123,11 @@ for the icon to actually show up.
 
 Settings changes from the UI take effect immediately; hand-editing
 `settings.json` is also picked up, the file is watched for changes.
+
+Changing or clearing the encryption passphrase migrates the existing clipboard
+and history data while ClipSync is running. Files sent through the file
+transfer feature are given unique names, limited to 2 GiB, and automatically
+pruned from the sender's shared folder after 30 days.
 
 ## How it compares
 

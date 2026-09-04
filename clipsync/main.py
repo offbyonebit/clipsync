@@ -162,7 +162,11 @@ class ClipSyncApp:
         self.clipboard = ClipboardSync(self.settings)
         self.clipboard.start()
 
-        self.file_transfer = FileTransfer(self.settings, on_received=self._on_file_received)
+        self.file_transfer = FileTransfer(
+            self.settings,
+            on_received=self._on_file_received,
+            device_id=self.syncthing.device_id,
+        )
         self.file_transfer.start()
 
         self.log_mirror = LogMirror(self.settings)
@@ -383,6 +387,12 @@ class ClipSyncApp:
             log.info("Clipboard history cleared from UI")
         elif kind == "reset":
             log.info("Devices reset from UI")
+        elif kind == "settings_changed":
+            if self.clipboard is not None:
+                try:
+                    self.clipboard.reconcile_encryption()
+                except Exception:
+                    log.exception("Failed to migrate clipboard data after encryption setting change")
         elif kind == "accept_device":
             device_id = evt.get("device_id")
             if isinstance(device_id, str):
@@ -408,6 +418,8 @@ class ClipSyncApp:
                 self.syncthing.client.set_folder_paused(paused)
             except Exception:
                 log.exception("Failed to pause/resume folder on Syncthing side")
+        if not paused and self.clipboard is not None:
+            self.clipboard.reconcile_from_disk()
         self._notify(
             f"{config.APP_NAME} {'paused' if paused else 'resumed'}",
             "Clipboard sync is off." if paused else "Clipboard sync is on.",
@@ -451,7 +463,11 @@ class ClipSyncApp:
 
         self.clipboard = ClipboardSync(self.settings)
         self.clipboard.start()
-        self.file_transfer = FileTransfer(self.settings, on_received=self._on_file_received)
+        self.file_transfer = FileTransfer(
+            self.settings,
+            on_received=self._on_file_received,
+            device_id=self.syncthing.device_id,
+        )
         self.file_transfer.start()
         log.info("Sync folder changed to %s; Syncthing, clipboard and file transfer restarted", new_path)
 

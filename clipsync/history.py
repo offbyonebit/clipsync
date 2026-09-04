@@ -213,6 +213,29 @@ class ClipboardHistory:
             self._entries.clear()
             self._persist_locked()
 
+    def reconcile_encryption(self, old_passphrase: str, new_passphrase: str) -> None:
+        """Re-write the existing history using the new encryption setting."""
+        with self._lock:
+            if not self._path.exists():
+                return
+            raw = self._path.read_bytes()
+            if is_encrypted(raw):
+                plain = decrypt(raw, old_passphrase) if old_passphrase else None
+                if plain is None:
+                    raise RuntimeError("clipboard history cannot be decrypted with the previous passphrase")
+            else:
+                plain = raw
+            json.loads(plain.decode("utf-8"))
+            payload = encrypt(plain, new_passphrase) if new_passphrase else plain
+            tmp = self._path.with_name(f"{self._path.name}.{os.getpid()}.migrate.tmp")
+            try:
+                tmp.write_bytes(payload)
+                config.set_file_permissions(tmp)
+                tmp.replace(self._path)
+            finally:
+                with contextlib.suppress(OSError):
+                    tmp.unlink(missing_ok=True)
+
     def get_max_items(self) -> int:
         return self._max_items
 

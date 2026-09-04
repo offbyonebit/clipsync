@@ -375,11 +375,12 @@ def test_folder_change_restarts_syncthing_and_file_transfer(tmp_path, monkeypatc
     app.clipboard = _Stub("clipboard")
     app.file_transfer = _Stub("file_transfer")
     app.syncthing = _Stub("syncthing")
+    app.syncthing.device_id = "A" * 56
     app._start_syncthing_with_retry = lambda: events.append("syncthing.start")
     app._on_file_received = lambda *_a: None
 
     monkeypatch.setattr(main_mod, "ClipboardSync", lambda _s: _Stub("clipboard"))
-    monkeypatch.setattr(main_mod, "FileTransfer", lambda _s, on_received=None: _Stub("file_transfer"))
+    monkeypatch.setattr(main_mod, "FileTransfer", lambda _s, on_received=None, **_kw: _Stub("file_transfer"))
 
     new_folder = tmp_path / "new_sync"
     app._on_folder_changed(str(new_folder))

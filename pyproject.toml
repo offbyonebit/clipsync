@@ -29,14 +29,17 @@ dependencies = [
     "Pillow>=10.0.0",
     "watchdog>=4.0.0",
     "requests>=2.31.0",
-    "opencv-python>=4.9.0.80",
     "cryptography>=41.0.0",
+    "keyring>=25.0",
     "pyobjc-core>=10.0; sys_platform == 'darwin'",
     "pyobjc-framework-Cocoa>=10.0; sys_platform == 'darwin'",
 ]
 
 [project.scripts]
 clipsync = "clipsync.main:main"
+
+[project.optional-dependencies]
+camera = ["opencv-python>=4.9.0.80"]
 
 [project.urls]
 Homepage = "https://github.com/offbyonebit/clipsync"

@@ -486,6 +486,7 @@ class ClipboardSync:
         self._xfixes_queue: queue.SimpleQueue[object] | None = None
         self._clipboard_owner: _XlibClipboardOwner | None = None
         self._history = ClipboardHistory(settings)
+        self._active_passphrase = self._passphrase()
 
     @property
     def clipboard_file(self) -> Path:
@@ -553,6 +554,42 @@ class ClipboardSync:
         the private _history attribute.
         """
         self._history.clear()
+
+    def reconcile_encryption(self) -> None:
+        """Migrate existing clipboard data after a passphrase change."""
+        new_passphrase = self._passphrase()
+        old_passphrase = self._active_passphrase
+        if new_passphrase == old_passphrase:
+            return
+        for path, is_image in ((self.clipboard_file, False), (self.clipboard_image_file, True)):
+            if not path.exists():
+                continue
+            raw = path.read_bytes()
+            if is_encrypted(raw):
+                if not old_passphrase:
+                    raise EncryptedPayloadError(path)
+                plain = decrypt(raw, old_passphrase)
+                if plain is None:
+                    raise EncryptedPayloadError(path)
+            else:
+                plain = raw
+            if is_image and not plain.startswith(_PNG_HEADER):
+                continue
+            if not is_image:
+                plain.decode("utf-8")
+            payload = encrypt(plain, new_passphrase) if new_passphrase else plain
+            self._atomic_write(path, payload)
+        self._history.reconcile_encryption(old_passphrase, new_passphrase)
+        self._active_passphrase = new_passphrase
+        log.info("Clipboard encryption settings migrated successfully")
+
+    def reconcile_from_disk(self) -> None:
+        """Apply the newest shared clipboard payload after resuming sync."""
+        candidates = [p for p in (self.clipboard_file, self.clipboard_image_file) if p.exists()]
+        if not candidates:
+            return
+        newest = max(candidates, key=lambda p: p.stat().st_mtime_ns)
+        self._on_file_changed(str(newest))
 
     def _passphrase(self) -> str:
         val = self._settings.get("encryption_passphrase") or ""
@@ -979,11 +1016,9 @@ class ClipboardSync:
             if content == self._last_synced:
                 log.debug("IN [%s]: file changed but content already synced (%d chars)", _HOSTNAME, len(content))
                 return
-            # Update _last_synced before the write so that the XFixes event
-            # triggered by pyperclip.copy() below sees no change in the OUT
-            # loop and does not re-read the clipboard.
-            self._last_synced = content
         if self._write_clipboard(content):
+            with self._lock:
+                self._last_synced = content
             log.info("IN [%s]: %d chars applied to clipboard", _HOSTNAME, len(content))
             self._history.add_entry(content, "remote")
 
@@ -995,8 +1030,9 @@ class ClipboardSync:
             if image == self._last_synced:
                 log.debug("IN [%s]: image file changed but already synced (%d bytes)", _HOSTNAME, len(image))
                 return
-            self._last_synced = image
         if self._write_clipboard_image(image):
+            with self._lock:
+                self._last_synced = image
             log.info("IN [%s]: %d bytes image applied to clipboard", _HOSTNAME, len(image))
 
 
