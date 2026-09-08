@@ -974,6 +974,14 @@ class _SettingsContent:
             self._auto_accept_var,
             self._on_auto_accept_toggle,
         ).pack(anchor="w", padx=16, pady=(4, 14))
+        ctk.CTkLabel(
+            general_card,
+            text="Only enable this on trusted private networks. New pairing requests gain clipboard access.",
+            font=_fonts()["tiny"],
+            justify="left",
+            wraplength=340,
+            text_color=THEME.muted,
+        ).pack(anchor="w", padx=(52, 16), pady=(0, 14))
 
         privacy_card = _card_frame(container)
         privacy_card.pack(fill="x", pady=(0, 16))
@@ -1006,7 +1014,7 @@ class _SettingsContent:
         passphrase_row = ctk.CTkFrame(privacy_card, fg_color="transparent")
         passphrase_row.pack(fill="x", padx=16, pady=(6, 16))
         self._passphrase_entry = _entry(passphrase_row, show="•")
-        self._passphrase_entry.insert(0, str(app.settings.get("encryption_passphrase") or ""))
+        self._passphrase_entry.insert(0, app.settings.get_passphrase())
         self._passphrase_entry.pack(side="left", fill="x", expand=True, padx=(0, 8))
         _primary_button(passphrase_row, text="Save", command=self._on_save_passphrase, width=70).pack(side="left")
 
@@ -1154,6 +1162,9 @@ class _SettingsContent:
 
     def _on_auto_accept_toggle(self) -> None:
         enabled = bool(self._auto_accept_var.get())
+        if enabled:
+            self._confirm_auto_accept()
+            return
         self._app.settings.set("auto_accept_incoming", enabled)
         self._app.on_settings_changed()
         self._status.configure(
@@ -1163,6 +1174,48 @@ class _SettingsContent:
                 else "Auto-accept disabled. You'll be prompted before pairing."
             )
         )
+
+    def _confirm_auto_accept(self) -> None:
+        confirm = ctk.CTkToplevel(self._win)
+        confirm.title("Enable auto-accept?")
+        confirm.configure(fg_color=THEME.bg)
+        confirm.resizable(False, False)
+        _center_window(confirm, 360, 205)
+        confirm.bind("<Escape>", lambda _e: cancel())
+        container = ctk.CTkFrame(confirm, fg_color="transparent")
+        container.pack(fill="both", expand=True, padx=24, pady=24)
+        ctk.CTkLabel(container, text="Auto-accept pairing?", font=_fonts()["title"], text_color=THEME.text).pack(
+            anchor="w"
+        )
+        ctk.CTkLabel(
+            container,
+            text="Any device that can send a pairing request will be trusted immediately and can receive your clipboard. Use only on a private network.",
+            font=_fonts()["small"],
+            justify="left",
+            wraplength=310,
+            text_color=THEME.muted,
+        ).pack(anchor="w", pady=(6, 18))
+        buttons = ctk.CTkFrame(container, fg_color="transparent")
+        buttons.pack(fill="x")
+
+        def cancel() -> None:
+            self._auto_accept_var.set(False)
+            confirm.destroy()
+
+        def enable() -> None:
+            self._app.settings.set("auto_accept_incoming", True)
+            self._app.on_settings_changed()
+            self._status.configure(text="Auto-accept enabled. New requests will pair immediately.")
+            confirm.destroy()
+
+        _secondary_button(buttons, text="Cancel", command=cancel).pack(side="left", expand=True, fill="x", padx=(0, 6))
+        _primary_button(
+            buttons,
+            text="Enable",
+            fg_color=config.COLOR_DANGER,
+            hover_color=config.COLOR_DANGER_HOVER,
+            command=enable,
+        ).pack(side="left", expand=True, fill="x", padx=(6, 0))
 
     def _on_theme_changed(self, value: str) -> None:
         self._app.settings.set("theme", value)
@@ -1180,7 +1233,11 @@ class _SettingsContent:
 
     def _on_save_passphrase(self) -> None:
         new_value = self._passphrase_entry.get()
-        self._app.settings.set("encryption_passphrase", new_value)
+        try:
+            self._app.settings.set_passphrase(new_value)
+        except config.SecretStorageError:
+            self._status.configure(text="Could not access the OS keychain. Passphrase was not changed.")
+            return
         self._app.on_settings_changed()
         if new_value:
             self._status.configure(text="Encryption enabled. Set the same passphrase on every device.")

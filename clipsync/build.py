@@ -52,6 +52,11 @@ def _common_args(name: str) -> list[str]:
         # customtkinter ships TTF files that don't auto-detect.
         "--collect-data",
         "customtkinter",
+        # The OS keychain package is imported lazily by config.py. Collect its
+        # backends explicitly so Windows Credential Manager is present in the
+        # frozen app as well as in a source checkout.
+        "--collect-all",
+        "keyring",
         str(ENTRY_POINT),
     ]
 

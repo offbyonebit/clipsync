@@ -31,6 +31,7 @@ dependencies = [
     "requests>=2.31.0",
     "opencv-python>=4.9.0.80",
     "cryptography>=41.0.0",
+    "keyring>=25.0.0",
     "pyobjc-core>=10.0; sys_platform == 'darwin'",
     "pyobjc-framework-Cocoa>=10.0; sys_platform == 'darwin'",
 ]
@@ -75,3 +76,9 @@ warn_unused_ignores = true
 warn_redundant_casts = true
 no_implicit_optional = true
 check_untyped_defs = true
+
+[tool.pytest.ini_options]
+addopts = "-m 'not integration'"
+markers = [
+    "integration: requires a real desktop clipboard and is excluded from the default test suite",
+]

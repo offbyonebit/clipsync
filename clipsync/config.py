@@ -8,6 +8,7 @@ depend on it without cycles.
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import logging
 import os
@@ -110,7 +111,6 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "start_on_login": False,
     "sync_folder": str(SYNC_FOLDER),
     "first_run_completed": False,
-    "encryption_passphrase": "",
     "auto_accept_incoming": False,
     "rejected_device_ids": [],
     "history_enabled": True,
@@ -127,6 +127,20 @@ DEFAULT_SETTINGS: dict[str, Any] = {
 }
 
 HISTORY_FILE = APP_DATA_DIR / "clipsync_history.json"
+_PASSPHRASE_KEYRING_ACCOUNT = "encryption-passphrase"
+
+
+class SecretStorageError(RuntimeError):
+    """Raised when the operating-system credential store is unavailable."""
+
+
+def _keyring_backend() -> Any:
+    """Return the optional keyring module without importing it at startup."""
+    try:
+        import keyring
+    except ImportError as exc:
+        raise SecretStorageError("OS keychain support is not installed") from exc
+    return keyring
 
 
 class Settings:
@@ -141,6 +155,7 @@ class Settings:
         self._path = path
         self._lock = threading.RLock()
         self._data: dict[str, Any] = dict(DEFAULT_SETTINGS)
+        self._legacy_passphrase: str | None = None
         self._mtime_ns: int = 0
         self._load()
 
@@ -164,11 +179,14 @@ class Settings:
         if not isinstance(loaded, dict):
             logging.warning("Settings file did not contain a JSON object; using defaults")
             return
+        legacy = loaded.get("encryption_passphrase")
+        self._legacy_passphrase = legacy if isinstance(legacy, str) and legacy else None
         merged = dict(DEFAULT_SETTINGS)
         merged.update({k: v for k, v in loaded.items() if k in DEFAULT_SETTINGS})
         if not merged.get("api_key"):
             merged["api_key"] = uuid.uuid4().hex
         self._data = merged
+        self._migrate_legacy_passphrase_locked()
         # Only persist if the on-disk file is incomplete (missing a default
         # key) or has an empty api_key that we just generated. Otherwise
         # leave the file alone: rewriting it on every startup is needless
@@ -188,8 +206,15 @@ class Settings:
         self._path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self._path.with_name(f"{self._path.name}.{os.getpid()}.tmp")
         try:
+            persisted = dict(self._data)
+            if self._legacy_passphrase:
+                # Retain this only when the OS keychain is unavailable. This
+                # avoids turning an upgrade into unrecoverable encrypted data.
+                persisted["encryption_passphrase"] = self._legacy_passphrase
+            else:
+                persisted.pop("encryption_passphrase", None)
             with tmp.open("w", encoding="utf-8") as fh:
-                json.dump(self._data, fh, indent=2)
+                json.dump(persisted, fh, indent=2)
             set_file_permissions(tmp)
             os.replace(tmp, self._path)
         finally:
@@ -216,11 +241,74 @@ class Settings:
     def get(self, key: str, default: Any = None) -> Any:
         with self._lock:
             self._refresh_if_changed()
+            if key == "encryption_passphrase":
+                return self._get_passphrase_locked()
             return self._data.get(key, default)
 
     def set(self, key: str, value: Any) -> None:
         with self._lock:
+            if key == "encryption_passphrase":
+                self.set_passphrase(value)
+                return
             self._data[key] = value
+            self._persist_locked()
+
+    def _get_passphrase_locked(self) -> str:
+        try:
+            value = _keyring_backend().get_password(APP_ID, self._keyring_account())
+        except Exception as exc:
+            if self._legacy_passphrase:
+                logging.warning("OS keychain unavailable; retaining legacy encrypted-data access: %s", exc)
+                return self._legacy_passphrase
+            logging.warning("OS keychain unavailable: %s", exc)
+            return ""
+        if isinstance(value, str):
+            return value
+        return self._migrate_legacy_passphrase_locked()
+
+    def _migrate_legacy_passphrase_locked(self) -> str:
+        if not self._legacy_passphrase:
+            return ""
+        legacy = self._legacy_passphrase
+        try:
+            _keyring_backend().set_password(APP_ID, self._keyring_account(), legacy)
+        except Exception as exc:
+            logging.warning("Could not migrate passphrase into OS keychain: %s", exc)
+            return legacy
+        self._legacy_passphrase = None
+        self._persist_locked()
+        logging.info("Moved encryption passphrase from settings.json into the OS keychain")
+        return legacy
+
+    def _keyring_account(self) -> str:
+        """Keep separate portable/test profiles from sharing a local secret."""
+        profile = hashlib.sha256(str(self._path.resolve()).encode("utf-8")).hexdigest()[:16]
+        return f"{_PASSPHRASE_KEYRING_ACCOUNT}-{profile}"
+
+    def get_passphrase(self) -> str:
+        """Return the encryption passphrase from the OS keychain."""
+        with self._lock:
+            self._refresh_if_changed()
+            return self._get_passphrase_locked()
+
+    def set_passphrase(self, value: Any) -> None:
+        """Store an encryption passphrase outside settings.json.
+
+        New values are never written to the JSON settings file. Existing
+        plaintext values are migrated automatically on their first read.
+        """
+        if not isinstance(value, str):
+            raise ValueError("Encryption passphrase must be text")
+        with self._lock:
+            try:
+                backend = _keyring_backend()
+                if value:
+                    backend.set_password(APP_ID, self._keyring_account(), value)
+                elif backend.get_password(APP_ID, self._keyring_account()) is not None:
+                    backend.delete_password(APP_ID, self._keyring_account())
+            except Exception as exc:
+                raise SecretStorageError("Could not store passphrase in the OS keychain") from exc
+            self._legacy_passphrase = None
             self._persist_locked()
 
     def update(self, **kwargs: Any) -> None:
@@ -248,9 +336,12 @@ class Settings:
             if not isinstance(loaded, dict):
                 logging.warning("Settings file did not contain a JSON object; keeping in-memory state")
                 return
+            legacy = loaded.get("encryption_passphrase")
+            self._legacy_passphrase = legacy if isinstance(legacy, str) and legacy else None
             merged = dict(DEFAULT_SETTINGS)
             merged.update({k: v for k, v in loaded.items() if k in DEFAULT_SETTINGS})
             self._data = merged
+            self._migrate_legacy_passphrase_locked()
 
 
 def ensure_directories() -> None:

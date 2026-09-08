@@ -17,6 +17,7 @@ import os
 import shutil
 import threading
 import time
+from collections import deque
 from collections.abc import Callable
 from pathlib import Path
 
@@ -34,6 +35,8 @@ _HOSTNAME = _safe_hostname()
 # Marks a file in the shared folder as encrypted. Stripped when writing the
 # plaintext out to the receiver's Downloads folder.
 ENCRYPTED_SUFFIX = ".csenc"
+MAX_FILE_TRANSFER_BYTES = 1 * 1024 * 1024 * 1024
+MAX_INCOMING_FILES_PER_MINUTE = 30
 
 
 class FileTransfer:
@@ -57,6 +60,15 @@ class FileTransfer:
         val = self._settings.get("encryption_passphrase") or ""
         return val if isinstance(val, str) else ""
 
+    @staticmethod
+    def _validate_outgoing_source(source: Path) -> int:
+        if not source.is_file() or source.is_symlink():
+            raise ValueError("Only regular files can be sent")
+        size = source.stat().st_size
+        if size > MAX_FILE_TRANSFER_BYTES:
+            raise ValueError(f"File exceeds the {MAX_FILE_TRANSFER_BYTES // (1024 * 1024)} MiB transfer limit")
+        return size
+
     def send(self, source: Path) -> Path:
         """Copy *source* into the shared folder under this host's subdirectory.
 
@@ -72,7 +84,7 @@ class FileTransfer:
         dest_dir.mkdir(parents=True, exist_ok=True)
         timestamp = time.strftime("%Y%m%d_%H%M%S")
         passphrase = self._passphrase()
-        size = source.stat().st_size
+        size = self._validate_outgoing_source(source)
 
         if passphrase:
             dest = dest_dir / f"{timestamp}_{source.name}{ENCRYPTED_SUFFIX}"
@@ -97,7 +109,7 @@ class FileTransfer:
 
     def start(self) -> None:
         self.files_dir.mkdir(parents=True, exist_ok=True)
-        handler = _FileReceiveHandler(on_received=self._on_received)
+        handler = _FileReceiveHandler(on_received=self._on_received, files_dir=self.files_dir)
         observer = Observer()
         observer.schedule(handler, str(self.files_dir), recursive=True)
         observer.start()
@@ -114,7 +126,7 @@ class FileTransfer:
 class _FileReceiveHandler(FileSystemEventHandler):
     """Watch the files/ tree and fire on_received for files from remote hosts."""
 
-    def __init__(self, on_received: Callable[[Path, str], None]) -> None:
+    def __init__(self, on_received: Callable[[Path, str], None], files_dir: Path | None = None) -> None:
         super().__init__()
         self._on_received = on_received
         # Guard against duplicate events (watchdog can fire multiple times for
@@ -124,19 +136,56 @@ class _FileReceiveHandler(FileSystemEventHandler):
         # file can both pass it and deliver the file twice.
         self._seen: set[str] = set()
         self._seen_lock = threading.Lock()
+        self._files_dir = files_dir.resolve() if files_dir is not None else None
+        self._received_at: deque[float] = deque()
+
+    def _within_rate_limit(self) -> bool:
+        now = time.monotonic()
+        cutoff = now - 60
+        while self._received_at and self._received_at[0] <= cutoff:
+            self._received_at.popleft()
+        if len(self._received_at) >= MAX_INCOMING_FILES_PER_MINUTE:
+            return False
+        self._received_at.append(now)
+        return True
 
     def _handle(self, path: Path) -> None:
         # Expected layout: files/<sender_hostname>/<filename>
         # Ignore files directly under files/ (no host subdirectory) and our own.
+        if self._files_dir is not None:
+            try:
+                relative = path.resolve().relative_to(self._files_dir)
+            except OSError:
+                log.warning("Ignoring unreadable received file: %s", path)
+                return
+            except ValueError:
+                log.warning("Ignoring received file outside the transfer directory: %s", path)
+                return
+            if len(relative.parts) != 2:
+                log.warning("Ignoring unexpected received-file path: %s", path)
+                return
         sender = path.parent.name
         if not sender or sender == _HOSTNAME:
             return
         # Ignore Syncthing temp files (.syncthing.*.tmp pattern).
         if path.name.startswith(".syncthing.") and path.name.endswith(".tmp"):
             return
+        try:
+            if path.is_symlink() or not path.is_file():
+                log.warning("Ignoring non-regular received file: %s", path)
+                return
+            if path.stat().st_size > MAX_FILE_TRANSFER_BYTES:
+                log.warning("Ignoring received file above transfer limit: %s", path)
+                return
+        except OSError:
+            log.warning("Ignoring unreadable received file: %s", path)
+            return
         key = str(path)
         with self._seen_lock:
             if key in self._seen:
+                return
+            if not self._within_rate_limit():
+                log.warning("Ignoring received file; rate limit reached")
                 return
             self._seen.add(key)
         log.info("FILE IN [%s]: %s from %s", _HOSTNAME, path.name, sender)

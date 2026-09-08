@@ -44,10 +44,16 @@ _API_TIMEOUT = 10
 _STARTUP_PING_TIMEOUT = 3  # short per-attempt timeout during startup probing
 _STARTUP_WAIT = 60  # initial scan on Windows with slow storage can exceed 30s
 _RESTART_DELAY = 10
+_RESTART_DELAY_MAX = 300
 
 
 class SyncthingError(RuntimeError):
     """Raised for any unrecoverable Syncthing failure surfaced to callers."""
+
+
+def _next_restart_delay(current: int) -> int:
+    """Return the next bounded delay after an unsuccessful restart."""
+    return min(current * 2, _RESTART_DELAY_MAX)
 
 
 def _platform_archive_info() -> tuple[str, str, str]:
@@ -1047,6 +1053,7 @@ class SyncthingService:
                 pass
 
     def _watch(self) -> None:
+        restart_delay = _RESTART_DELAY
         while not self._stop.is_set():
             with self._lock:
                 proc = self._proc
@@ -1058,15 +1065,17 @@ class SyncthingService:
                 continue
             if self._stop.is_set():
                 break
-            log.error("Syncthing exited with code %s, restarting in %ss", rc, _RESTART_DELAY)
-            if self._stop.wait(_RESTART_DELAY):
+            log.error("Syncthing exited with code %s, restarting in %ss", rc, restart_delay)
+            if self._stop.wait(restart_delay):
                 break
             try:
                 self._spawn()
-                if self.client is not None:
-                    self.client.wait_until_ready()
+                if self.client is not None and not self.client.wait_until_ready():
+                    raise SyncthingError("Syncthing did not become ready after restart")
+                restart_delay = _RESTART_DELAY
             except Exception:
                 log.exception("Failed to restart Syncthing")
+                restart_delay = _next_restart_delay(restart_delay)
 
     def stop(self) -> None:
         self._stop.set()
