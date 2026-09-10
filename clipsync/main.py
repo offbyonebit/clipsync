@@ -412,6 +412,8 @@ class ClipSyncApp:
             f"{config.APP_NAME} {'paused' if paused else 'resumed'}",
             "Clipboard sync is off." if paused else "Clipboard sync is on.",
         )
+        if not paused and self.clipboard is not None:
+            self.clipboard.reconcile_latest()
 
     def _on_device_accepted(self, device_id: str) -> None:
         self._notify("Device connected", f"Now syncing clipboard with {device_id[:7]}")
