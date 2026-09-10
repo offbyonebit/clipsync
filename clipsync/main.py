@@ -23,9 +23,11 @@ import shutil
 import signal
 import sys
 import threading
+import time
 from pathlib import Path
 
 import pystray
+import requests
 from PIL import Image, ImageDraw
 
 from . import config, update
@@ -149,6 +151,9 @@ class ClipSyncApp:
         self._quitting = threading.Event()
         self._pending_lock = threading.Lock()
         self._pending: dict[str, dict[str, object]] = {}
+        self._hotkey_listener: object | None = None
+        self._status_stop = threading.Event()
+        self._status_thread: threading.Thread | None = None
 
     def start(self) -> None:
         config.configure_logging()
@@ -161,8 +166,14 @@ class ClipSyncApp:
             raise RuntimeError("Syncthing started but REST client was not initialized")
         self.clipboard = ClipboardSync(self.settings)
         self.clipboard.start()
+        self._start_status_monitor()
 
-        self.file_transfer = FileTransfer(self.settings, on_received=self._on_file_received)
+        self.file_transfer = FileTransfer(
+            self.settings,
+            on_received=self._on_file_received,
+            expected_receivers=self._expected_file_receivers,
+            acknowledger_id=self._file_acknowledger_id,
+        )
         self.file_transfer.start()
 
         self.log_mirror = LogMirror(self.settings)
@@ -176,6 +187,7 @@ class ClipSyncApp:
             auto_accept=lambda: bool(self.settings.get("auto_accept_incoming")),
         )
         self.watcher.start()
+        self._start_history_hotkey()
 
         if not self.settings.get("first_run_completed"):
             self.settings.set("first_run_completed", True)
@@ -208,6 +220,8 @@ class ClipSyncApp:
     def _run_tray(self) -> None:
         image = _load_or_create_icon()
         menu = pystray.Menu(
+            pystray.MenuItem(self._sync_status_title, None, enabled=False),
+            pystray.Menu.SEPARATOR,
             pystray.MenuItem(
                 "Open ClipSync",
                 lambda _i, _it: self.ui.open("tabbed:devices"),
@@ -219,7 +233,9 @@ class ClipSyncApp:
                 visible=lambda _item: self._pending_count() > 0,
             ),
             pystray.MenuItem("Clipboard History", lambda _i, _it: self.ui.open("history")),
+            pystray.MenuItem("Send Clipboard Now", self._menu_send_clipboard),
             pystray.MenuItem("Send File…", lambda _i, _it: self.ui.open("file_picker")),
+            pystray.MenuItem(self._transfer_status_title, None, enabled=False),
             pystray.MenuItem("Add Device", lambda _i, _it: self.ui.open("tabbed:pair")),
             pystray.MenuItem("Connected Devices", lambda _i, _it: self.ui.open("tabbed:devices")),
             pystray.MenuItem(
@@ -227,6 +243,7 @@ class ClipSyncApp:
                 self._menu_toggle_pause,
                 checked=lambda _item: bool(self.settings.get("sync_paused")),
             ),
+            pystray.MenuItem("Pause for 15 minutes", self._menu_pause_temporarily),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Settings", lambda _i, _it: self.ui.open("tabbed:settings")),
             pystray.MenuItem("Check for Updates…", self._menu_check_updates),
@@ -250,7 +267,10 @@ class ClipSyncApp:
         icon.visible = True
         if self._pending_first_run_notice:
             self._pending_first_run_notice = False
-            self._notify(f"{config.APP_NAME} is running", "Click the tray icon to add a device.")
+            self.ui.open("tabbed:pair")
+            self._notify(
+                f"{config.APP_NAME} is running", "Pair both devices, approve the request, then copy a test phrase."
+            )
 
     def _notify(self, title: str, message: str) -> None:
         if not self.settings.get("show_notifications", True) and title != f"{config.APP_NAME} is running":
@@ -265,10 +285,81 @@ class ClipSyncApp:
             log.debug("Tray notification not supported on this platform")
             log.info("%s: %s", title, message)
 
+    def _sync_status_title(self, _item: pystray.MenuItem) -> str:
+        if self.clipboard is None:
+            return "Status: starting"
+        return self.clipboard.status_text()
+
+    def _transfer_status_title(self, _item: pystray.MenuItem) -> str:
+        if self.file_transfer is None:
+            return "Transfers: starting"
+        return self.file_transfer.status_text()
+
+    def _start_status_monitor(self) -> None:
+        self._status_stop.clear()
+        self._status_thread = threading.Thread(target=self._status_loop, name="clipsync-status", daemon=True)
+        self._status_thread.start()
+
+    def _status_loop(self) -> None:
+        next_transfer_cleanup = time.monotonic() + 3600
+        while not self._status_stop.is_set():
+            state = "Syncthing unavailable"
+            try:
+                client = self.syncthing.client
+                if client is not None and client.ping(timeout=2):
+                    folder = client.get_folder_status()
+                    devices = client.connected_devices()
+                    locally_current = folder.get("state") == "idle" and int(folder.get("needTotalItems", 0)) == 0
+                    if not devices:
+                        state = "No paired devices"
+                    elif any(not device.get("connected") for device in devices):
+                        state = "Syncthing waiting for an offline device"
+                    elif locally_current and all(
+                        isinstance(device.get("completion"), (int, float)) and float(device["completion"]) >= 99.99
+                        for device in devices
+                    ):
+                        state = "Syncthing replicated to paired devices"
+                    else:
+                        state = "Syncthing syncing"
+            except (OSError, TypeError, ValueError, requests.RequestException):
+                state = "Syncthing unavailable"
+            if self.clipboard is not None:
+                self.clipboard.set_replication_status(state)
+            if self.file_transfer is not None and time.monotonic() >= next_transfer_cleanup:
+                self.file_transfer.cleanup_delivered()
+                next_transfer_cleanup = time.monotonic() + 3600
+            if self.tray is not None:
+                try:
+                    self.tray.update_menu()
+                except Exception:
+                    log.debug("Tray status refresh failed", exc_info=True)
+            self._status_stop.wait(10)
+
     def _menu_toggle_pause(self, _icon: pystray.Icon, _item: pystray.MenuItem) -> None:
         paused = not bool(self.settings.get("sync_paused"))
         self.settings.set("sync_paused", paused)
         self._on_pause_changed(paused)
+
+    def _menu_pause_temporarily(self, _icon: pystray.Icon, _item: pystray.MenuItem) -> None:
+        self.settings.set("paused_until", time.time() + 15 * 60)
+        self._notify(config.APP_NAME, "Clipboard sync paused for 15 minutes.")
+
+    def _menu_send_clipboard(self, _icon: pystray.Icon, _item: pystray.MenuItem) -> None:
+        if self.clipboard is not None:
+            threading.Thread(target=self.clipboard.send_current, daemon=True).start()
+
+    def _start_history_hotkey(self) -> None:
+        shortcut = str(self.settings.get("history_shortcut") or "").strip()
+        if not shortcut:
+            return
+        try:
+            from pynput import keyboard
+
+            listener = keyboard.GlobalHotKeys({shortcut: lambda: self.ui.open("history")})
+            listener.start()
+            self._hotkey_listener = listener
+        except Exception as exc:
+            log.info("Global history shortcut unavailable: %s", exc)
 
     def _menu_quit(self, icon: pystray.Icon, _item: pystray.MenuItem) -> None:
         log.info("Quit requested from tray")
@@ -381,6 +472,15 @@ class ClipSyncApp:
             if self.clipboard is not None:
                 self.clipboard.clear_history()
             log.info("Clipboard history cleared from UI")
+        elif kind == "pin_history":
+            timestamp = evt.get("timestamp")
+            if self.clipboard is not None and isinstance(timestamp, (int, float)):
+                self.clipboard.set_history_pinned(float(timestamp), bool(evt.get("pinned")))
+        elif kind == "settings_changed":
+            if self.clipboard is not None:
+                self.clipboard.refresh_settings()
+            if self.tray is not None:
+                self.tray.update_menu()
         elif kind == "reset":
             log.info("Devices reset from UI")
         elif kind == "accept_device":
@@ -413,10 +513,13 @@ class ClipSyncApp:
             "Clipboard sync is off." if paused else "Clipboard sync is on.",
         )
         if not paused and self.clipboard is not None:
-            self.clipboard.reconcile_latest()
+            threading.Thread(target=self.clipboard.reconcile_latest, daemon=True).start()
 
     def _on_device_accepted(self, device_id: str) -> None:
-        self._notify("Device connected", f"Now syncing clipboard with {device_id[:7]}")
+        self._notify(
+            "Device connected",
+            f"Now syncing with {device_id[:7]}. Copy a short test phrase and check the tray status.",
+        )
 
     def _on_folder_changed(self, new_path: str) -> None:
         """Repoint every consumer of the sync folder, not just the clipboard.
@@ -453,7 +556,12 @@ class ClipSyncApp:
 
         self.clipboard = ClipboardSync(self.settings)
         self.clipboard.start()
-        self.file_transfer = FileTransfer(self.settings, on_received=self._on_file_received)
+        self.file_transfer = FileTransfer(
+            self.settings,
+            on_received=self._on_file_received,
+            expected_receivers=self._expected_file_receivers,
+            acknowledger_id=self._file_acknowledger_id,
+        )
         self.file_transfer.start()
         log.info("Sync folder changed to %s; Syncthing, clipboard and file transfer restarted", new_path)
 
@@ -461,13 +569,28 @@ class ClipSyncApp:
         if self.file_transfer is None:
             return
         try:
-            dest = self.file_transfer.send(source)
-            self._notify("File sent", f"{source.name} ({dest.stat().st_size // 1024} KB)")
+            self.file_transfer.send(source)
+            self._notify("File published", f"{source.name} is awaiting a receiver acknowledgement.")
         except Exception as exc:
             log.exception("Failed to send file %s", source)
             self._notify("File send failed", str(exc))
 
-    def _on_file_received(self, path: Path, sender: str) -> None:
+    def _expected_file_receivers(self) -> int:
+        client = self.syncthing.client
+        if client is None:
+            return 0
+        try:
+            return len(client.connected_devices())
+        except (OSError, TypeError, ValueError, requests.RequestException):
+            return 0
+
+    def _file_acknowledger_id(self) -> str:
+        client = self.syncthing.client
+        if client is None:
+            return ""
+        return client.get_device_id()
+
+    def _on_file_received(self, path: Path, sender: str) -> bool:
         downloads = Path.home() / "Downloads"
         downloads.mkdir(parents=True, exist_ok=True)
 
@@ -478,6 +601,9 @@ class ClipSyncApp:
         display_name = path.name
         if encrypted and display_name.endswith(ENCRYPTED_SUFFIX):
             display_name = display_name[: -len(ENCRYPTED_SUFFIX)]
+        name_parts = display_name.split("_", 3)
+        if len(name_parts) == 4 and len(name_parts[0]) == 32:
+            display_name = name_parts[3]
         passphrase = self.settings.get("encryption_passphrase") or ""
         if encrypted and not isinstance(passphrase, str):
             passphrase = ""
@@ -487,7 +613,7 @@ class ClipSyncApp:
                 f"File from {sender}",
                 f"{display_name} is encrypted and no passphrase is set; not saved.",
             )
-            return
+            return False
 
         stem = Path(display_name).stem
         suffix = Path(display_name).suffix
@@ -507,7 +633,7 @@ class ClipSyncApp:
                 dest = downloads / f"{stem}_{attempt}{suffix}"
         if fd < 0:
             log.warning("Could not find free filename for received file %s", path.name)
-            return
+            return False
         try:
             if encrypted:
                 # decrypt_file owns the destination, so release the claim we
@@ -523,7 +649,7 @@ class ClipSyncApp:
                         f"File from {sender}",
                         f"{display_name} could not be decrypted ({exc}).",
                     )
-                    return
+                    return False
                 config.set_file_permissions(dest)
             else:
                 with os.fdopen(fd, "wb") as out, path.open("rb") as src:
@@ -535,13 +661,19 @@ class ClipSyncApp:
                     pass
         except OSError:
             log.exception("Failed to save received file %s", path)
+            if fd >= 0:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
             try:
                 dest.unlink(missing_ok=True)
             except OSError:
                 pass
-            return
+            return False
         log.info("Saved received file to %s", dest)
         self._notify(f"File from {sender}", f"Saved to ~/Downloads/{dest.name}")
+        return True
 
     # Shutdown ---------------------------------------------------------------
 
@@ -556,6 +688,16 @@ class ClipSyncApp:
             log.exception("Error closing UI subprocesses")
         if self.watcher is not None:
             self.watcher.stop()
+        self._status_stop.set()
+        if self._status_thread is not None and self._status_thread.is_alive():
+            self._status_thread.join(timeout=3)
+        self._status_thread = None
+        if self._hotkey_listener is not None:
+            try:
+                self._hotkey_listener.stop()  # type: ignore[attr-defined]
+            except Exception:
+                log.debug("Could not stop history hotkey listener", exc_info=True)
+            self._hotkey_listener = None
         if self.log_mirror is not None:
             self.log_mirror.stop()
         if self.file_transfer is not None:

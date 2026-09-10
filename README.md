@@ -1,8 +1,9 @@
 # ClipSync
 
 Peer-to-peer clipboard sync for Windows, macOS, and Linux. Copy on one machine,
-paste on another. No account, no cloud, no central server. The data never
-leaves your devices.
+paste on another. No account and no ClipSync-operated server. Syncthing may use
+its encrypted public relays when devices cannot connect directly; relays cannot
+read the TLS-encrypted traffic.
 
 Verified working across Windows, macOS, and Linux, across different networks.
 
@@ -50,6 +51,9 @@ Every device in the group needs the same passphrase. A mismatch logs a clear
 ciphertext.
 
 ## Install
+
+Download the current Windows and Linux builds from the
+[GitHub Releases page](https://github.com/offbyonebit/clipsync/releases), or install with Python:
 
 ```bash
 pip install offbyonebit-clipsync
@@ -102,7 +106,11 @@ for the icon to actually show up.
 1. Tray icon -> **Add Device**.
 2. On the second machine, do the same.
 3. Scan the QR code with the webcam, or paste the device ID shown below it.
-4. Both sides auto-accept and start syncing.
+4. Approve the incoming request on the other device. Auto-accept is available
+   in Settings for trusted private networks, and is off by default.
+5. Copy a short phrase on either device, then paste it on the other. The tray
+   distinguishes a local publish from Syncthing replication; it does not call
+   a clipboard delivered until a receiver has confirmed it.
 
 ## Settings
 
@@ -110,12 +118,20 @@ for the icon to actually show up.
   Linux).
 - Show notifications.
 - Pause sync.
+- Pause for 15 minutes, or use manual-send mode from the tray.
+- Configurable text and image size limits.
 - Sync folder path.
 - Encryption passphrase.
 - View Syncthing logs.
 - Reset / unpair all devices.
 - Check for updates (compares against the latest GitHub release and opens the
   download page, no auto-install, no phone-home on startup).
+
+Clipboard history opens from the tray or with `Ctrl+Alt+V` when the platform
+supports global shortcuts. It supports search, arrow-key navigation, pinned
+snippets, and bounded image thumbnails. Pinned items still follow the selected
+auto-clear window. File transfers use unique IDs, retry failed receives after a
+restart, and show "delivered" only after a receiver writes an acknowledgement.
 
 Settings changes from the UI take effect immediately; hand-editing
 `settings.json` is also picked up, the file is watched for changes.

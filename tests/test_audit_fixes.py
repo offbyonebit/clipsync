@@ -313,7 +313,7 @@ def test_folder_change_restarts_syncthing_and_file_transfer(tmp_path, monkeypatc
     app._on_file_received = lambda *_a: None
 
     monkeypatch.setattr(main_mod, "ClipboardSync", lambda _s: _Stub("clipboard"))
-    monkeypatch.setattr(main_mod, "FileTransfer", lambda _s, on_received=None: _Stub("file_transfer"))
+    monkeypatch.setattr(main_mod, "FileTransfer", lambda _s, **_kwargs: _Stub("file_transfer"))
 
     new_folder = tmp_path / "new_sync"
     app._on_folder_changed(str(new_folder))

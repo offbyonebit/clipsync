@@ -56,6 +56,7 @@ def _isolate_user_data(tmp_path, monkeypatch):
     for name, filename in (
         ("SETTINGS_FILE", "settings.json"),
         ("LOG_FILE", "clipsync.log"),
+        ("TRANSFER_STATE_FILE", "transfers.json"),
     ):
         if hasattr(config, name):
             monkeypatch.setattr(config, name, data_dir / filename, raising=False)

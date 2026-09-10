@@ -379,6 +379,19 @@ def _normalize_newlines(s: str) -> str:
     return s.replace("\r\n", "\n").replace("\r", "\n")
 
 
+def _relative_age(timestamp: float) -> str:
+    seconds = max(0, int(time.time() - timestamp))
+    if seconds < 60:
+        return "just now"
+    minutes = seconds // 60
+    if minutes < 60:
+        return f"{minutes}m ago"
+    hours = minutes // 60
+    if hours < 24:
+        return f"{hours}h ago"
+    return f"{hours // 24}d ago"
+
+
 def _read_image_from_system_clipboard() -> bytes | None:
     """Return PNG bytes from the system clipboard, or None if no image is present."""
     if sys.platform in ("win32", "darwin"):
@@ -490,6 +503,7 @@ class ClipboardSync:
         self._last_synced: str | bytes | None = None
         self._lock = threading.Lock()
         self._last_read_error: str | None = None
+        self._last_payload_error: str | None = None
         self._last_write_error: str | None = None
         self._last_decrypt_error: str | None = None
         self._xfixes_queue: queue.SimpleQueue[object] | None = None
@@ -501,6 +515,10 @@ class ClipboardSync:
         self._generation = 0
         self._pending_incoming: _PendingIncoming | None = None
         self._last_observed_clipboard: str | bytes | None = None
+        self._last_outbound_at: float | None = None
+        self._last_inbound_at: float | None = None
+        self._outbound_pending = False
+        self._replication_status = "Syncthing starting"
 
     @property
     def clipboard_file(self) -> Path:
@@ -514,6 +532,7 @@ class ClipboardSync:
 
     def start(self) -> None:
         self._stop.clear()
+        self._history.start()
         self._seed_from_file()
         if sys.platform not in ("win32", "darwin"):
             _no_xfixes = os.environ.get("CLIPSYNC_NO_XFIXES")
@@ -539,6 +558,7 @@ class ClipboardSync:
 
     def stop(self) -> None:
         self._stop.set()
+        self._history.stop()
         if self._observer is not None:
             try:
                 self._observer.stop()
@@ -569,6 +589,66 @@ class ClipboardSync:
         """
         self._history.clear()
 
+    def set_history_pinned(self, timestamp: float, pinned: bool) -> bool:
+        return self._history.set_pinned(timestamp, pinned)
+
+    def refresh_settings(self) -> None:
+        self._history.refresh_settings()
+
+    def send_current(self) -> None:
+        """Publish the current clipboard even when manual-send mode is enabled."""
+        if self._is_paused():
+            self._last_write_error = "Sync is paused; resume before sending"
+            return
+        self._out_tick(force=True)
+
+    def set_replication_status(self, status: str) -> None:
+        with self._lock:
+            self._replication_status = status
+
+    def status_snapshot(self) -> dict[str, object]:
+        with self._lock:
+            error = (
+                self._last_decrypt_error or self._last_write_error or self._last_payload_error or self._last_read_error
+            )
+            return {
+                "paused": self._is_paused(),
+                "paused_until": self._settings.get("paused_until", 0.0),
+                "manual_send": bool(self._settings.get("manual_send", False)),
+                "outbound_pending": self._outbound_pending,
+                "last_outbound_at": self._last_outbound_at,
+                "last_inbound_at": self._last_inbound_at,
+                "replication": self._replication_status,
+                "error": error,
+            }
+
+    def status_text(self) -> str:
+        status = self.status_snapshot()
+        if status["paused"]:
+            paused_until = status["paused_until"]
+            try:
+                remaining = (
+                    max(0, int(float(paused_until) - time.time())) if isinstance(paused_until, str | int | float) else 0
+                )
+            except (TypeError, ValueError):
+                remaining = 0
+            if remaining:
+                return f"Status: paused for {max(1, (remaining + 59) // 60)}m"
+            return "Status: paused"
+        if status["error"]:
+            return f"Status: {status['error']}"
+        if status["outbound_pending"]:
+            return "Status: publishing clipboard locally"
+        suffix = " · manual send" if status["manual_send"] else ""
+        outbound = status["last_outbound_at"]
+        inbound = status["last_inbound_at"]
+        activity = ""
+        if isinstance(outbound, (int, float)) and (not isinstance(inbound, (int, float)) or outbound >= inbound):
+            activity = f" · published {_relative_age(outbound)}"
+        elif isinstance(inbound, (int, float)):
+            activity = f" · applied {_relative_age(inbound)}"
+        return f"Status: {status['replication']}{activity}{suffix}"
+
     def _passphrase(self) -> str:
         val = self._settings.get("encryption_passphrase") or ""
         return val if isinstance(val, str) else ""
@@ -580,6 +660,10 @@ class ClipboardSync:
         path = self.clipboard_file
         try:
             if not path.exists():
+                return None
+            max_bytes = self._max_text_bytes()
+            if path.stat().st_size > (max_bytes * 2) + 4096:
+                self._last_payload_error = f"Incoming text exceeds the {max_bytes} byte limit"
                 return None
             data = path.read_bytes()
         except OSError as exc:
@@ -604,11 +688,19 @@ class ClipboardSync:
                 log.info("Decrypt recovered")
                 self._last_decrypt_error = None
             try:
+                if len(decrypted) > self._max_text_bytes():
+                    self._last_payload_error = f"Incoming text exceeds the {self._max_text_bytes()} byte limit"
+                    return None
+                self._last_payload_error = None
                 return _normalize_newlines(decrypted.decode("utf-8"))
             except UnicodeDecodeError:
                 log.warning("Decrypted clipboard data is not valid UTF-8; ignoring")
                 return None
         try:
+            if len(data) > self._max_text_bytes():
+                self._last_payload_error = f"Incoming text exceeds the {self._max_text_bytes()} byte limit"
+                return None
+            self._last_payload_error = None
             return _normalize_newlines(data.decode("utf-8"))
         except UnicodeDecodeError:
             log.warning("Clipboard file is not valid UTF-8 and not encrypted; ignoring")
@@ -657,6 +749,10 @@ class ClipboardSync:
         try:
             if not path.exists():
                 return None
+            max_bytes = self._max_image_bytes()
+            if path.stat().st_size > (max_bytes * 2) + 4096:
+                self._last_payload_error = f"Incoming image exceeds the {max_bytes} byte limit"
+                return None
             data = path.read_bytes()
         except OSError as exc:
             log.debug("Image file read failed: %s", exc)
@@ -683,6 +779,10 @@ class ClipboardSync:
         if not data.startswith(_PNG_HEADER):
             log.debug("IN [%s]: clipboard.png contains non-PNG data (%d bytes); skipping", _HOSTNAME, len(data))
             return None
+        if len(data) > self._max_image_bytes():
+            self._last_payload_error = f"Incoming image exceeds the {self._max_image_bytes()} byte limit"
+            return None
+        self._last_payload_error = None
         return data
 
     def _write_image_file(self, png_bytes: bytes) -> None:
@@ -751,7 +851,24 @@ class ClipboardSync:
         )
 
     def _is_paused(self) -> bool:
-        return bool(self._settings.get("sync_paused"))
+        paused_until = self._settings.get("paused_until", 0.0)
+        try:
+            temporarily_paused = float(paused_until) > time.time()
+        except (TypeError, ValueError):
+            temporarily_paused = False
+        return bool(self._settings.get("sync_paused")) or temporarily_paused
+
+    def _max_text_bytes(self) -> int:
+        try:
+            return max(1024, int(self._settings.get("max_text_bytes", 1024 * 1024)))
+        except (TypeError, ValueError):
+            return 1024 * 1024
+
+    def _max_image_bytes(self) -> int:
+        try:
+            return max(1024, int(self._settings.get("max_image_bytes", 5 * 1024 * 1024)))
+        except (TypeError, ValueError):
+            return 5 * 1024 * 1024
 
     def _read_clipboard(self) -> str | None:
         try:
@@ -810,14 +927,21 @@ class ClipboardSync:
     def _write_clipboard_image(self, png_bytes: bytes) -> bool:
         try:
             with _CLIPBOARD_LOCK:
-                return _write_image_to_system_clipboard(png_bytes)
+                written = _write_image_to_system_clipboard(png_bytes)
         except Exception as exc:
-            log.debug("Image clipboard write failed: %s", exc)
+            self._last_write_error = f"Could not apply incoming image: {type(exc).__name__}: {exc}"
+            log.warning("Image clipboard write failed: %s", exc)
             return False
+        if not written:
+            self._last_write_error = "Could not apply incoming image to the system clipboard"
+            return False
+        self._last_write_error = None
+        return True
 
     def _out_loop(self) -> None:
         _last_heartbeat = time.monotonic()
         _HEARTBEAT_INTERVAL = 6.0
+        was_paused = self._is_paused()
 
         # Initial tick captures whatever is on the clipboard at startup.
         try:
@@ -827,6 +951,7 @@ class ClipboardSync:
             log.exception("Error in OUT loop (initial tick)")
 
         while not self._stop.is_set():
+            was_paused = self._refresh_pause_state(was_paused)
             if self._xfixes_queue is not None:
                 # Event-driven path: block until clipboard owner changes (or stop).
                 try:
@@ -878,13 +1003,18 @@ class ClipboardSync:
                     self._is_paused(),
                 )
 
-    def _out_tick(self) -> None:
+    def _out_tick(self, force: bool = False) -> None:
+        if self._settings.get("manual_send", False) and not force:
+            return
         with self._lock:
             observed_generation = self._generation
 
         # Images take priority: if the clipboard has an image, sync it.
         image = self._read_clipboard_image()
         if image is not None:
+            if len(image) > self._max_image_bytes():
+                self._last_write_error = f"Image exceeds the {self._max_image_bytes()} byte limit"
+                return
             with self._lock:
                 if observed_generation != self._generation:
                     return
@@ -900,21 +1030,32 @@ class ClipboardSync:
                 self._last_observed_clipboard = image
                 self._last_synced = image
             try:
+                with self._lock:
+                    self._outbound_pending = True
                 self._write_image_file(image)
+                with self._lock:
+                    self._outbound_pending = False
+                    self._last_outbound_at = time.time()
+                    self._last_write_error = None
+                    self._replication_status = "Waiting for Syncthing"
                 log.info("OUT [%s]: %d bytes image written", _HOSTNAME, len(image))
+                self._history.add_image(image, "local")
             except EncryptedPayloadError:
                 with self._lock:
+                    self._outbound_pending = False
                     if self._generation == publish_generation and self._last_synced == image:
                         self._last_synced = previous_last_synced
                 reason = "Refusing to overwrite encrypted clipboard image file (cannot decrypt)"
                 if reason != self._last_decrypt_error:
                     log.warning("OUT [%s]: %s", _HOSTNAME, reason)
                     self._last_decrypt_error = reason
-            except OSError:
+            except OSError as exc:
                 # Roll back too: _last_synced is the "already sent" guard, so
                 # leaving it set after a failed write means every later tick
                 # sees this image as synced and it is never retried.
                 with self._lock:
+                    self._outbound_pending = False
+                    self._last_write_error = f"Could not publish clipboard image: {exc}"
                     if self._generation == publish_generation and self._last_synced == image:
                         self._last_synced = previous_last_synced
                 log.exception("OUT [%s]: Failed to write image file", _HOSTNAME)
@@ -922,6 +1063,9 @@ class ClipboardSync:
 
         current = self._read_clipboard()
         if current is None or current == "":
+            return
+        if len(current.encode("utf-8")) > self._max_text_bytes():
+            self._last_write_error = f"Text exceeds the {self._max_text_bytes()} byte limit"
             return
         with self._lock:
             if observed_generation != self._generation:
@@ -938,19 +1082,29 @@ class ClipboardSync:
             self._last_observed_clipboard = current
             self._last_synced = current
         try:
+            with self._lock:
+                self._outbound_pending = True
             self._write_file(current)
+            with self._lock:
+                self._outbound_pending = False
+                self._last_outbound_at = time.time()
+                self._last_write_error = None
+                self._replication_status = "Waiting for Syncthing"
             log.info("OUT [%s]: %d chars written", _HOSTNAME, len(current))
             self._history.add_entry(current, "local")
         except EncryptedPayloadError:
             with self._lock:
+                self._outbound_pending = False
                 if self._generation == publish_generation and self._last_synced == current:
                     self._last_synced = previous_last_synced
             reason = "Refusing to overwrite encrypted clipboard file (cannot decrypt)"
             if reason != self._last_decrypt_error:
                 log.warning("OUT [%s]: %s", _HOSTNAME, reason)
                 self._last_decrypt_error = reason
-        except OSError:
+        except OSError as exc:
             with self._lock:
+                self._outbound_pending = False
+                self._last_write_error = f"Could not publish clipboard text: {exc}"
                 if self._generation == publish_generation and self._last_synced == current:
                     self._last_synced = previous_last_synced
             log.exception("OUT [%s]: Failed to write clipboard file", _HOSTNAME)
@@ -1056,6 +1210,8 @@ class ClipboardSync:
                 self._generation += 1
                 self._last_synced = pending.value
                 self._last_observed_clipboard = pending.value
+                self._last_inbound_at = time.time()
+                self._last_write_error = None
                 self._pending_incoming = None
                 committed = pending
             elif pending.attempts <= len(_INCOMING_RETRY_DELAYS):
@@ -1063,6 +1219,7 @@ class ClipboardSync:
                 return
             else:
                 self._pending_incoming = None
+                self._last_write_error = f"Could not apply incoming {pending.kind} to the system clipboard"
                 log.warning(
                     "IN [%s]: %s clipboard write failed after %d attempts", _HOSTNAME, pending.kind, pending.attempts
                 )
@@ -1071,6 +1228,7 @@ class ClipboardSync:
             self._history.add_entry(committed.value, "remote")
             log.info("IN [%s]: %d chars applied to clipboard", _HOSTNAME, len(committed.value))
         elif isinstance(committed.value, bytes):
+            self._history.add_image(committed.value, "remote")
             log.info("IN [%s]: %d bytes image applied to clipboard", _HOSTNAME, len(committed.value))
 
     def reconcile_latest(self) -> None:
@@ -1088,6 +1246,13 @@ class ClipboardSync:
             self._on_image_file_changed()
         else:
             self._on_text_file_changed()
+
+    def _refresh_pause_state(self, was_paused: bool) -> bool:
+        """Reconcile changes that arrived while a timed or manual pause was active."""
+        paused = self._is_paused()
+        if was_paused and not paused:
+            self.reconcile_latest()
+        return paused
 
 
 class _ClipboardFileHandler(FileSystemEventHandler):

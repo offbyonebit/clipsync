@@ -116,6 +116,13 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "history_enabled": True,
     "history_max_items": 50,
     "history_auto_clear_minutes": 0,
+    "manual_send": False,
+    "paused_until": 0.0,
+    "max_text_bytes": 1 * 1024 * 1024,
+    "max_image_bytes": 5 * 1024 * 1024,
+    "history_shortcut": "<ctrl>+<alt>+v",
+    "transfer_retention_days": 7,
+    "cleanup_delivered_transfers": True,
     "theme": "System",
     # Mirror this device's log into the shared folder so peers can see it.
     # Off by default: it is a debugging aid, and the sync folder is replicated
@@ -127,6 +134,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
 }
 
 HISTORY_FILE = APP_DATA_DIR / "clipsync_history.json"
+TRANSFER_STATE_FILE = APP_DATA_DIR / "transfers.json"
 _PASSPHRASE_KEYRING_ACCOUNT = "encryption-passphrase"
 
 

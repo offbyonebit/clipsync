@@ -864,6 +864,12 @@ class SyncthingClient:
     def get_connections(self) -> dict[str, Any]:
         return self._get("/rest/system/connections") or {}
 
+    def get_folder_status(self, folder_id: str = config.CLIPBOARD_FOLDER_ID) -> dict[str, Any]:
+        return self._get(f"/rest/db/status?folder={folder_id}") or {}
+
+    def get_device_completion(self, device_id: str, folder_id: str = config.CLIPBOARD_FOLDER_ID) -> dict[str, Any]:
+        return self._get(f"/rest/db/completion?device={device_id}&folder={folder_id}") or {}
+
     def add_device(self, device_id: str, name: str = "") -> None:
         """Idempotently add a remote device to our config."""
         devices = self.get_devices()
@@ -932,12 +938,19 @@ class SyncthingClient:
             if not did or did == my_id:
                 continue
             conn = connections.get(did) or {}
+            completion: float | None = None
+            if conn.get("connected"):
+                try:
+                    completion = float(self.get_device_completion(did).get("completion", 0.0))
+                except (requests.RequestException, TypeError, ValueError):
+                    completion = None
             out.append(
                 {
                     "deviceID": did,
                     "name": d.get("name") or did[:7],
                     "connected": bool(conn.get("connected")),
                     "address": conn.get("address", ""),
+                    "completion": completion,
                 }
             )
         return out

@@ -372,6 +372,9 @@ class AppContext:
     def on_reject_device(self, device_id: str) -> None:
         _emit("reject_device", device_id=device_id)
 
+    def on_pin_history(self, timestamp: float, pinned: bool) -> None:
+        _emit("pin_history", timestamp=timestamp, pinned=pinned)
+
 
 # ---------------------------------------------------------------------------
 # Windows
@@ -451,8 +454,16 @@ class _PairingContent:
         self._scan_container = container
 
         ctk.CTkLabel(container, text="Pair a device", font=_fonts()["headline"], text_color=THEME.text).pack(
-            pady=(0, 18)
+            pady=(0, 6)
         )
+        ctk.CTkLabel(
+            container,
+            text="1. Open ClipSync on both devices.  2. Add or scan the other device.  3. Approve the request there.  4. Copy a short test phrase and check the tray status.",
+            font=_fonts()["small"],
+            text_color=THEME.muted,
+            wraplength=430,
+            justify="left",
+        ).pack(fill="x", pady=(0, 18))
 
         _section_header(container, "Nearby devices").pack(fill="x")
         self._nearby_frame = ctk.CTkScrollableFrame(
@@ -593,12 +604,15 @@ class _PairingContent:
             ).pack(pady=(4, 0))
             return
         for did in device_ids:
-            row = ctk.CTkFrame(self._nearby_frame, fg_color=(config.COLOR_ROW_BG_LIGHT, config.COLOR_ROW_BG_DARK), corner_radius=8)
+            row = ctk.CTkFrame(
+                self._nearby_frame, fg_color=(config.COLOR_ROW_BG_LIGHT, config.COLOR_ROW_BG_DARK), corner_radius=8
+            )
             row.pack(fill="x", padx=8, pady=4)
             row.grid_columnconfigure(0, weight=1)
             ctk.CTkLabel(row, text=did[:24] + "…", font=_fonts()["small"], anchor="w", text_color=THEME.text).grid(
                 row=0, column=0, sticky="we", padx=12, pady=10
             )
+
             def _pair_handler(d: str = did) -> None:
                 self._pair_from_nearby(d)
 
@@ -808,7 +822,9 @@ class _DevicesContent:
         for child in self._list_frame.winfo_children():
             child.destroy()
         if error:
-            ctk.CTkLabel(self._list_frame, text=error, text_color=config.COLOR_DANGER, font=_fonts()["body"]).pack(pady=14)
+            ctk.CTkLabel(self._list_frame, text=error, text_color=config.COLOR_DANGER, font=_fonts()["body"]).pack(
+                pady=14
+            )
             return
         if not devices:
             empty = ctk.CTkFrame(self._list_frame, fg_color="transparent")
@@ -830,7 +846,9 @@ class _DevicesContent:
             self._build_row(d)
 
     def _build_row(self, device: dict) -> None:
-        row = ctk.CTkFrame(self._list_frame, fg_color=(config.COLOR_ROW_BG_LIGHT, config.COLOR_ROW_BG_DARK), corner_radius=10)
+        row = ctk.CTkFrame(
+            self._list_frame, fg_color=(config.COLOR_ROW_BG_LIGHT, config.COLOR_ROW_BG_DARK), corner_radius=10
+        )
         row.pack(fill="x", padx=8, pady=5)
         row.grid_columnconfigure(0, weight=1)
 
@@ -838,12 +856,16 @@ class _DevicesContent:
         ctk.CTkLabel(row, text=name_text, font=_fonts()["subtitle"], text_color=THEME.text, anchor="w").grid(
             row=0, column=0, sticky="we", padx=12, pady=(10, 0)
         )
-        ctk.CTkLabel(row, text=device["deviceID"][:24] + "…", font=_fonts()["tiny"], text_color=THEME.muted, anchor="w").grid(
-            row=1, column=0, sticky="we", padx=12, pady=(0, 10)
-        )
+        ctk.CTkLabel(
+            row, text=device["deviceID"][:24] + "…", font=_fonts()["tiny"], text_color=THEME.muted, anchor="w"
+        ).grid(row=1, column=0, sticky="we", padx=12, pady=(0, 10))
 
         status_color = config.COLOR_SUCCESS if device["connected"] else THEME.muted
-        status_text = "● Connected" if device["connected"] else "○ Offline"
+        completion = device.get("completion")
+        if device["connected"] and isinstance(completion, (int, float)):
+            status_text = f"● Connected · {completion:.0f}% replicated"
+        else:
+            status_text = "● Connected" if device["connected"] else "○ Offline"
         ctk.CTkLabel(row, text=status_text, text_color=status_color, font=_fonts()["small"]).grid(
             row=0, column=1, rowspan=2, padx=12
         )
@@ -967,6 +989,14 @@ class _SettingsContent:
             anchor="w", padx=16, pady=4
         )
 
+        self._manual_send_var = ctk.BooleanVar(value=bool(app.settings.get("manual_send")))
+        _switch(
+            general_card,
+            "Manual send (use tray → Send Clipboard Now)",
+            self._manual_send_var,
+            self._on_manual_send_toggle,
+        ).pack(anchor="w", padx=16, pady=4)
+
         self._auto_accept_var = ctk.BooleanVar(value=bool(app.settings.get("auto_accept_incoming")))
         _switch(
             general_card,
@@ -1002,9 +1032,7 @@ class _SettingsContent:
             text_color=THEME.muted,
         ).pack(anchor="w", padx=(52, 16), pady=(0, 14))
 
-        _section_header(privacy_card, "Encryption passphrase (optional)").pack(
-            anchor="w", padx=16, pady=(4, 2)
-        )
+        _section_header(privacy_card, "Encryption passphrase (optional)").pack(anchor="w", padx=16, pady=(4, 2))
         ctk.CTkLabel(
             privacy_card,
             text="Same passphrase on every device. Empty = no encryption.",
@@ -1073,6 +1101,52 @@ class _SettingsContent:
         )
         self._auto_clear_menu.pack(side="left")
         self._auto_clear_menu.set(auto_clear_label)
+
+        _section_header(history_card, "Maximum clipboard item size").pack(anchor="w", padx=16, pady=(4, 8))
+        self._text_size_options = {
+            "256 KiB text": 256 * 1024,
+            "1 MiB text": 1024 * 1024,
+            "5 MiB text": 5 * 1024 * 1024,
+        }
+        self._image_size_options = {
+            "1 MiB images": 1024 * 1024,
+            "5 MiB images": 5 * 1024 * 1024,
+            "20 MiB images": 20 * 1024 * 1024,
+        }
+        size_row = ctk.CTkFrame(history_card, fg_color="transparent")
+        size_row.pack(fill="x", padx=16, pady=(0, 14))
+        text_menu = ctk.CTkOptionMenu(
+            size_row,
+            values=list(self._text_size_options),
+            command=self._on_text_size_changed,
+        )
+        text_menu.pack(side="left", padx=(0, 8))
+        text_menu.set(
+            next(
+                (
+                    label
+                    for label, size in self._text_size_options.items()
+                    if size == app.settings.get("max_text_bytes")
+                ),
+                "1 MiB text",
+            )
+        )
+        image_menu = ctk.CTkOptionMenu(
+            size_row,
+            values=list(self._image_size_options),
+            command=self._on_image_size_changed,
+        )
+        image_menu.pack(side="left")
+        image_menu.set(
+            next(
+                (
+                    label
+                    for label, size in self._image_size_options.items()
+                    if size == app.settings.get("max_image_bytes")
+                ),
+                "5 MiB images",
+            )
+        )
 
         advanced_card = _card_frame(container)
         advanced_card.pack(fill="x", pady=(0, 16))
@@ -1147,6 +1221,12 @@ class _SettingsContent:
         self._app.settings.set("sync_paused", paused)
         self._app.on_pause_changed(paused)
         self._status.configure(text=f"Sync {'enabled' if enabled else 'paused'}.")
+
+    def _on_manual_send_toggle(self) -> None:
+        enabled = bool(self._manual_send_var.get())
+        self._app.settings.set("manual_send", enabled)
+        self._app.on_settings_changed()
+        self._status.configure(text="Manual send enabled." if enabled else "Automatic clipboard sync enabled.")
 
     def _on_log_mirror_toggle(self) -> None:
         enabled = bool(self._log_mirror_var.get())
@@ -1230,6 +1310,16 @@ class _SettingsContent:
         self._status.configure(
             text=(f"History auto-clear set to {value}." if minutes > 0 else "History auto-clear disabled.")
         )
+
+    def _on_text_size_changed(self, value: str) -> None:
+        self._app.settings.set("max_text_bytes", self._text_size_options[value])
+        self._app.on_settings_changed()
+        self._status.configure(text=f"Text limit set to {value}.")
+
+    def _on_image_size_changed(self, value: str) -> None:
+        self._app.settings.set("max_image_bytes", self._image_size_options[value])
+        self._app.on_settings_changed()
+        self._status.configure(text=f"Image limit set to {value}.")
 
     def _on_save_passphrase(self) -> None:
         new_value = self._passphrase_entry.get()
@@ -1462,7 +1552,9 @@ class LogsWindow(_BaseWindow):
         super().__init__(parent, f"{config.APP_NAME} — Logs", (640, 440), on_close)
         container = ctk.CTkFrame(self.window, fg_color="transparent")
         container.pack(fill="both", expand=True, padx=20, pady=20)
-        ctk.CTkLabel(container, text="Logs", font=_fonts()["headline"], text_color=THEME.text).pack(anchor="w", pady=(0, 12))
+        ctk.CTkLabel(container, text="Logs", font=_fonts()["headline"], text_color=THEME.text).pack(
+            anchor="w", pady=(0, 12)
+        )
         self._textbox = ctk.CTkTextbox(
             container,
             wrap="none",
@@ -1506,9 +1598,9 @@ class IncomingWindow(_BaseWindow):
         container = ctk.CTkFrame(self.window, fg_color="transparent")
         container.pack(fill="both", expand=True, padx=20, pady=20)
 
-        ctk.CTkLabel(
-            container, text="Incoming device requests", font=_fonts()["headline"], text_color=THEME.text
-        ).pack(pady=(0, 6))
+        ctk.CTkLabel(container, text="Incoming device requests", font=_fonts()["headline"], text_color=THEME.text).pack(
+            pady=(0, 6)
+        )
         ctk.CTkLabel(
             container,
             text="Accept a device to start syncing clipboard with it.",
@@ -1571,7 +1663,9 @@ class IncomingWindow(_BaseWindow):
         for child in self._list_frame.winfo_children():
             child.destroy()
         if error:
-            ctk.CTkLabel(self._list_frame, text=error, text_color=config.COLOR_DANGER, font=_fonts()["body"]).pack(pady=14)
+            ctk.CTkLabel(self._list_frame, text=error, text_color=config.COLOR_DANGER, font=_fonts()["body"]).pack(
+                pady=14
+            )
             return
         rejected = set(self._app.settings.get("rejected_device_ids") or [])
         visible = [
@@ -1599,7 +1693,9 @@ class IncomingWindow(_BaseWindow):
             self._build_row(device_id, info)
 
     def _build_row(self, device_id: str, info: dict) -> None:
-        row = ctk.CTkFrame(self._list_frame, fg_color=(config.COLOR_ROW_BG_LIGHT, config.COLOR_ROW_BG_DARK), corner_radius=10)
+        row = ctk.CTkFrame(
+            self._list_frame, fg_color=(config.COLOR_ROW_BG_LIGHT, config.COLOR_ROW_BG_DARK), corner_radius=10
+        )
         row.pack(fill="x", padx=8, pady=5)
         row.grid_columnconfigure(0, weight=1)
 
@@ -1660,7 +1756,9 @@ class HistoryWindow(_BaseWindow):
 
         header = ctk.CTkFrame(container, fg_color="transparent")
         header.pack(fill="x", pady=(0, 10))
-        ctk.CTkLabel(header, text="Clipboard History", font=_fonts()["headline"], text_color=THEME.text).pack(side="left")
+        ctk.CTkLabel(header, text="Clipboard History", font=_fonts()["headline"], text_color=THEME.text).pack(
+            side="left"
+        )
         self._status = ctk.CTkLabel(header, text="", font=_fonts()["small"], text_color=THEME.muted)
         self._status.pack(side="right")
 
@@ -1687,26 +1785,45 @@ class HistoryWindow(_BaseWindow):
 
         btn_row = ctk.CTkFrame(container, fg_color="transparent")
         btn_row.pack(fill="x", pady=(14, 0))
-        _primary_button(btn_row, text="Refresh", command=self._refresh, width=100).pack(side="left")
+        _primary_button(btn_row, text="Refresh", command=self._reload_history, width=100).pack(side="left")
         _secondary_button(btn_row, text="Clear All", command=self._confirm_clear, width=100).pack(side="right")
 
-        self._all_entries: list[object] = []
+        self._all_entries: list[Any] = []
+        self._visible_entries: list[Any] = []
+        self._row_widgets: list[ctk.CTkFrame] = []
+        self._image_refs: list[ctk.CTkImage] = []
+        self._selected_index = 0
+        self.window.bind("<Control-f>", lambda _event: self._search_entry.focus_set())
+        self.window.bind("<Down>", lambda _event: self._move_selection(1))
+        self.window.bind("<Up>", lambda _event: self._move_selection(-1))
+        self.window.bind("<Return>", lambda _event: self._copy_selected())
+        self._reload_history()
+
+    def _reload_history(self) -> None:
+        from .history import ClipboardHistory
+
+        entries = ClipboardHistory(self._app.settings).get_entries()
+        self._all_entries = sorted(entries, key=lambda entry: (not getattr(entry, "pinned", False), -entry.timestamp))
         self._refresh()
 
     def _refresh(self) -> None:
-        from .history import ClipboardHistory
-
         for w in self._list_frame.winfo_children():
             w.destroy()
-
-        history = ClipboardHistory(self._app.settings)
-        self._all_entries = list(reversed(history.get_entries()))
+        self._row_widgets = []
+        self._image_refs = []
 
         query = self._search_var.get().strip().lower()
         if query:
-            entries = [e for e in self._all_entries if query in getattr(e, "text", "").lower()]
+            entries = [
+                e
+                for e in self._all_entries
+                if query in getattr(e, "text", "").lower()
+                or (getattr(e, "kind", "text") == "image" and query in "image")
+            ]
         else:
             entries = self._all_entries
+        self._visible_entries = entries
+        self._selected_index = min(self._selected_index, max(0, len(entries) - 1))
 
         if not entries:
             empty = ctk.CTkFrame(self._list_frame, fg_color="transparent")
@@ -1746,14 +1863,17 @@ class HistoryWindow(_BaseWindow):
 
         now = _time.time()
         for entry in entries:
-            self._build_row(entry, now)
+            self._row_widgets.append(self._build_row(entry, now))
+        self._show_selection()
 
-    def _build_row(self, entry: object, now: float) -> None:
+    def _build_row(self, entry: Any, now: float) -> ctk.CTkFrame:
         from datetime import datetime
 
         ts = getattr(entry, "timestamp", 0.0)
         text = getattr(entry, "text", "")
         source = getattr(entry, "source", "local")
+        pinned = bool(getattr(entry, "pinned", False))
+        kind = getattr(entry, "kind", "text")
 
         dt = datetime.fromtimestamp(ts)
         age = now - ts
@@ -1777,16 +1897,26 @@ class HistoryWindow(_BaseWindow):
         source_color = config.COLOR_PRIMARY if source == "remote" else THEME.muted
         meta = ctk.CTkLabel(
             row,
-            text=f"{time_str}  •  {source_label}",
+            text=f"{time_str}  •  {source_label}{'  •  Pinned' if pinned else ''}",
             font=_fonts()["tiny"],
             text_color=source_color,
             anchor="w",
         )
         meta.grid(row=0, column=0, columnspan=2, sticky="ew", padx=12, pady=(8, 0))
 
+        image_b64 = str(getattr(entry, "image_b64", ""))
+        preview_image: ctk.CTkImage | None = None
+        if kind == "image" and image_b64:
+            try:
+                image = Image.open(io.BytesIO(base64.b64decode(image_b64)))
+                preview_image = ctk.CTkImage(light_image=image, dark_image=image, size=image.size)
+                self._image_refs.append(preview_image)
+            except (OSError, ValueError):
+                preview_image = None
         preview_label = ctk.CTkLabel(
             row,
-            text=preview or "(empty)",
+            text="" if preview_image is not None else (preview or "Image" if kind == "image" else "(empty)"),
+            image=preview_image,
             font=_fonts()["small"],
             text_color=THEME.text,
             anchor="w",
@@ -1794,8 +1924,8 @@ class HistoryWindow(_BaseWindow):
         )
         preview_label.grid(row=1, column=0, columnspan=2, sticky="ew", padx=12, pady=(2, 8))
 
-        def _copy_handler(t: str = text) -> None:
-            self._copy_entry(t)
+        def _copy_handler(e: Any = entry) -> None:
+            self._copy_entry(e)
 
         copy_btn = _primary_button(
             row,
@@ -1805,11 +1935,51 @@ class HistoryWindow(_BaseWindow):
         )
         copy_btn.grid(row=0, column=2, rowspan=2, padx=(0, 10), pady=6)
 
-    def _copy_entry(self, text: str) -> None:
-        try:
-            import pyperclip
+        def _pin_handler(e: Any = entry) -> None:
+            self._toggle_pin(e)
 
-            pyperclip.copy(text)
+        _secondary_button(
+            row,
+            text="Unpin" if pinned else "Pin",
+            width=52,
+            command=_pin_handler,
+        ).grid(row=0, column=3, rowspan=2, padx=(0, 10), pady=6)
+        return row
+
+    def _toggle_pin(self, entry: Any) -> None:
+        pinned = not bool(getattr(entry, "pinned", False))
+        entry.pinned = pinned
+        self._app.on_pin_history(float(getattr(entry, "timestamp", 0.0)), pinned)
+        self._all_entries.sort(key=lambda candidate: (not getattr(candidate, "pinned", False), -candidate.timestamp))
+        self._refresh()
+
+    def _move_selection(self, delta: int) -> str:
+        if self._visible_entries:
+            self._selected_index = (self._selected_index + delta) % len(self._visible_entries)
+            self._show_selection()
+        return "break"
+
+    def _show_selection(self) -> None:
+        for index, row in enumerate(self._row_widgets):
+            row.configure(border_color=config.COLOR_PRIMARY if index == self._selected_index else THEME.border)
+
+    def _copy_selected(self) -> str:
+        if self._visible_entries:
+            self._copy_entry(self._visible_entries[self._selected_index])
+        return "break"
+
+    def _copy_entry(self, entry: Any) -> None:
+        try:
+            if getattr(entry, "kind", "text") == "image":
+                from .clipboard import _write_image_to_system_clipboard
+
+                payload = base64.b64decode(str(getattr(entry, "image_b64", "")))
+                if not _write_image_to_system_clipboard(payload):
+                    raise RuntimeError("image clipboard is unavailable")
+            else:
+                import pyperclip
+
+                pyperclip.copy(str(getattr(entry, "text", "")))
             self._status.configure(text="Copied!")
             self.window.after(1500, lambda: self._status.configure(text=""))
         except Exception as exc:
@@ -1846,9 +2016,7 @@ class HistoryWindow(_BaseWindow):
 
         def do_clear() -> None:
             _emit("clear_history")
-            from .history import ClipboardHistory
-
-            ClipboardHistory(self._app.settings).clear()
+            self._all_entries = []
             dialog.destroy()
             self._refresh()
 
