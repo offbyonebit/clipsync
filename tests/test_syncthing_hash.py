@@ -137,16 +137,14 @@ def test_verify_release_signature_rejects_badsig(monkeypatch) -> None:
         syncthing._verify_release_signature(b"-----BEGIN PGP SIGNED MESSAGE-----")
 
 
-def test_verify_release_signature_falls_back_when_gpg_absent(monkeypatch, caplog) -> None:
-    """Without gpg on PATH we must NOT refuse the download -- we log a
-    warning and fall back to hash-only (preserves prior behavior on
-    systems like stock Windows)."""
+def test_verify_release_signature_refuses_when_gpg_absent(monkeypatch) -> None:
+    """A network-fetched hash cannot vouch for itself. Without gpg on PATH
+    signature verification is impossible, so we fail closed rather than
+    silently falling back to hash-only."""
     monkeypatch.setattr(syncthing.shutil, "which", lambda _n: None)
-    import logging
 
-    with caplog.at_level(logging.WARNING):
+    with pytest.raises(SyncthingError, match="gpg is not available"):
         syncthing._verify_release_signature(b"-----BEGIN PGP SIGNED MESSAGE-----")
-    assert any("signature will NOT be verified" in r.message for r in caplog.records)
 
 
 def test_verify_archive_hash_succeeds_on_match(monkeypatch) -> None:

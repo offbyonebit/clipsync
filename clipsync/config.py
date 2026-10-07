@@ -197,12 +197,17 @@ class Settings:
         self._data = merged
         self._migrate_legacy_passphrase_locked()
         # Only persist if the on-disk file is incomplete (missing a default
-        # key) or has an empty api_key that we just generated. Otherwise
-        # leave the file alone: rewriting it on every startup is needless
-        # churn and could race with a concurrent writer (e.g. a UI
-        # subprocess that just wrote a new value).
+        # key), has an empty api_key that we just generated, or still holds a
+        # plaintext passphrase that was just migrated. Otherwise leave the file
+        # alone: rewriting it on every startup is needless churn and could race
+        # with a concurrent writer (e.g. a UI subprocess that just wrote a new
+        # value).
         loaded_keys = set(loaded.keys())
-        needs_persist = not loaded.get("api_key") or any(k not in loaded_keys for k in DEFAULT_SETTINGS)
+        needs_persist = (
+            not loaded.get("api_key")
+            or any(k not in loaded_keys for k in DEFAULT_SETTINGS)
+            or loaded.get("encryption_passphrase", "") != ""
+        )
         if needs_persist:
             self._persist_locked()
         else:
@@ -210,6 +215,13 @@ class Settings:
                 self._mtime_ns = self._path.stat().st_mtime_ns
             except OSError:
                 pass
+
+    def _secure_namespace(self) -> str:
+        """Stable namespace isolating secure storage per settings file."""
+        try:
+            return str(self._path.resolve())
+        except OSError:
+            return str(self._path)
 
     def _persist_locked(self) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)
@@ -263,6 +275,7 @@ class Settings:
             self._persist_locked()
 
     def _get_passphrase_locked(self) -> str:
+        value = None
         try:
             value = _keyring_backend().get_password(APP_ID, self._keyring_account())
         except Exception as exc:
@@ -270,10 +283,22 @@ class Settings:
                 logging.warning("OS keychain unavailable; retaining legacy encrypted-data access: %s", exc)
                 return self._legacy_passphrase
             logging.warning("OS keychain unavailable: %s", exc)
-            return ""
         if isinstance(value, str):
             return value
-        return self._migrate_legacy_passphrase_locked()
+        if self._legacy_passphrase:
+            return self._migrate_legacy_passphrase_locked()
+        # Older releases used a different keychain account and an encrypted
+        # fallback file. Preserve access when upgrading an existing install.
+        from .secure_settings import get_passphrase
+
+        previous = get_passphrase(self._secure_namespace())
+        if not previous:
+            return ""
+        try:
+            _keyring_backend().set_password(APP_ID, self._keyring_account(), previous)
+        except Exception:
+            logging.warning("Could not migrate older secure storage; retaining access to its passphrase")
+        return previous
 
     def _migrate_legacy_passphrase_locked(self) -> str:
         if not self._legacy_passphrase:
@@ -317,6 +342,11 @@ class Settings:
                     backend.delete_password(APP_ID, self._keyring_account())
             except Exception as exc:
                 raise SecretStorageError("Could not store passphrase in the OS keychain") from exc
+            from .secure_settings import set_passphrase
+
+            # Clear the older account/fallback too so clearing the new account
+            # cannot cause a previously saved secret to reappear on next read.
+            set_passphrase(None, self._secure_namespace())
             self._legacy_passphrase = None
             self._persist_locked()
 

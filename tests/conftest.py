@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import pytest
 
-from clipsync import config
+from clipsync import config, secure_settings
 
 
 class _MemoryKeyring:
@@ -65,4 +65,11 @@ def _isolate_user_data(tmp_path, monkeypatch):
             monkeypatch.setattr(config, name, data_dir / name.lower(), raising=False)
     keyring = _MemoryKeyring()
     monkeypatch.setattr(config, "_keyring_backend", lambda: keyring)
+    import keyring as keyring_module
+
+    monkeypatch.setattr(keyring_module, "get_password", keyring.get_password)
+    monkeypatch.setattr(keyring_module, "set_password", keyring.set_password)
+    monkeypatch.setattr(keyring_module, "delete_password", keyring.delete_password)
+    monkeypatch.setattr(secure_settings, "_FALLBACK_FILE", data_dir / "passphrase.enc")
+    monkeypatch.setattr(secure_settings, "_FALLBACK_SALT_FILE", data_dir / ".salt")
     return data_dir

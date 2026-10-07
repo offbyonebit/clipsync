@@ -20,7 +20,7 @@ import shutil
 import threading
 import time
 import uuid
-from collections import deque
+from collections import OrderedDict, deque
 from collections.abc import Callable
 from pathlib import Path
 
@@ -373,8 +373,12 @@ class _FileReceiveHandler(FileSystemEventHandler):
         # watchdog dispatches from a thread pool on Windows, so the
         # check-then-add below has to be atomic or two events for the same
         # file can both pass it and deliver the file twice.
-        self._seen: set[str] = set()
+        # An OrderedDict used as an LRU cache keeps the set bounded: filenames
+        # are timestamped, so without eviction the set would grow forever.
+        self._seen: OrderedDict[str, bool] = OrderedDict()
         self._seen_lock = threading.Lock()
+        self._seen_max = 1000
+        self._deferred_keys: set[str] = set()
         self._files_dir = files_dir.resolve() if files_dir is not None else None
         self._received_at: deque[float] = deque()
         self._deferred: deque[tuple[Path, str]] = deque()
@@ -425,10 +429,14 @@ class _FileReceiveHandler(FileSystemEventHandler):
             return
         key = str(path)
         with self._seen_lock:
+            if key in self._deferred_keys:
+                return
             if key in self._seen:
+                # Mark as recently used.
+                self._seen.move_to_end(key)
                 return
             if not self._within_rate_limit():
-                self._seen.add(key)
+                self._deferred_keys.add(key)
                 self._deferred.append((path, sender))
                 if self._defer_timer is None:
                     delay = max(0.1, 60 - (time.monotonic() - self._received_at[0]))
@@ -437,7 +445,9 @@ class _FileReceiveHandler(FileSystemEventHandler):
                     self._defer_timer.start()
                 log.warning("Incoming file queued until the receive rate limit resets: %s", path.name)
                 return
-            self._seen.add(key)
+            self._seen[key] = True
+            while len(self._seen) > self._seen_max:
+                self._seen.popitem(last=False)
         log.info("FILE IN [%s]: %s from %s", _HOSTNAME, path.name, sender)
         try:
             self._on_received(path, sender)
@@ -450,7 +460,7 @@ class _FileReceiveHandler(FileSystemEventHandler):
             if not self._deferred:
                 return
             path, _sender = self._deferred.popleft()
-            self._seen.discard(str(path))
+            self._deferred_keys.discard(str(path))
         self._handle(path)
         with self._seen_lock:
             if self._deferred and self._defer_timer is None:
@@ -458,12 +468,18 @@ class _FileReceiveHandler(FileSystemEventHandler):
                 self._defer_timer.daemon = True
                 self._defer_timer.start()
 
+    def _path_str(self, path: str | bytes) -> str:
+        """Decode watchdog paths safely; surrogateescape preserves non-UTF-8 bytes."""
+        if isinstance(path, str):
+            return path
+        return path.decode("utf-8", errors="surrogateescape")
+
     def on_created(self, event: FileSystemEvent) -> None:
         if not event.is_directory:
-            self._handle(Path(os.fsdecode(event.src_path)))
+            self._handle(Path(self._path_str(event.src_path)))
 
     def on_moved(self, event: FileSystemEvent) -> None:
         # Syncthing uses atomic rename: .syncthing.*.tmp → final name.
         dest = getattr(event, "dest_path", "")
         if dest and not event.is_directory:
-            self._handle(Path(dest))
+            self._handle(Path(self._path_str(dest)))
