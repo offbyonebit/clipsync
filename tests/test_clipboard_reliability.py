@@ -38,6 +38,42 @@ def test_failed_incoming_write_retries_and_commits_only_on_success(tmp_path, mon
     assert sync._pending_incoming is None
 
 
+def test_incoming_survives_prolonged_failure_and_eventually_applies(tmp_path, monkeypatch):
+    sync = _sync(tmp_path)
+    monkeypatch.setattr(sync, "_write_clipboard", lambda _value: False)
+    monkeypatch.setattr("clipsync.clipboard.time.monotonic", lambda: 100.0)
+    sync._stage_incoming("remote", "text")
+
+    for _ in range(20):
+        assert sync._pending_incoming is not None
+        sync._pending_incoming.next_attempt = 0
+        sync._attempt_pending_incoming()
+        assert sync._pending_incoming is not None
+        assert 100.0 < sync._pending_incoming.next_attempt <= 130.0
+    assert sync._last_synced is None
+    assert sync._history.get_entries() == []
+
+    monkeypatch.setattr(sync, "_write_clipboard", lambda _value: True)
+    assert sync.retry_incoming_now()
+    assert sync._pending_incoming is None
+    assert sync._last_synced == "remote"
+    assert sync._history.get_entries()[0].text == "remote"
+    assert sync.status_snapshot()["error"] is None
+
+
+def test_manual_incoming_retry_obeys_pause(tmp_path, monkeypatch):
+    sync = _sync(tmp_path)
+    monkeypatch.setattr(sync, "_write_clipboard", lambda _value: False)
+    sync._stage_incoming("remote", "text")
+    sync._settings.set("sync_paused", True)
+    written = []
+    monkeypatch.setattr(sync, "_write_clipboard", lambda value: written.append(value) or True)
+
+    assert not sync.retry_incoming_now()
+    assert written == []
+    assert sync._pending_incoming is not None
+
+
 def test_new_local_copy_invalidates_old_remote_retry(tmp_path, monkeypatch):
     sync = _sync(tmp_path)
     sync._last_observed_clipboard = "local-old"

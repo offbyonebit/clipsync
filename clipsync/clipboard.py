@@ -28,6 +28,7 @@ import io
 import logging
 import os
 import queue
+import re
 import subprocess
 import sys
 import threading
@@ -75,6 +76,26 @@ class EncryptedPayloadError(RuntimeError):
 _STOP_SENTINEL = object()
 
 _INCOMING_RETRY_DELAYS = (0.25, 0.5, 1.0, 2.0, 4.0)
+_INCOMING_RETRY_MAX_DELAY = 30.0
+_LIKELY_SECRET_PATTERNS = (
+    re.compile(r"-----BEGIN (?:[A-Z0-9 ]+ )?PRIVATE KEY-----", re.IGNORECASE),
+    re.compile(
+        r"(?im)^\s*(?:password|passwd|pwd|secret|api[_-]?key|access[_-]?token|refresh[_-]?token)\s*[:=]\s*\S{6,}"
+    ),
+    re.compile(r"\bBearer\s+[A-Za-z0-9._~+/=-]{16,}", re.IGNORECASE),
+    re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})\b"),
+    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
+)
+
+
+def _incoming_retry_delay(attempts: int) -> float:
+    """Back off clipboard writes without abandoning the newest remote value."""
+    exponent = min(max(attempts - 1, 0), 10)
+    return min(_INCOMING_RETRY_MAX_DELAY, 0.25 * (2**exponent))
+
+
+def _looks_like_secret(text: str) -> bool:
+    return any(pattern.search(text) for pattern in _LIKELY_SECRET_PATTERNS)
 
 
 @dataclass
@@ -611,6 +632,7 @@ class ClipboardSync:
             error = (
                 self._last_decrypt_error or self._last_write_error or self._last_payload_error or self._last_read_error
             )
+            pending = self._pending_incoming
             return {
                 "paused": self._is_paused(),
                 "paused_until": self._settings.get("paused_until", 0.0),
@@ -618,6 +640,14 @@ class ClipboardSync:
                 "outbound_pending": self._outbound_pending,
                 "last_outbound_at": self._last_outbound_at,
                 "last_inbound_at": self._last_inbound_at,
+                "incoming_pending": pending is not None,
+                "incoming_kind": None if pending is None else pending.kind,
+                "incoming_attempts": 0 if pending is None else pending.attempts,
+                "workers": {
+                    "outbound": self._poll_thread is not None and self._poll_thread.is_alive(),
+                    "inbound": self._in_thread is not None and self._in_thread.is_alive(),
+                    "file_watcher": self._observer is not None and self._observer.is_alive(),
+                },
                 "replication": self._replication_status,
                 "error": error,
             }
@@ -635,6 +665,18 @@ class ClipboardSync:
             if remaining:
                 return f"Status: paused for {max(1, (remaining + 59) // 60)}m"
             return "Status: paused"
+        workers = status["workers"]
+        worker_names = {"outbound": "sender", "inbound": "receiver", "file_watcher": "file watcher"}
+        stopped = (
+            [worker_names.get(str(name), str(name)) for name, running in workers.items() if not running]
+            if isinstance(workers, dict)
+            else []
+        )
+        if stopped:
+            return f"Status: clipboard {' and '.join(stopped)} stopped"
+        if status["incoming_pending"]:
+            action = "retrying" if status["incoming_attempts"] else "applying"
+            return f"Status: {action} incoming {status['incoming_kind']} clipboard"
         if status["error"]:
             return f"Status: {status['error']}"
         if status["outbound_pending"]:
@@ -642,12 +684,25 @@ class ClipboardSync:
         suffix = " · manual send" if status["manual_send"] else ""
         outbound = status["last_outbound_at"]
         inbound = status["last_inbound_at"]
-        activity = ""
-        if isinstance(outbound, (int, float)) and (not isinstance(inbound, (int, float)) or outbound >= inbound):
-            activity = f" · published {_relative_age(outbound)}"
-        elif isinstance(inbound, (int, float)):
-            activity = f" · applied {_relative_age(inbound)}"
+        activity_parts = []
+        if isinstance(outbound, (int, float)):
+            activity_parts.append(f"sent {_relative_age(outbound)}")
+        if isinstance(inbound, (int, float)):
+            activity_parts.append(f"received {_relative_age(inbound)}")
+        activity = " · " + " · ".join(activity_parts) if activity_parts else ""
         return f"Status: {status['replication']}{activity}{suffix}"
+
+    def retry_incoming_now(self) -> bool:
+        """Retry a staged incoming clipboard value immediately from the tray."""
+        with self._lock:
+            if self._is_paused():
+                return False
+            pending = self._pending_incoming
+            if pending is None:
+                return False
+            pending.next_attempt = time.monotonic()
+        self._attempt_pending_incoming()
+        return True
 
     def _passphrase(self) -> str:
         val = self._settings.get("encryption_passphrase") or ""
@@ -1064,6 +1119,9 @@ class ClipboardSync:
         current = self._read_clipboard()
         if current is None or current == "":
             return
+        if self._settings.get("filter_likely_secrets", False) and _looks_like_secret(current):
+            self._last_write_error = "Text that looks like a secret was blocked by the privacy filter"
+            return
         if len(current.encode("utf-8")) > self._max_text_bytes():
             self._last_write_error = f"Text exceeds the {self._max_text_bytes()} byte limit"
             return
@@ -1165,6 +1223,12 @@ class ClipboardSync:
         content = self._read_file()
         if content is None:
             return
+        if self._settings.get("filter_likely_secrets", False) and _looks_like_secret(content):
+            message = "Incoming text was blocked by the likely-secret filter"
+            if self._last_payload_error != message:
+                log.warning("IN [%s]: incoming text blocked by privacy filter", _HOSTNAME)
+            self._last_payload_error = message
+            return
         self._stage_incoming(content, "text")
 
     def _on_image_file_changed(self) -> None:
@@ -1214,15 +1278,18 @@ class ClipboardSync:
                 self._last_write_error = None
                 self._pending_incoming = None
                 committed = pending
-            elif pending.attempts <= len(_INCOMING_RETRY_DELAYS):
-                pending.next_attempt = now + _INCOMING_RETRY_DELAYS[pending.attempts - 1]
-                return
             else:
-                self._pending_incoming = None
-                self._last_write_error = f"Could not apply incoming {pending.kind} to the system clipboard"
-                log.warning(
-                    "IN [%s]: %s clipboard write failed after %d attempts", _HOSTNAME, pending.kind, pending.attempts
-                )
+                pending.next_attempt = now + _incoming_retry_delay(pending.attempts)
+                if pending.attempts == len(_INCOMING_RETRY_DELAYS) + 1:
+                    self._last_write_error = (
+                        f"Could not apply incoming {pending.kind} to the system clipboard; retrying"
+                    )
+                    log.warning(
+                        "IN [%s]: %s clipboard write still failing after %d attempts; retrying with bounded backoff",
+                        _HOSTNAME,
+                        pending.kind,
+                        pending.attempts,
+                    )
                 return
         if committed.kind == "text" and isinstance(committed.value, str):
             self._history.add_entry(committed.value, "remote")

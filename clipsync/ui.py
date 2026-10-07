@@ -1032,6 +1032,25 @@ class _SettingsContent:
             text_color=THEME.muted,
         ).pack(anchor="w", padx=(52, 16), pady=(0, 14))
 
+        self._secret_filter_var = ctk.BooleanVar(value=bool(app.settings.get("filter_likely_secrets")))
+        _switch(
+            privacy_card,
+            "Block likely secrets from text sync",
+            self._secret_filter_var,
+            self._on_secret_filter_toggle,
+        ).pack(anchor="w", padx=16, pady=(0, 2))
+        ctk.CTkLabel(
+            privacy_card,
+            text=(
+                "Checks incoming and outgoing text for common private-key, API-token, and password patterns. "
+                "This heuristic can miss secrets or flag examples; images are not checked."
+            ),
+            font=_fonts()["tiny"],
+            justify="left",
+            wraplength=340,
+            text_color=THEME.muted,
+        ).pack(anchor="w", padx=(52, 16), pady=(0, 14))
+
         _section_header(privacy_card, "Encryption passphrase (optional)").pack(anchor="w", padx=16, pady=(4, 2))
         ctk.CTkLabel(
             privacy_card,
@@ -1072,7 +1091,23 @@ class _SettingsContent:
 
         history_card = _card_frame(container)
         history_card.pack(fill="x", pady=(0, 16))
-        _section_header(history_card, "Clipboard history auto-clear").pack(anchor="w", padx=16, pady=(14, 8))
+        _section_header(history_card, "Clipboard history").pack(anchor="w", padx=16, pady=(14, 8))
+        self._history_enabled_var = ctk.BooleanVar(value=bool(app.settings.get("history_enabled", True)))
+        _switch(
+            history_card,
+            "Save clipboard history on this device",
+            self._history_enabled_var,
+            self._on_history_enabled_toggle,
+        ).pack(anchor="w", padx=16, pady=(0, 2))
+        ctk.CTkLabel(
+            history_card,
+            text="Turn off to stop saving new clips. Existing entries remain until cleared or expired below.",
+            font=_fonts()["tiny"],
+            justify="left",
+            wraplength=340,
+            text_color=THEME.muted,
+        ).pack(anchor="w", padx=(52, 16), pady=(0, 10))
+        _section_header(history_card, "Auto-clear saved history").pack(anchor="w", padx=16, pady=(4, 8))
         self._auto_clear_options: dict[str, int] = {
             "Never": 0,
             "5 minutes": 5,
@@ -1238,6 +1273,22 @@ class _SettingsContent:
                 if enabled
                 else "Log sharing off. Your published log will be removed shortly."
             )
+        )
+
+    def _on_secret_filter_toggle(self) -> None:
+        enabled = bool(self._secret_filter_var.get())
+        self._app.settings.set("filter_likely_secrets", enabled)
+        self._app.on_settings_changed()
+        self._status.configure(
+            text=("Likely-secret text filter enabled." if enabled else "Likely-secret text filter disabled.")
+        )
+
+    def _on_history_enabled_toggle(self) -> None:
+        enabled = bool(self._history_enabled_var.get())
+        self._app.settings.set("history_enabled", enabled)
+        self._app.on_settings_changed()
+        self._status.configure(
+            text=("Clipboard history enabled." if enabled else "Clipboard history disabled; saved entries remain.")
         )
 
     def _on_auto_accept_toggle(self) -> None:

@@ -233,6 +233,13 @@ class ClipSyncApp:
                 visible=lambda _item: self._pending_count() > 0,
             ),
             pystray.MenuItem("Clipboard History", lambda _i, _it: self.ui.open("history")),
+            pystray.MenuItem(
+                "Retry Incoming Clipboard Now",
+                self._menu_retry_incoming,
+                visible=lambda _item: (
+                    self.clipboard is not None and bool(self.clipboard.status_snapshot()["incoming_pending"])
+                ),
+            ),
             pystray.MenuItem("Send Clipboard Now", self._menu_send_clipboard),
             pystray.MenuItem("Send File…", lambda _i, _it: self.ui.open("file_picker")),
             pystray.MenuItem(self._transfer_status_title, None, enabled=False),
@@ -347,6 +354,10 @@ class ClipSyncApp:
     def _menu_send_clipboard(self, _icon: pystray.Icon, _item: pystray.MenuItem) -> None:
         if self.clipboard is not None:
             threading.Thread(target=self.clipboard.send_current, daemon=True).start()
+
+    def _menu_retry_incoming(self, _icon: pystray.Icon, _item: pystray.MenuItem) -> None:
+        if self.clipboard is not None:
+            threading.Thread(target=self.clipboard.retry_incoming_now, daemon=True).start()
 
     def _start_history_hotkey(self) -> None:
         shortcut = str(self.settings.get("history_shortcut") or "").strip()

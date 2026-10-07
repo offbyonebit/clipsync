@@ -116,6 +116,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "history_enabled": True,
     "history_max_items": 50,
     "history_auto_clear_minutes": 0,
+    "filter_likely_secrets": False,
     "manual_send": False,
     "paused_until": 0.0,
     "max_text_bytes": 1 * 1024 * 1024,

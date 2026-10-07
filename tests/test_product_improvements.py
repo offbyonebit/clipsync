@@ -6,6 +6,7 @@ import io
 import time
 from pathlib import Path
 
+import pytest
 from PIL import Image
 
 from clipsync import config
@@ -76,6 +77,55 @@ def test_manual_send_requires_explicit_send(tmp_path, monkeypatch):
     sync.send_current()
     assert published == ["manual"]
     assert sync.status_snapshot()["replication"] == "Waiting for Syncthing"
+
+
+@pytest.mark.parametrize("secret", ["password = example-secret", "-----BEGIN OPENSSH PRIVATE KEY-----"])
+def test_secret_filter_blocks_outgoing_text_and_history(tmp_path, monkeypatch, secret):
+    settings = _settings(tmp_path)
+    settings.set("filter_likely_secrets", True)
+    sync = ClipboardSync(settings)
+    monkeypatch.setattr(sync, "_read_clipboard_image", lambda: None)
+    monkeypatch.setattr(sync, "_read_clipboard", lambda: secret)
+    sync.send_current()
+
+    assert not sync.clipboard_file.exists()
+    assert sync._history.get_entries() == []
+    assert "privacy filter" in str(sync.status_snapshot()["error"])
+
+
+def test_secret_filter_blocks_incoming_and_allows_it_when_disabled(tmp_path, monkeypatch):
+    settings = _settings(tmp_path)
+    settings.set("filter_likely_secrets", True)
+    sync = ClipboardSync(settings)
+    sync.clipboard_file.parent.mkdir(parents=True, exist_ok=True)
+    sync.clipboard_file.write_text("api_key = example-secret", encoding="utf-8")
+    written = []
+    monkeypatch.setattr(sync, "_write_clipboard", lambda value: written.append(value) or True)
+
+    sync._on_text_file_changed()
+    assert written == []
+    assert sync._history.get_entries() == []
+    assert "filter" in str(sync.status_snapshot()["error"])
+
+    settings.set("filter_likely_secrets", False)
+    sync._on_text_file_changed()
+    assert written == ["api_key = example-secret"]
+    assert sync.status_snapshot()["error"] is None
+
+
+def test_disabling_history_still_publishes_but_does_not_save_new_clips(tmp_path, monkeypatch):
+    settings = _settings(tmp_path)
+    sync = ClipboardSync(settings)
+    sync._history.add_entry("existing")
+    settings.set("history_enabled", False)
+    sync.refresh_settings()
+    monkeypatch.setattr(sync, "_read_clipboard_image", lambda: None)
+    monkeypatch.setattr(sync, "_read_clipboard", lambda: "new")
+
+    sync.send_current()
+
+    assert sync.clipboard_file.read_text(encoding="utf-8") == "new"
+    assert [entry.text for entry in sync._history.get_entries()] == ["existing"]
 
 
 def test_timed_pause_reconciles_changes_when_it_expires(tmp_path, monkeypatch):

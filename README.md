@@ -133,6 +133,18 @@ snippets, and bounded image thumbnails. Pinned items still follow the selected
 auto-clear window. File transfers use unique IDs, retry failed receives after a
 restart, and show "delivered" only after a receiver writes an acknowledgement.
 
+The tray status shows the latest local send and incoming paste separately. If
+an incoming paste is waiting on the desktop clipboard, use **Retry Incoming
+Clipboard Now** from the tray; ClipSync also retries automatically with a
+capped backoff. The Connected Devices view shows each peer's connection and
+folder replication status. **Settings → View Syncthing logs** opens transport
+diagnostics.
+
+Settings can block text that matches common private-key, API-token, or
+password-assignment patterns. This heuristic is off by default, can miss
+secrets or flag examples, and does not inspect images. Clipboard history can
+be disabled locally or set to auto-clear after a short interval.
+
 Settings changes from the UI take effect immediately; hand-editing
 `settings.json` is also picked up, the file is watched for changes.
 
