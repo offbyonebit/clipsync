@@ -30,7 +30,7 @@ from clipsync.crypto import (
     encrypt_file,
     is_encrypted_file,
 )
-from clipsync.file_transfer import ENCRYPTED_SUFFIX, FileTransfer
+from clipsync.file_transfer import ENCRYPTED_SUFFIX, FileTransfer, _FileReceiveHandler
 
 
 class _Settings:
@@ -221,3 +221,46 @@ def test_encrypted_send_roundtrips_a_large_file_in_bounded_memory(tmp_path):
 def test_set_file_permissions_is_available_to_file_transfer():
     """send() relies on it for both paths."""
     assert callable(config.set_file_permissions)
+
+
+def test_send_rejects_symlinks_and_oversized_files(tmp_path, monkeypatch):
+    transfer = _transfer(tmp_path, "")
+    target = tmp_path / "target.txt"
+    target.write_text("data")
+    if os.name == "nt":
+        pytest.skip("creating symlinks requires Windows developer mode or elevated privileges")
+    link = tmp_path / "link.txt"
+    link.symlink_to(target)
+    with pytest.raises(ValueError, match="regular files"):
+        transfer.send(link)
+
+    monkeypatch.setattr("clipsync.file_transfer.MAX_FILE_TRANSFER_BYTES", 3)
+    with pytest.raises(ValueError, match="transfer limit"):
+        transfer.send(target)
+
+
+def test_receive_rejects_unexpected_paths_oversized_files_and_bursts(tmp_path, monkeypatch):
+    root = tmp_path / "files"
+    delivered = []
+    handler = _FileReceiveHandler(on_received=lambda path, _sender: delivered.append(path), files_dir=root)
+
+    nested = root / "peer" / "nested" / "bad.txt"
+    nested.parent.mkdir(parents=True)
+    nested.write_text("bad")
+    handler._handle(nested)
+    assert delivered == []
+
+    oversized = root / "peer" / "large.txt"
+    oversized.parent.mkdir(exist_ok=True)
+    oversized.write_text("long")
+    monkeypatch.setattr("clipsync.file_transfer.MAX_FILE_TRANSFER_BYTES", 3)
+    handler._handle(oversized)
+    assert delivered == []
+
+    monkeypatch.setattr("clipsync.file_transfer.MAX_FILE_TRANSFER_BYTES", 100)
+    monkeypatch.setattr("clipsync.file_transfer.MAX_INCOMING_FILES_PER_MINUTE", 2)
+    for name in ("one.txt", "two.txt", "three.txt"):
+        incoming = root / "peer" / name
+        incoming.write_text(name)
+        handler._handle(incoming)
+    assert [path.name for path in delivered] == ["one.txt", "two.txt"]

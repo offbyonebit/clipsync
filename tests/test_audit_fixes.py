@@ -379,7 +379,7 @@ def test_folder_change_restarts_syncthing_and_file_transfer(tmp_path, monkeypatc
     app._on_file_received = lambda *_a: None
 
     monkeypatch.setattr(main_mod, "ClipboardSync", lambda _s: _Stub("clipboard"))
-    monkeypatch.setattr(main_mod, "FileTransfer", lambda _s, on_received=None: _Stub("file_transfer"))
+    monkeypatch.setattr(main_mod, "FileTransfer", lambda _s, **_kwargs: _Stub("file_transfer"))
 
     new_folder = tmp_path / "new_sync"
     app._on_folder_changed(str(new_folder))
@@ -471,6 +471,7 @@ def test_file_receive_seen_set_is_bounded(tmp_path, monkeypatch) -> None:
     handler = ft_mod._FileReceiveHandler(on_received=lambda p, _s: received.append(p))
     # Match everything; sender extraction still runs.
     handler._seen_max = 50
+    monkeypatch.setattr(handler, "_within_rate_limit", lambda: True)
 
     for i in range(200):
         incoming = tmp_path / "files" / "peer" / f"file_{i}.txt"

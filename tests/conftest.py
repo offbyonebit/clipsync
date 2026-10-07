@@ -23,7 +23,23 @@ from __future__ import annotations
 
 import pytest
 
-from clipsync import config
+from clipsync import config, secure_settings
+
+
+class _MemoryKeyring:
+    """In-memory keychain so tests never read or alter user credentials."""
+
+    def __init__(self) -> None:
+        self.values: dict[tuple[str, str], str] = {}
+
+    def get_password(self, service: str, account: str) -> str | None:
+        return self.values.get((service, account))
+
+    def set_password(self, service: str, account: str, value: str) -> None:
+        self.values[(service, account)] = value
+
+    def delete_password(self, service: str, account: str) -> None:
+        self.values.pop((service, account), None)
 
 
 @pytest.fixture(autouse=True)
@@ -40,10 +56,20 @@ def _isolate_user_data(tmp_path, monkeypatch):
     for name, filename in (
         ("SETTINGS_FILE", "settings.json"),
         ("LOG_FILE", "clipsync.log"),
+        ("TRANSFER_STATE_FILE", "transfers.json"),
     ):
         if hasattr(config, name):
             monkeypatch.setattr(config, name, data_dir / filename, raising=False)
     for name in ("APP_DATA_DIR", "SYNC_FOLDER"):
         if hasattr(config, name):
             monkeypatch.setattr(config, name, data_dir / name.lower(), raising=False)
+    keyring = _MemoryKeyring()
+    monkeypatch.setattr(config, "_keyring_backend", lambda: keyring)
+    import keyring as keyring_module
+
+    monkeypatch.setattr(keyring_module, "get_password", keyring.get_password)
+    monkeypatch.setattr(keyring_module, "set_password", keyring.set_password)
+    monkeypatch.setattr(keyring_module, "delete_password", keyring.delete_password)
+    monkeypatch.setattr(secure_settings, "_FALLBACK_FILE", data_dir / "passphrase.enc")
+    monkeypatch.setattr(secure_settings, "_FALLBACK_SALT_FILE", data_dir / ".salt")
     return data_dir

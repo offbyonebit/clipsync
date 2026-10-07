@@ -8,6 +8,7 @@ depend on it without cycles.
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import logging
 import os
@@ -110,12 +111,19 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "start_on_login": False,
     "sync_folder": str(SYNC_FOLDER),
     "first_run_completed": False,
-    "encryption_passphrase": "",
     "auto_accept_incoming": False,
     "rejected_device_ids": [],
     "history_enabled": True,
     "history_max_items": 50,
     "history_auto_clear_minutes": 0,
+    "filter_likely_secrets": False,
+    "manual_send": False,
+    "paused_until": 0.0,
+    "max_text_bytes": 1 * 1024 * 1024,
+    "max_image_bytes": 5 * 1024 * 1024,
+    "history_shortcut": "<ctrl>+<alt>+v",
+    "transfer_retention_days": 7,
+    "cleanup_delivered_transfers": True,
     "theme": "System",
     # Mirror this device's log into the shared folder so peers can see it.
     # Off by default: it is a debugging aid, and the sync folder is replicated
@@ -127,6 +135,21 @@ DEFAULT_SETTINGS: dict[str, Any] = {
 }
 
 HISTORY_FILE = APP_DATA_DIR / "clipsync_history.json"
+TRANSFER_STATE_FILE = APP_DATA_DIR / "transfers.json"
+_PASSPHRASE_KEYRING_ACCOUNT = "encryption-passphrase"
+
+
+class SecretStorageError(RuntimeError):
+    """Raised when the operating-system credential store is unavailable."""
+
+
+def _keyring_backend() -> Any:
+    """Return the optional keyring module without importing it at startup."""
+    try:
+        import keyring
+    except ImportError as exc:
+        raise SecretStorageError("OS keychain support is not installed") from exc
+    return keyring
 
 
 class Settings:
@@ -141,6 +164,7 @@ class Settings:
         self._path = path
         self._lock = threading.RLock()
         self._data: dict[str, Any] = dict(DEFAULT_SETTINGS)
+        self._legacy_passphrase: str | None = None
         self._mtime_ns: int = 0
         self._load()
 
@@ -164,13 +188,14 @@ class Settings:
         if not isinstance(loaded, dict):
             logging.warning("Settings file did not contain a JSON object; using defaults")
             return
+        legacy = loaded.get("encryption_passphrase")
+        self._legacy_passphrase = legacy if isinstance(legacy, str) and legacy else None
         merged = dict(DEFAULT_SETTINGS)
         merged.update({k: v for k, v in loaded.items() if k in DEFAULT_SETTINGS})
         if not merged.get("api_key"):
             merged["api_key"] = uuid.uuid4().hex
         self._data = merged
-        # Migrate any plaintext passphrase into secure storage.
-        self._maybe_migrate_passphrase()
+        self._migrate_legacy_passphrase_locked()
         # Only persist if the on-disk file is incomplete (missing a default
         # key), has an empty api_key that we just generated, or still holds a
         # plaintext passphrase that was just migrated. Otherwise leave the file
@@ -191,18 +216,6 @@ class Settings:
             except OSError:
                 pass
 
-    def _maybe_migrate_passphrase(self) -> None:
-        """Move plaintext passphrases from settings.json into secure storage."""
-        plaintext = self._data.get("encryption_passphrase", "")
-        if not plaintext or not isinstance(plaintext, str):
-            return
-        try:
-            from .secure_settings import migrate_plaintext_passphrase
-
-            migrate_plaintext_passphrase(self, self._secure_namespace())
-        except Exception:
-            logging.warning("Could not migrate plaintext passphrase", exc_info=True)
-
     def _secure_namespace(self) -> str:
         """Stable namespace isolating secure storage per settings file."""
         try:
@@ -214,8 +227,15 @@ class Settings:
         self._path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self._path.with_name(f"{self._path.name}.{os.getpid()}.tmp")
         try:
+            persisted = dict(self._data)
+            if self._legacy_passphrase:
+                # Retain this only when the OS keychain is unavailable. This
+                # avoids turning an upgrade into unrecoverable encrypted data.
+                persisted["encryption_passphrase"] = self._legacy_passphrase
+            else:
+                persisted.pop("encryption_passphrase", None)
             with tmp.open("w", encoding="utf-8") as fh:
-                json.dump(self._data, fh, indent=2)
+                json.dump(persisted, fh, indent=2)
             set_file_permissions(tmp)
             os.replace(tmp, self._path)
         finally:
@@ -243,32 +263,91 @@ class Settings:
         with self._lock:
             self._refresh_if_changed()
             if key == "encryption_passphrase":
-                in_memory = self._data.get(key, default)
-                if in_memory:
-                    return in_memory
-                try:
-                    from .secure_settings import get_passphrase
-
-                    stored = get_passphrase(self._secure_namespace())
-                    if stored is not None:
-                        return stored
-                except Exception:
-                    logging.warning("Could not read passphrase from secure storage", exc_info=True)
+                return self._get_passphrase_locked()
             return self._data.get(key, default)
 
     def set(self, key: str, value: Any) -> None:
         with self._lock:
             if key == "encryption_passphrase":
-                try:
-                    from .secure_settings import set_passphrase
-
-                    set_passphrase(value if value else None, self._secure_namespace())
-                except Exception:
-                    logging.warning("Could not write passphrase to secure storage", exc_info=True)
-                # Keep the plaintext field empty; the passphrase lives in the
-                # OS keychain or the encrypted fallback file.
-                value = ""
+                self.set_passphrase(value)
+                return
             self._data[key] = value
+            self._persist_locked()
+
+    def _get_passphrase_locked(self) -> str:
+        value = None
+        try:
+            value = _keyring_backend().get_password(APP_ID, self._keyring_account())
+        except Exception as exc:
+            if self._legacy_passphrase:
+                logging.warning("OS keychain unavailable; retaining legacy encrypted-data access: %s", exc)
+                return self._legacy_passphrase
+            logging.warning("OS keychain unavailable: %s", exc)
+        if isinstance(value, str):
+            return value
+        if self._legacy_passphrase:
+            return self._migrate_legacy_passphrase_locked()
+        # Older releases used a different keychain account and an encrypted
+        # fallback file. Preserve access when upgrading an existing install.
+        from .secure_settings import get_passphrase
+
+        previous = get_passphrase(self._secure_namespace())
+        if not previous:
+            return ""
+        try:
+            _keyring_backend().set_password(APP_ID, self._keyring_account(), previous)
+        except Exception:
+            logging.warning("Could not migrate older secure storage; retaining access to its passphrase")
+        return previous
+
+    def _migrate_legacy_passphrase_locked(self) -> str:
+        if not self._legacy_passphrase:
+            return ""
+        legacy = self._legacy_passphrase
+        try:
+            _keyring_backend().set_password(APP_ID, self._keyring_account(), legacy)
+        except Exception as exc:
+            logging.warning("Could not migrate passphrase into OS keychain: %s", exc)
+            return legacy
+        self._legacy_passphrase = None
+        self._persist_locked()
+        logging.info("Moved encryption passphrase from settings.json into the OS keychain")
+        return legacy
+
+    def _keyring_account(self) -> str:
+        """Keep separate portable/test profiles from sharing a local secret."""
+        profile = hashlib.sha256(str(self._path.resolve()).encode("utf-8")).hexdigest()[:16]
+        return f"{_PASSPHRASE_KEYRING_ACCOUNT}-{profile}"
+
+    def get_passphrase(self) -> str:
+        """Return the encryption passphrase from the OS keychain."""
+        with self._lock:
+            self._refresh_if_changed()
+            return self._get_passphrase_locked()
+
+    def set_passphrase(self, value: Any) -> None:
+        """Store an encryption passphrase outside settings.json.
+
+        New values are never written to the JSON settings file. Existing
+        plaintext values are migrated automatically on their first read.
+        """
+        if not isinstance(value, str):
+            raise ValueError("Encryption passphrase must be text")
+        with self._lock:
+            try:
+                backend = _keyring_backend()
+                if value:
+                    backend.set_password(APP_ID, self._keyring_account(), value)
+                elif backend.get_password(APP_ID, self._keyring_account()) is not None:
+                    backend.delete_password(APP_ID, self._keyring_account())
+            except Exception as exc:
+                raise SecretStorageError("Could not store passphrase in the OS keychain") from exc
+            from .secure_settings import set_passphrase
+
+            # Clear the older account/fallback too so clearing the new account
+            # cannot cause a previously saved secret to reappear on next read.
+            set_passphrase(None, self._secure_namespace())
+            self._legacy_passphrase = None
             self._persist_locked()
 
     def update(self, **kwargs: Any) -> None:
@@ -296,9 +375,12 @@ class Settings:
             if not isinstance(loaded, dict):
                 logging.warning("Settings file did not contain a JSON object; keeping in-memory state")
                 return
+            legacy = loaded.get("encryption_passphrase")
+            self._legacy_passphrase = legacy if isinstance(legacy, str) and legacy else None
             merged = dict(DEFAULT_SETTINGS)
             merged.update({k: v for k, v in loaded.items() if k in DEFAULT_SETTINGS})
             self._data = merged
+            self._migrate_legacy_passphrase_locked()
 
 
 def ensure_directories() -> None:

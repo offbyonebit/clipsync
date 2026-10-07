@@ -10,7 +10,9 @@ using the same Fernet-based scheme as the clipboard sync file.
 
 from __future__ import annotations
 
+import base64
 import contextlib
+import io
 import json
 import logging
 import os
@@ -18,6 +20,8 @@ import threading
 import time
 from dataclasses import dataclass
 from typing import Any
+
+from PIL import Image
 
 from . import config
 from .crypto import decrypt, encrypt, is_encrypted
@@ -30,9 +34,19 @@ class HistoryEntry:
     text: str
     timestamp: float
     source: str = "local"  # 'local' or 'remote'
+    pinned: bool = False
+    kind: str = "text"
+    image_b64: str = ""
 
     def to_dict(self) -> dict[str, Any]:
-        return {"text": self.text, "timestamp": self.timestamp, "source": self.source}
+        return {
+            "text": self.text,
+            "timestamp": self.timestamp,
+            "source": self.source,
+            "pinned": self.pinned,
+            "kind": self.kind,
+            "image_b64": self.image_b64,
+        }
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> HistoryEntry:
@@ -40,6 +54,9 @@ class HistoryEntry:
             text=data["text"],
             timestamp=float(data["timestamp"]),
             source=str(data.get("source", "local")),
+            pinned=bool(data.get("pinned", False)),
+            kind=str(data.get("kind", "text")),
+            image_b64=str(data.get("image_b64", "")),
         )
 
 
@@ -65,6 +82,8 @@ class ClipboardHistory:
         # Set when the on-disk file holds data we could not read and could not
         # move aside. Persisting would destroy it, so we stay in memory only.
         self._readonly: bool = False
+        self._stop = threading.Event()
+        self._cleanup_thread: threading.Thread | None = None
         self._load()
 
     def _passphrase(self) -> str:
@@ -81,12 +100,16 @@ class ClipboardHistory:
         # user's belief that they expire. A stringified "30" is accepted.
         return _coerce_int(self._settings.get("history_auto_clear_minutes"), 0)
 
-    def _prune_old(self) -> None:
+    def _prune_old(self) -> bool:
         minutes = self._auto_clear_minutes()
         if minutes <= 0:
-            return
+            return False
         cutoff = time.time() - (minutes * 60)
+        previous = len(self._entries)
+        # Pins improve retrieval, but do not override the user's privacy
+        # retention window. Pinned sensitive content expires on the same timer.
         self._entries = [e for e in self._entries if e.timestamp > cutoff]
+        return len(self._entries) != previous
 
     def _quarantine_unreadable(self, reason: str) -> None:
         """Move an undecryptable history file aside instead of overwriting it.
@@ -158,7 +181,8 @@ class ClipboardHistory:
             entries.sort(key=lambda e: e.timestamp)
             with self._lock:
                 self._entries = entries[-self._max_items :] if len(entries) > self._max_items else entries
-                self._prune_old()
+                if self._prune_old():
+                    self._persist_locked()
         except (KeyError, ValueError) as exc:
             log.warning("Failed to load clipboard history: %s", exc)
 
@@ -204,8 +228,69 @@ class ClipboardHistory:
             self._prune_old()
             self._persist_locked()
 
+    def add_image(self, png_bytes: bytes, source: str = "local") -> None:
+        """Store a bounded PNG thumbnail, encrypted with the history payload."""
+        if not self._enabled or not png_bytes:
+            return
+        try:
+            with Image.open(io.BytesIO(png_bytes)) as image:
+                image.thumbnail((320, 240))
+                output = io.BytesIO()
+                image.convert("RGBA").save(output, format="PNG", optimize=True)
+                thumbnail = output.getvalue()
+        except (OSError, ValueError):
+            log.warning("Could not create clipboard image history thumbnail")
+            return
+        if len(thumbnail) > 512 * 1024:
+            log.warning("Clipboard image history thumbnail exceeded 512 KiB; skipping")
+            return
+        entry = HistoryEntry(
+            text="",
+            timestamp=time.time(),
+            source=source,
+            kind="image",
+            image_b64=base64.b64encode(thumbnail).decode("ascii"),
+        )
+        with self._lock:
+            self._entries.append(entry)
+            # Keep at most ten thumbnails even if text history allows more.
+            images = [candidate for candidate in self._entries if candidate.kind == "image"]
+            for old in images[:-10]:
+                self._entries.remove(old)
+            while len(self._entries) > self._max_items:
+                self._entries.pop(0)
+            self._prune_old()
+            self._persist_locked()
+
+    def start(self) -> None:
+        if self._cleanup_thread is not None and self._cleanup_thread.is_alive():
+            return
+        self._stop.clear()
+        self._cleanup_thread = threading.Thread(target=self._cleanup_loop, name="clipsync-history", daemon=True)
+        self._cleanup_thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._cleanup_thread is not None and self._cleanup_thread.is_alive():
+            self._cleanup_thread.join(timeout=2)
+        self._cleanup_thread = None
+
+    def _cleanup_loop(self) -> None:
+        while not self._stop.wait(30):
+            self.expire_now()
+
+    def expire_now(self) -> bool:
+        """Remove expired entries from memory and disk immediately."""
+        with self._lock:
+            changed = self._prune_old()
+            if changed:
+                self._persist_locked()
+            return changed
+
     def get_entries(self) -> list[HistoryEntry]:
         with self._lock:
+            if self._prune_old():
+                self._persist_locked()
             return list(self._entries)
 
     def clear(self) -> None:
@@ -229,6 +314,26 @@ class ClipboardHistory:
 
     def set_enabled(self, value: bool) -> None:
         self._enabled = value
+
+    def refresh_settings(self) -> None:
+        if self._settings is None:
+            return
+        with self._lock:
+            self._enabled = _coerce_bool(self._settings.get("history_enabled", True), True)
+            self._max_items = _coerce_int(self._settings.get("history_max_items", 50), 50)
+            while len(self._entries) > self._max_items:
+                self._entries.pop(0)
+            self._prune_old()
+            self._persist_locked()
+
+    def set_pinned(self, timestamp: float, pinned: bool) -> bool:
+        with self._lock:
+            for entry in self._entries:
+                if entry.timestamp == timestamp:
+                    entry.pinned = pinned
+                    self._persist_locked()
+                    return True
+        return False
 
     def count(self) -> int:
         with self._lock:

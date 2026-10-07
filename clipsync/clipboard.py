@@ -28,10 +28,12 @@ import io
 import logging
 import os
 import queue
+import re
 import subprocess
 import sys
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 import pyperclip
@@ -72,6 +74,37 @@ class EncryptedPayloadError(RuntimeError):
 
 # Sentinel pushed onto the XFixes queue by stop() to unblock the OUT loop.
 _STOP_SENTINEL = object()
+
+_INCOMING_RETRY_DELAYS = (0.25, 0.5, 1.0, 2.0, 4.0)
+_INCOMING_RETRY_MAX_DELAY = 30.0
+_LIKELY_SECRET_PATTERNS = (
+    re.compile(r"-----BEGIN (?:[A-Z0-9 ]+ )?PRIVATE KEY-----", re.IGNORECASE),
+    re.compile(
+        r"(?im)^\s*(?:password|passwd|pwd|secret|api[_-]?key|access[_-]?token|refresh[_-]?token)\s*[:=]\s*\S{6,}"
+    ),
+    re.compile(r"\bBearer\s+[A-Za-z0-9._~+/=-]{16,}", re.IGNORECASE),
+    re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})\b"),
+    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
+)
+
+
+def _incoming_retry_delay(attempts: int) -> float:
+    """Back off clipboard writes without abandoning the newest remote value."""
+    exponent = min(max(attempts - 1, 0), 10)
+    return min(_INCOMING_RETRY_MAX_DELAY, 0.25 * (2**exponent))
+
+
+def _looks_like_secret(text: str) -> bool:
+    return any(pattern.search(text) for pattern in _LIKELY_SECRET_PATTERNS)
+
+
+@dataclass
+class _PendingIncoming:
+    value: str | bytes
+    kind: str
+    generation: int
+    attempts: int = 0
+    next_attempt: float = 0.0
 
 
 def _try_start_xfixes_watcher() -> queue.SimpleQueue[object] | None:
@@ -367,6 +400,19 @@ def _normalize_newlines(s: str) -> str:
     return s.replace("\r\n", "\n").replace("\r", "\n")
 
 
+def _relative_age(timestamp: float) -> str:
+    seconds = max(0, int(time.time() - timestamp))
+    if seconds < 60:
+        return "just now"
+    minutes = seconds // 60
+    if minutes < 60:
+        return f"{minutes}m ago"
+    hours = minutes // 60
+    if hours < 24:
+        return f"{hours}h ago"
+    return f"{hours // 24}d ago"
+
+
 def _read_image_from_system_clipboard() -> bytes | None:
     """Return PNG bytes from the system clipboard, or None if no image is present."""
     if sys.platform in ("win32", "darwin"):
@@ -481,11 +527,22 @@ class ClipboardSync:
         self._last_synced: str | bytes | None = None
         self._lock = threading.Lock()
         self._last_read_error: str | None = None
+        self._last_payload_error: str | None = None
         self._last_write_error: str | None = None
         self._last_decrypt_error: str | None = None
         self._xfixes_queue: queue.SimpleQueue[object] | None = None
         self._clipboard_owner: _XlibClipboardOwner | None = None
         self._history = ClipboardHistory(settings)
+        # Text and images share one native clipboard. A single generation and
+        # pending delivery prevent an older retry of either type from
+        # overwriting a newer local or remote value.
+        self._generation = 0
+        self._pending_incoming: _PendingIncoming | None = None
+        self._last_observed_clipboard: str | bytes | None = None
+        self._last_outbound_at: float | None = None
+        self._last_inbound_at: float | None = None
+        self._outbound_pending = False
+        self._replication_status = "Syncthing starting"
 
     @property
     def clipboard_file(self) -> Path:
@@ -499,6 +556,7 @@ class ClipboardSync:
 
     def start(self) -> None:
         self._stop.clear()
+        self._history.start()
         self._seed_from_file()
         if sys.platform not in ("win32", "darwin"):
             _no_xfixes = os.environ.get("CLIPSYNC_NO_XFIXES")
@@ -524,6 +582,7 @@ class ClipboardSync:
 
     def stop(self) -> None:
         self._stop.set()
+        self._history.stop()
         if self._observer is not None:
             try:
                 self._observer.stop()
@@ -554,6 +613,100 @@ class ClipboardSync:
         """
         self._history.clear()
 
+    def set_history_pinned(self, timestamp: float, pinned: bool) -> bool:
+        return self._history.set_pinned(timestamp, pinned)
+
+    def refresh_settings(self) -> None:
+        self._history.refresh_settings()
+
+    def send_current(self) -> None:
+        """Publish the current clipboard even when manual-send mode is enabled."""
+        if self._is_paused():
+            self._last_write_error = "Sync is paused; resume before sending"
+            return
+        self._out_tick(force=True)
+
+    def set_replication_status(self, status: str) -> None:
+        with self._lock:
+            self._replication_status = status
+
+    def status_snapshot(self) -> dict[str, object]:
+        with self._lock:
+            error = (
+                self._last_decrypt_error or self._last_write_error or self._last_payload_error or self._last_read_error
+            )
+            pending = self._pending_incoming
+            return {
+                "paused": self._is_paused(),
+                "paused_until": self._settings.get("paused_until", 0.0),
+                "manual_send": bool(self._settings.get("manual_send", False)),
+                "outbound_pending": self._outbound_pending,
+                "last_outbound_at": self._last_outbound_at,
+                "last_inbound_at": self._last_inbound_at,
+                "incoming_pending": pending is not None,
+                "incoming_kind": None if pending is None else pending.kind,
+                "incoming_attempts": 0 if pending is None else pending.attempts,
+                "workers": {
+                    "outbound": self._poll_thread is not None and self._poll_thread.is_alive(),
+                    "inbound": self._in_thread is not None and self._in_thread.is_alive(),
+                    "file_watcher": self._observer is not None and self._observer.is_alive(),
+                },
+                "replication": self._replication_status,
+                "error": error,
+            }
+
+    def status_text(self) -> str:
+        status = self.status_snapshot()
+        if status["paused"]:
+            paused_until = status["paused_until"]
+            try:
+                remaining = (
+                    max(0, int(float(paused_until) - time.time())) if isinstance(paused_until, str | int | float) else 0
+                )
+            except (TypeError, ValueError):
+                remaining = 0
+            if remaining:
+                return f"Status: paused for {max(1, (remaining + 59) // 60)}m"
+            return "Status: paused"
+        workers = status["workers"]
+        worker_names = {"outbound": "sender", "inbound": "receiver", "file_watcher": "file watcher"}
+        stopped = (
+            [worker_names.get(str(name), str(name)) for name, running in workers.items() if not running]
+            if isinstance(workers, dict)
+            else []
+        )
+        if stopped:
+            return f"Status: clipboard {' and '.join(stopped)} stopped"
+        if status["incoming_pending"]:
+            action = "retrying" if status["incoming_attempts"] else "applying"
+            return f"Status: {action} incoming {status['incoming_kind']} clipboard"
+        if status["error"]:
+            return f"Status: {status['error']}"
+        if status["outbound_pending"]:
+            return "Status: publishing clipboard locally"
+        suffix = " · manual send" if status["manual_send"] else ""
+        outbound = status["last_outbound_at"]
+        inbound = status["last_inbound_at"]
+        activity_parts = []
+        if isinstance(outbound, (int, float)):
+            activity_parts.append(f"sent {_relative_age(outbound)}")
+        if isinstance(inbound, (int, float)):
+            activity_parts.append(f"received {_relative_age(inbound)}")
+        activity = " · " + " · ".join(activity_parts) if activity_parts else ""
+        return f"Status: {status['replication']}{activity}{suffix}"
+
+    def retry_incoming_now(self) -> bool:
+        """Retry a staged incoming clipboard value immediately from the tray."""
+        with self._lock:
+            if self._is_paused():
+                return False
+            pending = self._pending_incoming
+            if pending is None:
+                return False
+            pending.next_attempt = time.monotonic()
+        self._attempt_pending_incoming()
+        return True
+
     def _passphrase(self) -> str:
         val = self._settings.get("encryption_passphrase") or ""
         return val if isinstance(val, str) else ""
@@ -565,6 +718,10 @@ class ClipboardSync:
         path = self.clipboard_file
         try:
             if not path.exists():
+                return None
+            max_bytes = self._max_text_bytes()
+            if path.stat().st_size > (max_bytes * 2) + 4096:
+                self._last_payload_error = f"Incoming text exceeds the {max_bytes} byte limit"
                 return None
             data = path.read_bytes()
         except OSError as exc:
@@ -589,11 +746,19 @@ class ClipboardSync:
                 log.info("Decrypt recovered")
                 self._last_decrypt_error = None
             try:
+                if len(decrypted) > self._max_text_bytes():
+                    self._last_payload_error = f"Incoming text exceeds the {self._max_text_bytes()} byte limit"
+                    return None
+                self._last_payload_error = None
                 return _normalize_newlines(decrypted.decode("utf-8"))
             except UnicodeDecodeError:
                 log.warning("Decrypted clipboard data is not valid UTF-8; ignoring")
                 return None
         try:
+            if len(data) > self._max_text_bytes():
+                self._last_payload_error = f"Incoming text exceeds the {self._max_text_bytes()} byte limit"
+                return None
+            self._last_payload_error = None
             return _normalize_newlines(data.decode("utf-8"))
         except UnicodeDecodeError:
             log.warning("Clipboard file is not valid UTF-8 and not encrypted; ignoring")
@@ -656,6 +821,10 @@ class ClipboardSync:
         try:
             if not path.exists():
                 return None
+            max_bytes = self._max_image_bytes()
+            if path.stat().st_size > (max_bytes * 2) + 4096:
+                self._last_payload_error = f"Incoming image exceeds the {max_bytes} byte limit"
+                return None
             data = path.read_bytes()
         except OSError as exc:
             log.debug("Image file read failed: %s", exc)
@@ -682,6 +851,10 @@ class ClipboardSync:
         if not data.startswith(_PNG_HEADER):
             log.debug("IN [%s]: clipboard.png contains non-PNG data (%d bytes); skipping", _HOSTNAME, len(data))
             return None
+        if len(data) > self._max_image_bytes():
+            self._last_payload_error = f"Incoming image exceeds the {self._max_image_bytes()} byte limit"
+            return None
+        self._last_payload_error = None
         return data
 
     def _write_image_file(self, png_bytes: bytes) -> None:
@@ -740,7 +913,24 @@ class ClipboardSync:
         )
 
     def _is_paused(self) -> bool:
-        return bool(self._settings.get("sync_paused"))
+        paused_until = self._settings.get("paused_until", 0.0)
+        try:
+            temporarily_paused = float(paused_until) > time.time()
+        except (TypeError, ValueError):
+            temporarily_paused = False
+        return bool(self._settings.get("sync_paused")) or temporarily_paused
+
+    def _max_text_bytes(self) -> int:
+        try:
+            return max(1024, int(self._settings.get("max_text_bytes", 1024 * 1024)))
+        except (TypeError, ValueError):
+            return 1024 * 1024
+
+    def _max_image_bytes(self) -> int:
+        try:
+            return max(1024, int(self._settings.get("max_image_bytes", 5 * 1024 * 1024)))
+        except (TypeError, ValueError):
+            return 5 * 1024 * 1024
 
     def _read_clipboard(self) -> str | None:
         try:
@@ -760,22 +950,21 @@ class ClipboardSync:
         return _normalize_newlines(value)
 
     def _write_clipboard(self, value: str) -> bool:
-        if self._clipboard_owner is not None:
-            try:
-                self._clipboard_owner.set(value)
-                log.debug("xlib clipboard set (%d chars)", len(value))
-                if self._last_write_error is not None:
-                    log.info("Clipboard write recovered")
-                    self._last_write_error = None
-                return True
-            except Exception as exc:
-                msg = f"xlib owner: {type(exc).__name__}: {exc}"
-                if msg != self._last_write_error:
-                    log.warning("Clipboard write failed (%s); falling back to pyperclip", msg)
-                    self._last_write_error = msg
-                # fall through to pyperclip
         try:
             with _CLIPBOARD_LOCK:
+                if self._clipboard_owner is not None:
+                    try:
+                        self._clipboard_owner.set(value)
+                        log.debug("xlib clipboard set (%d chars)", len(value))
+                        if self._last_write_error is not None:
+                            log.info("Clipboard write recovered")
+                            self._last_write_error = None
+                        return True
+                    except Exception as exc:
+                        msg = f"xlib owner: {type(exc).__name__}: {exc}"
+                        if msg != self._last_write_error:
+                            log.warning("Clipboard write failed (%s); falling back to pyperclip", msg)
+                            self._last_write_error = msg
                 pyperclip.copy(value)
             log.debug("clipboard write (pyperclip) (%d chars)", len(value))
         except Exception as exc:
@@ -800,14 +989,21 @@ class ClipboardSync:
     def _write_clipboard_image(self, png_bytes: bytes) -> bool:
         try:
             with _CLIPBOARD_LOCK:
-                return _write_image_to_system_clipboard(png_bytes)
+                written = _write_image_to_system_clipboard(png_bytes)
         except Exception as exc:
-            log.debug("Image clipboard write failed: %s", exc)
+            self._last_write_error = f"Could not apply incoming image: {type(exc).__name__}: {exc}"
+            log.warning("Image clipboard write failed: %s", exc)
             return False
+        if not written:
+            self._last_write_error = "Could not apply incoming image to the system clipboard"
+            return False
+        self._last_write_error = None
+        return True
 
     def _out_loop(self) -> None:
         _last_heartbeat = time.monotonic()
         _HEARTBEAT_INTERVAL = 6.0
+        was_paused = self._is_paused()
 
         # Initial tick captures whatever is on the clipboard at startup.
         try:
@@ -817,6 +1013,7 @@ class ClipboardSync:
             log.exception("Error in OUT loop (initial tick)")
 
         while not self._stop.is_set():
+            was_paused = self._refresh_pause_state(was_paused)
             if self._xfixes_queue is not None:
                 # Event-driven path: block until clipboard owner changes (or stop).
                 try:
@@ -874,50 +1071,114 @@ class ClipboardSync:
                     self._is_paused(),
                 )
 
-    def _out_tick(self) -> None:
+    def _out_tick(self, force: bool = False) -> None:
+        if self._settings.get("manual_send", False) and not force:
+            return
+        with self._lock:
+            observed_generation = self._generation
+
         # Images take priority: if the clipboard has an image, sync it.
         image = self._read_clipboard_image()
         if image is not None:
+            if len(image) > self._max_image_bytes():
+                self._last_write_error = f"Image exceeds the {self._max_image_bytes()} byte limit"
+                return
             with self._lock:
-                if image == self._last_synced:
+                if observed_generation != self._generation:
                     return
+                if image == self._last_synced:
+                    self._last_observed_clipboard = image
+                    return
+                if self._pending_incoming is not None and image == self._last_observed_clipboard:
+                    return
+                previous_last_synced = self._last_synced
+                self._generation += 1
+                publish_generation = self._generation
+                self._pending_incoming = None
+                self._last_observed_clipboard = image
+                self._last_synced = image
             try:
+                with self._lock:
+                    self._outbound_pending = True
                 self._write_image_file(image)
+                with self._lock:
+                    self._outbound_pending = False
+                    self._last_outbound_at = time.time()
+                    self._last_write_error = None
+                    self._replication_status = "Waiting for Syncthing"
+                log.info("OUT [%s]: %d bytes image written", _HOSTNAME, len(image))
+                self._history.add_image(image, "local")
             except EncryptedPayloadError:
+                with self._lock:
+                    self._outbound_pending = False
+                    if self._generation == publish_generation and self._last_synced == image:
+                        self._last_synced = previous_last_synced
                 reason = "Refusing to overwrite encrypted clipboard image file (cannot decrypt)"
                 if reason != self._last_decrypt_error:
                     log.warning("OUT [%s]: %s", _HOSTNAME, reason)
                     self._last_decrypt_error = reason
-                return
-            except OSError:
+            except OSError as exc:
+                # Roll back too: _last_synced is the "already sent" guard, so
+                # leaving it set after a failed write means every later tick
+                # sees this image as synced and it is never retried.
+                with self._lock:
+                    self._outbound_pending = False
+                    self._last_write_error = f"Could not publish clipboard image: {exc}"
+                    if self._generation == publish_generation and self._last_synced == image:
+                        self._last_synced = previous_last_synced
                 log.exception("OUT [%s]: Failed to write image file", _HOSTNAME)
-                return
-            with self._lock:
-                self._last_synced = image
-            log.info("OUT [%s]: %d bytes image written", _HOSTNAME, len(image))
             return
 
         current = self._read_clipboard()
         if current is None or current == "":
             return
+        if self._settings.get("filter_likely_secrets", False) and _looks_like_secret(current):
+            self._last_write_error = "Text that looks like a secret was blocked by the privacy filter"
+            return
+        if len(current.encode("utf-8")) > self._max_text_bytes():
+            self._last_write_error = f"Text exceeds the {self._max_text_bytes()} byte limit"
+            return
         with self._lock:
-            if current == self._last_synced:
+            if observed_generation != self._generation:
                 return
+            if current == self._last_synced:
+                self._last_observed_clipboard = current
+                return
+            if self._pending_incoming is not None and current == self._last_observed_clipboard:
+                return
+            previous_last_synced = self._last_synced
+            self._generation += 1
+            publish_generation = self._generation
+            self._pending_incoming = None
+            self._last_observed_clipboard = current
+            self._last_synced = current
         try:
+            with self._lock:
+                self._outbound_pending = True
             self._write_file(current)
+            with self._lock:
+                self._outbound_pending = False
+                self._last_outbound_at = time.time()
+                self._last_write_error = None
+                self._replication_status = "Waiting for Syncthing"
+            log.info("OUT [%s]: %d chars written", _HOSTNAME, len(current))
+            self._history.add_entry(current, "local")
         except EncryptedPayloadError:
+            with self._lock:
+                self._outbound_pending = False
+                if self._generation == publish_generation and self._last_synced == current:
+                    self._last_synced = previous_last_synced
             reason = "Refusing to overwrite encrypted clipboard file (cannot decrypt)"
             if reason != self._last_decrypt_error:
                 log.warning("OUT [%s]: %s", _HOSTNAME, reason)
                 self._last_decrypt_error = reason
-            return
-        except OSError:
+        except OSError as exc:
+            with self._lock:
+                self._outbound_pending = False
+                self._last_write_error = f"Could not publish clipboard text: {exc}"
+                if self._generation == publish_generation and self._last_synced == current:
+                    self._last_synced = previous_last_synced
             log.exception("OUT [%s]: Failed to write clipboard file", _HOSTNAME)
-            return
-        with self._lock:
-            self._last_synced = current
-        log.info("OUT [%s]: %d chars written", _HOSTNAME, len(current))
-        self._history.add_entry(current, "local")
 
     def _in_loop(self) -> None:
         """Drain _in_queue and apply remote file changes to the local clipboard.
@@ -927,28 +1188,28 @@ class ClipboardSync:
         causes pool-exhaustion errors. This loop runs on a thread we own so
         watchdog events are always handled off the pool in bounded time.
         """
-        _last_processed: dict[str, float] = {}
         while True:
+            with self._lock:
+                pending = self._pending_incoming
+                retry_timeout = None if pending is None else max(0.0, pending.next_attempt - time.monotonic())
+            timeout = 0.5 if retry_timeout is None else min(0.5, retry_timeout)
             try:
-                path = self._in_queue.get(timeout=0.5)
+                path = self._in_queue.get(timeout=timeout)
             except queue.Empty:
                 if self._stop.is_set():
                     break
-                continue
-            if not path:  # sentinel posted by stop()
-                break
-            if self._stop.is_set():
-                break
-            if self._is_paused():
-                continue
-            now = time.monotonic()
-            if now - _last_processed.get(path, 0.0) < 0.1:
-                continue
-            _last_processed[path] = now
-            try:
-                self._on_file_changed(path)
-            except Exception:
-                log.exception("Error in IN loop")
+            else:
+                if not path:  # sentinel posted by stop()
+                    break
+                if self._stop.is_set():
+                    break
+                if not self._is_paused():
+                    try:
+                        self._on_file_changed(path)
+                    except Exception:
+                        log.exception("Error in IN loop")
+            if not self._is_paused():
+                self._attempt_pending_incoming()
 
     def _start_watcher(self) -> None:
         handler = _ClipboardFileHandler(self)
@@ -975,29 +1236,103 @@ class ClipboardSync:
         content = self._read_file()
         if content is None:
             return
-        with self._lock:
-            if content == self._last_synced:
-                log.debug("IN [%s]: file changed but content already synced (%d chars)", _HOSTNAME, len(content))
-                return
-            # Update _last_synced before the write so that the XFixes event
-            # triggered by pyperclip.copy() below sees no change in the OUT
-            # loop and does not re-read the clipboard.
-            self._last_synced = content
-        if self._write_clipboard(content):
-            log.info("IN [%s]: %d chars applied to clipboard", _HOSTNAME, len(content))
-            self._history.add_entry(content, "remote")
+        if self._settings.get("filter_likely_secrets", False) and _looks_like_secret(content):
+            message = "Incoming text was blocked by the likely-secret filter"
+            if self._last_payload_error != message:
+                log.warning("IN [%s]: incoming text blocked by privacy filter", _HOSTNAME)
+            self._last_payload_error = message
+            return
+        self._stage_incoming(content, "text")
 
     def _on_image_file_changed(self) -> None:
         image = self._read_image_file()
         if image is None:
             return
+        self._stage_incoming(image, "image")
+
+    def _stage_incoming(self, value: str | bytes, kind: str) -> None:
         with self._lock:
-            if image == self._last_synced:
-                log.debug("IN [%s]: image file changed but already synced (%d bytes)", _HOSTNAME, len(image))
+            if value == self._last_synced:
+                log.debug("IN [%s]: %s file changed but content is already synced", _HOSTNAME, kind)
                 return
-            self._last_synced = image
-        if self._write_clipboard_image(image):
-            log.info("IN [%s]: %d bytes image applied to clipboard", _HOSTNAME, len(image))
+            if self._pending_incoming is not None and self._pending_incoming.value == value:
+                return
+            self._generation += 1
+            self._pending_incoming = _PendingIncoming(
+                value=value,
+                kind=kind,
+                generation=self._generation,
+                next_attempt=time.monotonic(),
+            )
+        self._attempt_pending_incoming()
+
+    def _attempt_pending_incoming(self) -> None:
+        """Apply the newest remote value, retrying failures without stale writes."""
+        now = time.monotonic()
+        with self._lock:
+            pending = self._pending_incoming
+            if pending is None or pending.next_attempt > now or pending.generation != self._generation:
+                return
+            # Keep the logical guard locked across the native write and commit.
+            # OUT takes a generation snapshot before reading, so any read that
+            # overlaps this operation is discarded after the generation bump.
+            if pending.kind == "image":
+                ok = isinstance(pending.value, bytes) and self._write_clipboard_image(pending.value)
+            else:
+                ok = isinstance(pending.value, str) and self._write_clipboard(pending.value)
+            if pending is not self._pending_incoming or pending.generation != self._generation:
+                return
+            pending.attempts += 1
+            if ok:
+                self._generation += 1
+                self._last_synced = pending.value
+                self._last_observed_clipboard = pending.value
+                self._last_inbound_at = time.time()
+                self._last_write_error = None
+                self._pending_incoming = None
+                committed = pending
+            else:
+                pending.next_attempt = now + _incoming_retry_delay(pending.attempts)
+                if pending.attempts == len(_INCOMING_RETRY_DELAYS) + 1:
+                    self._last_write_error = (
+                        f"Could not apply incoming {pending.kind} to the system clipboard; retrying"
+                    )
+                    log.warning(
+                        "IN [%s]: %s clipboard write still failing after %d attempts; retrying with bounded backoff",
+                        _HOSTNAME,
+                        pending.kind,
+                        pending.attempts,
+                    )
+                return
+        if committed.kind == "text" and isinstance(committed.value, str):
+            self._history.add_entry(committed.value, "remote")
+            log.info("IN [%s]: %d chars applied to clipboard", _HOSTNAME, len(committed.value))
+        elif isinstance(committed.value, bytes):
+            self._history.add_image(committed.value, "remote")
+            log.info("IN [%s]: %d bytes image applied to clipboard", _HOSTNAME, len(committed.value))
+
+    def reconcile_latest(self) -> None:
+        """After resume, apply only the newest clipboard file by mtime."""
+        candidates: list[tuple[int, str]] = []
+        for kind, path in (("text", self.clipboard_file), ("image", self.clipboard_image_file)):
+            try:
+                candidates.append((path.stat().st_mtime_ns, kind))
+            except OSError:
+                continue
+        if not candidates:
+            return
+        _mtime, kind = max(candidates, key=lambda item: (item[0], item[1] == "image"))
+        if kind == "image":
+            self._on_image_file_changed()
+        else:
+            self._on_text_file_changed()
+
+    def _refresh_pause_state(self, was_paused: bool) -> bool:
+        """Reconcile changes that arrived while a timed or manual pause was active."""
+        paused = self._is_paused()
+        if was_paused and not paused:
+            self.reconcile_latest()
+        return paused
 
 
 class _ClipboardFileHandler(FileSystemEventHandler):
@@ -1016,6 +1351,9 @@ class _ClipboardFileHandler(FileSystemEventHandler):
         # Cache resolved targets once so _matches doesn't re-resolve per event.
         self._resolved_text = sync.clipboard_file.resolve()
         self._resolved_image = sync.clipboard_image_file.resolve()
+        self._debounce_lock = threading.Lock()
+        self._trailing_timers: dict[str, threading.Timer] = {}
+        self._latest_path: dict[str, str] = {}
 
     def _matches(self, path: str) -> bool:
         if Path(path).name not in self._target_names:
@@ -1031,12 +1369,27 @@ class _ClipboardFileHandler(FileSystemEventHandler):
             return
         now = time.monotonic()
         key = str(Path(path).name)
-        if now < self._debounce_until.get(key, 0.0):
-            return
-        self._debounce_until[key] = now + 0.1
+        with self._debounce_lock:
+            deadline = self._debounce_until.get(key, 0.0)
+            if now < deadline:
+                self._latest_path[key] = path
+                if key not in self._trailing_timers:
+                    timer = threading.Timer(deadline - now, self._dispatch_trailing, args=(key,))
+                    timer.daemon = True
+                    self._trailing_timers[key] = timer
+                    timer.start()
+                return
+            self._debounce_until[key] = now + 0.1
         # Non-blocking: hand off to _in_loop so the watchdog thread pool
         # is never held by clipboard I/O (avoids pool exhaustion on Windows).
         self._sync._in_queue.put(path)
+
+    def _dispatch_trailing(self, key: str) -> None:
+        with self._debounce_lock:
+            path = self._latest_path.pop(key, None)
+            self._trailing_timers.pop(key, None)
+        if path is not None:
+            self._sync._in_queue.put(path)
 
     def _path_str(self, path: str | bytes) -> str:
         """Decode watchdog paths safely; surrogateescape preserves non-UTF-8 bytes."""

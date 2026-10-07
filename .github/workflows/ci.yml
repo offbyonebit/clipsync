@@ -14,11 +14,12 @@ on:
 
 jobs:
   lint-and-test:
+    name: ${{ matrix.os }} / Python 3.12
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
+        os: [ubuntu-latest, windows-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
 
